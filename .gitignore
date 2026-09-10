@@ -1,0 +1,40 @@
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Android Studio / IDE
+.idea/
+*.iml
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+.native-build/
+
+# Local scratch: editor / tool leftovers and patch residue. The repository holds
+# sources only - build output lives in build/ and app/build/.
+*.tmp
+*.log
+*.bak
+*.orig
+*.rej
+*.swp
+*~
+
+# Scratch build trees from earlier iterations of the port. The current build
+# puts everything under app/build/edgetx-build/<abi>.
+.app-x86/
+.edgetx-android/
+
+# VS Code local history
+.history/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Deliberately LAST, so it wins over every pattern above: the bundled SD-card
+# content is shipped verbatim inside the APK and must never be filtered out.
+# (Nothing under it is generated, so nothing there is ever disposable.)
+!app/src/main/assets/sdcard/**

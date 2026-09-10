@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Sampled from the EdgeTX logo's dark shield so the adaptive-icon
+         background blends with the artwork inside the mask. -->
+    <color name="ic_launcher_background">#14171c</color>
+</resources>
