@@ -4,11 +4,15 @@
 #include <jni.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "log.h"
@@ -19,12 +23,19 @@ namespace {
 
 // --------------------------------------------------------------- EdgeTX keys --
 //
-// Values from radio/src/hal/key_driver.h (enum EnumKeys). Only the keys the
-// target defines do anything: TX16SMK3 (the 800x480 touch radio) defines
-// EXIT, ENTER, PAGEUP, PAGEDN, MODEL, TELE and SYS - there are no arrow keys,
-// which is why a D-pad is mapped onto the page/confirm keys instead.
-// (Upstream's SDL simulator gates its own mapping on keysGetSupported() the
-// same way.)
+// Values from radio/src/hal/key_driver.h (enum EnumKeys).
+//
+// EnumKeys also holds UP, DOWN, LEFT and RIGHT, and on the mono radios
+// EVT_KEY_FIRST(KEY_LEFT/RIGHT) is exactly equivalent to the rotary encoder
+// turning - but that equivalence lives under NAVIGATION_9X / NAVIGATION_XLITE
+// (gui/navigation/common.cpp), which TX16SMK3 does not use. Its colour LCD GUI
+// reacts to seven keys and nothing else:
+//
+//     EXIT  ENTER  PAGEUP  PAGEDN  MODEL  TELE  SYS
+//
+// Injecting LEFT/RIGHT therefore yields a well-formed event that no window
+// consumes; LvglWrapper's evt_to_indev_data() forwards only ENTER and EXIT into
+// LVGL. There is no "step to the next field" key on this target.
 constexpr uint8_t kKeyExit = 1;
 constexpr uint8_t kKeyEnter = 2;
 constexpr uint8_t kKeyPageUp = 3;
@@ -97,32 +108,16 @@ struct KeyChoice {
     uint8_t key;
 };
 
+// Only what the DJI RC Plus 2 needs. Everything else is handled elsewhere: the
+// 5-way directions and the go-home button come from the DJI SDK (see
+// DjiMsdkBridge -> nativeOnDjiButton), because the RC firmware never dispatches
+// their events to apps.
+//
+// These two are the only controller buttons Android itself reports for this
+// remote. Pressing anything else logs "unmapped button keycode N" once.
 const KeyChoice kKeyMap[] = {
-    {AKEYCODE_BUTTON_A, kKeyEnter},
-    {AKEYCODE_DPAD_CENTER, kKeyEnter},
-    {AKEYCODE_ENTER, kKeyEnter},
-    {AKEYCODE_NUMPAD_ENTER, kKeyEnter},
-
-    {AKEYCODE_BUTTON_B, kKeyExit},
-    {AKEYCODE_BACK, kKeyExit},
-    {AKEYCODE_ESCAPE, kKeyExit},
-
-    {AKEYCODE_BUTTON_L1, kKeyPageUp},
-    {AKEYCODE_DPAD_LEFT, kKeyPageUp},
-    {AKEYCODE_BUTTON_R1, kKeyPageDn},
-    {AKEYCODE_DPAD_RIGHT, kKeyPageDn},
-
-    {AKEYCODE_BUTTON_X, kKeyModel},
-    {AKEYCODE_BUTTON_L2, kKeyModel},
-    {AKEYCODE_BUTTON_THUMBL, kKeyModel},
-
-    {AKEYCODE_BUTTON_Y, kKeyTele},
-    {AKEYCODE_BUTTON_R2, kKeyTele},
-    {AKEYCODE_BUTTON_THUMBR, kKeyTele},
-
-    {AKEYCODE_BUTTON_START, kKeySys},
-    {AKEYCODE_BUTTON_SELECT, kKeySys},
-    {AKEYCODE_BUTTON_MODE, kKeySys},
+    {AKEYCODE_BACK, kKeyExit},            // the remote's back button
+    {AKEYCODE_BUTTON_THUMBL, kKeyEnter},  // 5-way centre press
 };
 
 // ------------------------------------------------------------------ state ----
@@ -132,6 +127,7 @@ ANativeActivity* g_activity = nullptr;
 bool g_present = false;
 std::vector<int32_t> g_loggedAxes;   // deviceId<<8 | axis, logged once each
 std::vector<int32_t> g_loggedKeys;   // android key codes already reported
+std::vector<int32_t> g_loggedMappedKeys;  // mapped android key codes already reported
 std::vector<int32_t> g_loggedSources;  // deviceId ^ source, logged once each
 std::vector<int32_t> g_dumpedDevices;  // devices whose axes were dumped once
 
@@ -197,8 +193,205 @@ const char* key_name(int32_t keycode) {
         case AKEYCODE_F2: return "F2";
         case AKEYCODE_F3: return "F3";
         case AKEYCODE_F4: return "F4";
+        case AKEYCODE_F5: return "F5";
+        case AKEYCODE_F6: return "F6";
+        case AKEYCODE_F7: return "F7";
+        case AKEYCODE_F8: return "F8";
+        case AKEYCODE_F9: return "F9";
+        case AKEYCODE_F10: return "F10";
+        case AKEYCODE_F11: return "F11";
+        case AKEYCODE_F12: return "F12";
         default: return "?";
     }
+}
+
+// EdgeTX 键名，只在日志里用。
+const char* etkey_name(uint8_t key) {
+    switch (key) {
+        case kKeyExit: return "EXIT";
+        case kKeyEnter: return "ENTER";
+        case kKeyPageUp: return "PAGEUP";
+        case kKeyPageDn: return "PAGEDN";
+        case kKeyModel: return "MODEL";
+        case kKeyTele: return "TELE";
+        case kKeySys: return "SYS";
+        default: return "?";
+    }
+}
+
+// ----------------------------------------------------------- key map file ----
+//
+// The table above is only the default. A plain text file in the app's external
+// data directory replaces it, so the mapping can be tuned without rebuilding:
+//
+//     /sdcard/Android/data/com.edgetx.droidui/files/joystick.keys
+//
+// One "<android key> = <EdgeTX key>" per line, '#' starts a comment:
+//
+//     F1 = PAGEUP
+//     BUTTON_THUMBL = ENTER
+//
+// The Android key name is the one logcat prints, e.g.
+//   joystick: button keycode 131 (F1) -> EdgeTX PAGEUP
+// EdgeTX keys: EXIT ENTER PAGEUP PAGEDN MODEL TELE SYS
+//
+// The app writes a template containing the built-in defaults on first run. To
+// change it, edit that file (or push a new one) and restart the app:
+//
+//     adb pull /sdcard/Android/data/com.edgetx.droidui/files/joystick.keys .
+//     ... edit ...
+//     adb push joystick.keys /sdcard/Android/data/com.edgetx.droidui/files/
+
+struct RuntimeKey {
+    int32_t keycode;
+    uint8_t key;
+};
+
+std::vector<RuntimeKey> g_runtimeKeys;
+bool g_keyMapLoaded = false;
+
+struct NamedId {
+    const char* name;
+    int32_t id;
+};
+
+const NamedId kAndroidKeyNames[] = {
+    {"F1", AKEYCODE_F1},   {"F2", AKEYCODE_F2},   {"F3", AKEYCODE_F3},
+    {"F4", AKEYCODE_F4},   {"F5", AKEYCODE_F5},   {"F6", AKEYCODE_F6},
+    {"F7", AKEYCODE_F7},   {"F8", AKEYCODE_F8},   {"F9", AKEYCODE_F9},
+    {"F10", AKEYCODE_F10}, {"F11", AKEYCODE_F11}, {"F12", AKEYCODE_F12},
+    {"DPAD_UP", AKEYCODE_DPAD_UP},       {"DPAD_DOWN", AKEYCODE_DPAD_DOWN},
+    {"DPAD_LEFT", AKEYCODE_DPAD_LEFT},   {"DPAD_RIGHT", AKEYCODE_DPAD_RIGHT},
+    {"DPAD_CENTER", AKEYCODE_DPAD_CENTER},
+    {"ENTER", AKEYCODE_ENTER}, {"BACK", AKEYCODE_BACK}, {"ESCAPE", AKEYCODE_ESCAPE},
+    {"BUTTON_A", AKEYCODE_BUTTON_A}, {"BUTTON_B", AKEYCODE_BUTTON_B},
+    {"BUTTON_X", AKEYCODE_BUTTON_X}, {"BUTTON_Y", AKEYCODE_BUTTON_Y},
+    {"BUTTON_L1", AKEYCODE_BUTTON_L1}, {"BUTTON_R1", AKEYCODE_BUTTON_R1},
+    {"BUTTON_L2", AKEYCODE_BUTTON_L2}, {"BUTTON_R2", AKEYCODE_BUTTON_R2},
+    {"BUTTON_THUMBL", AKEYCODE_BUTTON_THUMBL}, {"BUTTON_THUMBR", AKEYCODE_BUTTON_THUMBR},
+    {"BUTTON_START", AKEYCODE_BUTTON_START}, {"BUTTON_SELECT", AKEYCODE_BUTTON_SELECT},
+    {"BUTTON_MODE", AKEYCODE_BUTTON_MODE},
+};
+
+const NamedId kEtKeyNames[] = {
+    {"EXIT", kKeyExit},     {"ENTER", kKeyEnter}, {"PAGEUP", kKeyPageUp},
+    {"PAGEDN", kKeyPageDn}, {"MODEL", kKeyModel}, {"TELE", kKeyTele},
+    {"SYS", kKeySys},
+};
+
+std::string trim(const std::string& s) {
+    const char* ws = " \t\r\n";
+    const size_t b = s.find_first_not_of(ws);
+    if (b == std::string::npos) return std::string();
+    const size_t e = s.find_last_not_of(ws);
+    return s.substr(b, e - b + 1);
+}
+
+int32_t android_keycode_by_name(const std::string& name) {
+    for (const NamedId& n : kAndroidKeyNames) {
+        if (name == n.name) return n.id;
+    }
+    if (!name.empty() && isdigit(static_cast<unsigned char>(name[0]))) {
+        return static_cast<int32_t>(strtol(name.c_str(), nullptr, 10));
+    }
+    return -1;
+}
+
+const char* android_keycode_name(int32_t keycode) {
+    for (const NamedId& n : kAndroidKeyNames) {
+        if (n.id == keycode) return n.name;
+    }
+    return nullptr;
+}
+
+uint8_t etkey_by_name(const std::string& name) {
+    for (const NamedId& n : kEtKeyNames) {
+        if (name == n.name) return static_cast<uint8_t>(n.id);
+    }
+    return 0;
+}
+
+std::string key_map_path(ANativeActivity* activity) {
+    if (activity == nullptr || activity->externalDataPath == nullptr) return std::string();
+    return std::string(activity->externalDataPath) + "/joystick.keys";
+}
+
+// Seed the file with the built-in defaults so it is obvious what to edit.
+void write_key_map_template(const std::string& path) {
+    std::ofstream out(path.c_str(), std::ios::trunc);
+    if (!out) return;
+    out << "# Which EdgeTX key each controller button drives.\n"
+        << "# One \"<android key> = <EdgeTX key>\" per line, '#' starts a comment.\n"
+        << "# The android key name is what logcat prints, e.g.\n"
+        << "#   joystick: button keycode 4 (BACK) -> EdgeTX EXIT\n"
+        << "# EdgeTX keys: EXIT ENTER PAGEUP PAGEDN MODEL TELE SYS\n"
+        << "# Edit this file, then restart the app.\n\n";
+    for (const KeyChoice& c : kKeyMap) {
+        const char* kn = android_keycode_name(c.keycode);
+        if (kn != nullptr) out << kn << " = " << etkey_name(c.key) << "\n";
+    }
+}
+
+void load_key_map(ANativeActivity* activity) {
+    if (g_keyMapLoaded) return;
+    g_keyMapLoaded = true;
+
+    const std::string path = key_map_path(activity);
+    if (path.empty()) return;
+
+    std::ifstream in(path.c_str());
+    if (!in) {
+        LOGI("joystick: no key map at %s, using the built-in mapping", path.c_str());
+        write_key_map_template(path);
+        return;
+    }
+
+    std::string line;
+    while (std::getline(in, line)) {
+        const size_t hash = line.find('#');
+        if (hash != std::string::npos) line.erase(hash);
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+
+        const std::string left = trim(line.substr(0, eq));
+        const std::string right = trim(line.substr(eq + 1));
+        if (left.empty() || right.empty()) continue;
+
+        const int32_t keycode = android_keycode_by_name(left);
+        const uint8_t key = etkey_by_name(right);
+        if (keycode < 0 || key == 0) {
+            LOGW("joystick: ignoring key map line \"%s = %s\"", left.c_str(), right.c_str());
+            continue;
+        }
+        g_runtimeKeys.push_back(RuntimeKey{keycode, key});
+    }
+
+    if (g_runtimeKeys.empty()) {
+        LOGW("joystick: %s has no usable entries, using the built-in mapping", path.c_str());
+    } else {
+        LOGI("joystick: loaded %u mapping(s) from %s", (unsigned)g_runtimeKeys.size(),
+             path.c_str());
+    }
+}
+
+// Runtime file wins outright; otherwise fall back to the built-in table.
+bool lookup_key(int32_t keycode, uint8_t* key) {
+    if (!g_runtimeKeys.empty()) {
+        for (const RuntimeKey& rk : g_runtimeKeys) {
+            if (rk.keycode == keycode) {
+                *key = rk.key;
+                return true;
+            }
+        }
+        return false;
+    }
+    for (const KeyChoice& c : kKeyMap) {
+        if (c.keycode == keycode) {
+            *key = c.key;
+            return true;
+        }
+    }
+    return false;
 }
 
 // Claim each declared axis for one EdgeTX channel, in candidate order. Axes the
@@ -255,6 +448,19 @@ void log_key_once(int32_t keycode) {
     if (std::find(g_loggedKeys.begin(), g_loggedKeys.end(), keycode) != g_loggedKeys.end()) return;
     g_loggedKeys.push_back(keycode);
     LOGI("joystick: unmapped button keycode %d (%s)", keycode, key_name(keycode));
+}
+
+// Mapped buttons are otherwise silent, which makes it impossible to tell from
+// logcat whether a physical button reached the app and what it drove. Report
+// each keycode once, with both its Android name and the EdgeTX key it maps to.
+void log_mapped_key_once(int32_t keycode, uint8_t key) {
+    if (std::find(g_loggedMappedKeys.begin(), g_loggedMappedKeys.end(), keycode) !=
+        g_loggedMappedKeys.end()) {
+        return;
+    }
+    g_loggedMappedKeys.push_back(keycode);
+    LOGI("joystick: button keycode %d (%s) -> EdgeTX %s", keycode, key_name(keycode),
+         etkey_name(key));
 }
 
 // Report every distinct device/source pair once. This is what proves whether a
@@ -319,6 +525,13 @@ void log_analog_throttled(AInputEvent* event, const DeviceInfo& info) {
 void init(ANativeActivity* activity) {
     if (activity == nullptr || activity->vm == nullptr) return;
     g_activity = activity;
+    load_key_map(activity);
+
+    // The sticks come from the DJI SDK instead (see nativeOnDjiStick): the RC
+    // firmware never dispatches their MotionEvents to Android, and this process
+    // may not open /dev/input/event4 to read them from the kernel either - it is
+    // root:input mode 0660, and the only permission that grants that group,
+    // android.permission.DIAGNOSTIC, is signature-level.
 
     JavaVM* vm = activity->vm;
     JNIEnv* env = nullptr;
@@ -513,6 +726,53 @@ bool handleMotionEvent(AInputEvent* event) {
     return true;
 }
 
+// The RC Plus 2's 5-way centre doubles as AKEYCODE_BUTTON_THUMBL, so one press
+// reaches us twice: first through Android's input layer, then a few tens of
+// milliseconds later through the DJI SDK. Android's copy is the one that keeps
+// working when the SDK is disabled, so it is the SDK copy that gets dropped.
+std::chrono::steady_clock::time_point g_thumbLAt{};
+bool g_thumbLSeen = false;
+constexpr auto kThumbLDedup = std::chrono::milliseconds(500);
+
+// The RC's L1/L2/L3/R1/R2/R3 buttons arrive as plain Android key codes F1..F6
+// (measured - the SDK's own boolean button keys are all silent on this remote).
+// They are momentary, so each drives an EdgeTX switch: pressed = down, released
+// = up. SA (index 0) belongs to the flight-mode switch, so these start at SB.
+//
+// A key code listed in joystick.keys wins, which is how any of these can be made
+// an EdgeTX key instead.
+struct SwitchKey {
+    int32_t keycode;
+    uint8_t index;
+};
+
+const SwitchKey kSwitchKeys[] = {
+    {AKEYCODE_F1, 1},  // L1 -> SB
+    {AKEYCODE_F2, 2},  // L2 -> SC
+    {AKEYCODE_F3, 3},  // L3 -> SD
+    {AKEYCODE_F4, 4},  // R1 -> SE
+    {AKEYCODE_F5, 5},  // R2 -> SF
+    {AKEYCODE_F6, 6},  // R3 -> SG
+};
+
+std::vector<int32_t> g_loggedSwitchKeys;
+
+const char* switch_name(uint8_t index) {
+    static char buf[4];
+    std::snprintf(buf, sizeof(buf), "S%c", 'A' + index);
+    return buf;
+}
+
+void log_switch_key_once(int32_t keycode, uint8_t index) {
+    if (std::find(g_loggedSwitchKeys.begin(), g_loggedSwitchKeys.end(), keycode) !=
+        g_loggedSwitchKeys.end()) {
+        return;
+    }
+    g_loggedSwitchKeys.push_back(keycode);
+    LOGI("joystick: button keycode %d (%s) -> EdgeTX switch %s", keycode, key_name(keycode),
+         switch_name(index));
+}
+
 bool handleKeyEvent(AInputEvent* event) {
     const int32_t source = AInputEvent_getSource(event);
 
@@ -530,14 +790,285 @@ bool handleKeyEvent(AInputEvent* event) {
     const int32_t keycode = AKeyEvent_getKeyCode(event);
     const bool down = (action == AKEY_EVENT_ACTION_DOWN);
 
-    for (const KeyChoice& choice : kKeyMap) {
-        if (choice.keycode != keycode) continue;
-        simu::setKey(choice.key, down);
+    if (keycode == AKEYCODE_BUTTON_THUMBL && down) {
+        g_thumbLAt = std::chrono::steady_clock::now();
+        g_thumbLSeen = true;
+    }
+
+    uint8_t key = 0;
+    if (lookup_key(keycode, &key)) {
+        log_mapped_key_once(keycode, key);
+        simu::setKey(key, down);
         return true;
+    }
+
+    // Not remapped, so fall back to the built-in role of these buttons.
+    for (const SwitchKey& entry : kSwitchKeys) {
+        if (entry.keycode == keycode) {
+            log_switch_key_once(keycode, entry.index);
+            requestSwitch(entry.index, down ? 1 : -1);
+            return true;
+        }
     }
 
     log_key_once(keycode);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic key presses, for buttons the Android input layer never delivers.
+//
+// These cannot simply call setKey(true) followed by setKey(false):
+//
+//  * EdgeTX samples its key state from its own thread, so a key that goes down
+//    and up within a single call is never observed. It has to stay down for a
+//    few frames, which is what tick() is for.
+//  * The DJI SDK hands us button events on the Java main thread, whereas the
+//    working Android path feeds keys from the android_main thread. Doing the
+//    transition in tick() keeps every setKey() call on that one thread.
+// ---------------------------------------------------------------------------
+std::mutex g_synthMutex;
+bool g_synthQueued = false;
+uint8_t g_synthQueuedKey = 0;
+bool g_synthHeld = false;
+uint8_t g_synthHeldKey = 0;
+std::chrono::steady_clock::time_point g_synthReleaseAt{};
+constexpr auto kSynthHold = std::chrono::milliseconds(60);
+
+void requestKey(uint8_t key) {
+    std::lock_guard<std::mutex> lock(g_synthMutex);
+    g_synthQueued = true;
+    g_synthQueuedKey = key;
+}
+
+// ---------------------------------------------------------------------------
+// Stick positions from the DJI SDK.
+//
+// Android never dispatches the RC's stick MotionEvents (see native_main.cpp),
+// but the SDK does expose them as four integer keys. They are queued and pushed
+// from tick() so all firmware entry points stay on the android_main thread.
+// ---------------------------------------------------------------------------
+
+// DjiMsdkBridge axis ids -> EdgeTX analog channel (see simu_host.h):
+//   0 left horizontal  -> 0 rudder
+//   1 left vertical    -> 1 throttle
+//   2 right horizontal -> 3 aileron
+//   3 right vertical   -> 2 elevator
+//
+// No inversion: confirmed on device that the SDK already reports the sticks the
+// way EdgeTX expects. The HID joystick path further down *does* flip the vertical
+// axes, because the RC's raw kernel axes are the other way round - the two
+// sources disagree, so they cannot share a helper.
+constexpr uint8_t kStickChannels[4] = {0, 1, 3, 2};
+
+// The SDK reports each stick, and each dial, as an integer centred on zero,
+// spanning -660..660 (measured at full deflection for all six on device).
+constexpr int32_t kDjiStickRange = 660;
+
+// Switches we drive, indexed by the board's switch table
+// (radio/src/boards/hw_defs/tx16smk3.json): 0 = SA .. 7 = SH.
+//   0    flight-mode switch          (DJI SDK)
+//   1-6  L1/L2/L3/R1/R2/R3           (Android key codes, see kSwitchKeys)
+constexpr int kSwitchCount = 8;
+
+std::mutex g_switchMutex;
+bool g_switchQueued[kSwitchCount] = {};
+int8_t g_switchQueuedValue[kSwitchCount] = {};
+
+// Analog channels we can drive: 0-3 are the stick axes, then the flex inputs
+// from the same board file - 4 = P1, 5 = P2, 6 = SL1, 7 = SL2.
+constexpr int kMaxAnalogChannels = 8;
+constexpr uint8_t kScrollWheelChannel = 7;  // SL2
+
+std::mutex g_analogMutex;
+bool g_analogQueued[kMaxAnalogChannels] = {};
+uint16_t g_analogValue[kMaxAnalogChannels] = {};
+int32_t g_scrollWheelValue = 0;
+
+// One wheel detent covers this much of the range, so ~20 detents is full travel.
+constexpr int32_t kScrollWheelStep = 33;
+
+uint16_t dji_analog(int32_t value) {
+    if (value > kDjiStickRange) value = kDjiStickRange;
+    if (value < -kDjiStickRange) value = -kDjiStickRange;
+    return static_cast<uint16_t>(2048 + (value * 2048) / kDjiStickRange);
+}
+
+void requestAnalog(uint8_t channel, uint16_t value) {
+    if (channel >= kMaxAnalogChannels) return;
+    std::lock_guard<std::mutex> lock(g_analogMutex);
+    g_analogValue[channel] = value;
+    g_analogQueued[channel] = true;
+}
+
+void requestStick(int axis, int32_t value) {
+    if (axis < 0 || axis > 3) return;
+    requestAnalog(kStickChannels[axis], dji_analog(value));
+}
+
+void requestDial(uint8_t channel, int32_t value) {
+    requestAnalog(channel, dji_analog(value));
+}
+
+void requestScrollWheel(int32_t steps) {
+    std::lock_guard<std::mutex> lock(g_analogMutex);
+    // The wheel reports relative steps: it returns to 0 after each detent.
+    // ROTARY_ENCODER_NAVIGATION is not compiled in for TX16SMK3 (see the board
+    // table), so simuRotaryEncoderEvent() is a no-op and accumulating into a
+    // slider is the only way to make the wheel usable.
+    g_scrollWheelValue += steps * kScrollWheelStep;
+    if (g_scrollWheelValue > kDjiStickRange) g_scrollWheelValue = kDjiStickRange;
+    if (g_scrollWheelValue < -kDjiStickRange) g_scrollWheelValue = -kDjiStickRange;
+    g_analogValue[kScrollWheelChannel] = dji_analog(g_scrollWheelValue);
+    g_analogQueued[kScrollWheelChannel] = true;
+}
+
+void requestSwitch(int index, int8_t state) {
+    if (index < 0 || index >= kSwitchCount) return;
+    std::lock_guard<std::mutex> lock(g_switchMutex);
+    g_switchQueuedValue[index] = state;
+    g_switchQueued[index] = true;
+}
+
+void tick() {
+    bool release = false;
+    uint8_t releasedKey = 0;
+    bool press = false;
+    uint8_t pressedKey = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_synthMutex);
+        const auto now = std::chrono::steady_clock::now();
+        if (g_synthHeld && now >= g_synthReleaseAt) {
+            release = true;
+            releasedKey = g_synthHeldKey;
+            g_synthHeld = false;
+        }
+        if (!g_synthHeld && g_synthQueued) {
+            press = true;
+            pressedKey = g_synthQueuedKey;
+            g_synthQueued = false;
+        }
+    }
+
+    if (release) simu::setKey(releasedKey, false);
+    if (press) {
+        simu::setKey(pressedKey, true);
+        std::lock_guard<std::mutex> lock(g_synthMutex);
+        g_synthHeld = true;
+        g_synthHeldKey = pressedKey;
+        g_synthReleaseAt = std::chrono::steady_clock::now() + kSynthHold;
+    }
+
+    for (int channel = 0; channel < kMaxAnalogChannels; channel++) {
+        bool queued;
+        uint16_t value;
+        {
+            std::lock_guard<std::mutex> lock(g_analogMutex);
+            queued = g_analogQueued[channel];
+            value = g_analogValue[channel];
+            g_analogQueued[channel] = false;
+        }
+        if (queued) {
+            simu::pushAnalog(static_cast<uint8_t>(channel), value);
+            simu::setAnalogSource(true);
+        }
+    }
+
+    for (int index = 0; index < kSwitchCount; index++) {
+        bool queued;
+        int8_t state;
+        {
+            std::lock_guard<std::mutex> lock(g_switchMutex);
+            queued = g_switchQueued[index];
+            state = g_switchQueuedValue[index];
+            g_switchQueued[index] = false;
+        }
+        if (queued) simu::setSwitch(static_cast<uint8_t>(index), state);
+    }
+}
+
+// Called from DjiMsdkBridge.java (DJI Mobile SDK) for RC buttons that Android's
+// input layer never delivers. The ones we care about are the RC Plus 2's 5-way
+// switch directions: the device reports them as ABS_HAT0X / ABS_HAT0Y motion
+// events, which the RC firmware does not dispatch to apps, so the SDK is the
+// only documented source for them.
+//
+// Ids come from DjiMsdkBridge.BTN_*; keep the two sides in sync.
+extern "C" JNIEXPORT void JNICALL
+Java_com_edgetx_droidui_DjiMsdkBridge_nativeOnDjiButton(JNIEnv* env, jclass clazz, jint id) {
+    (void)env;
+    (void)clazz;
+
+    uint8_t key = 0;
+    switch (id) {
+        case 1: key = kKeyModel; break;    // 5-way up    -> model menu
+        case 2: key = kKeyTele; break;     // 5-way down  -> telemetry        // The SDK's leftwards/rightwards flags do match the physical directions
+        // (verified against the log), so this is purely about which way the page
+        // should turn: left goes back, right goes forward.
+        case 3: key = kKeyPageUp; break;   // 5-way left  -> previous page
+        case 4: key = kKeyPageDn; break;   // 5-way right -> next page
+        case 5:
+            // Android already delivers this same button as AKEYCODE_BUTTON_THUMBL.
+            if (g_thumbLSeen &&
+                std::chrono::steady_clock::now() - g_thumbLAt < kThumbLDedup) {
+                LOGI("joystick: DJI SDK 5-way press ignored (Android sent it)");
+                return;
+            }
+            key = kKeyEnter;               // 5-way press -> confirm
+            break;
+        case 6: key = kKeySys; break;      // go-home button -> SYS
+        default:
+            LOGI("joystick: DJI SDK button id %d (unmapped)", id);
+            return;
+    }
+
+    LOGI("joystick: DJI SDK button id %d -> EdgeTX %s", id, etkey_name(key));
+    requestKey(key);
+}
+
+// Called from DjiMsdkBridge.java with the RC's stick positions. `axis` is
+// 0 left-horizontal, 1 left-vertical, 2 right-horizontal, 3 right-vertical;
+// `value` is the SDK's raw reading, centred on zero.
+//
+// This is the only way to get the sticks: the RC firmware never dispatches
+// their MotionEvents to Android, and this process may not open
+// /dev/input/event4 (root:input, mode 0660) to read them from the kernel.
+extern "C" JNIEXPORT void JNICALL
+Java_com_edgetx_droidui_DjiMsdkBridge_nativeOnDjiStick(JNIEnv* env, jclass clazz, jint axis,
+                                                       jint value) {
+    (void)env;
+    (void)clazz;
+    requestStick(axis, value);
+}
+
+// Called from DjiMsdkBridge.java with a dial position. `channel` is an EdgeTX
+// analog channel index (4 = P1, 5 = P2 for this board).
+extern "C" JNIEXPORT void JNICALL
+Java_com_edgetx_droidui_DjiMsdkBridge_nativeOnDjiDial(JNIEnv* env, jclass clazz, jint channel,
+                                                      jint value) {
+    (void)env;
+    (void)clazz;
+    requestDial(static_cast<uint8_t>(channel), value);
+}
+
+// Called from DjiMsdkBridge.java with scroll-wheel movement in detents.
+extern "C" JNIEXPORT void JNICALL
+Java_com_edgetx_droidui_DjiMsdkBridge_nativeOnDjiScrollWheel(JNIEnv* env, jclass clazz,
+                                                            jint steps) {
+    (void)env;
+    (void)clazz;
+    requestScrollWheel(steps);
+}
+
+// Called from DjiMsdkBridge.java for the RC's physical switches. `index` 0 = SA,
+// 1 = SB (see requestSwitch); `state` is <0 up, 0 middle, >0 down, which is
+// exactly what boardSwitchGetPosition() expects.
+extern "C" JNIEXPORT void JNICALL
+Java_com_edgetx_droidui_DjiMsdkBridge_nativeOnDjiSwitch(JNIEnv* env, jclass clazz, jint index,
+                                                        jint state) {
+    (void)env;
+    (void)clazz;
+    requestSwitch(index, static_cast<int8_t>(state));
 }
 
 }  // namespace joystick

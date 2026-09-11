@@ -6,12 +6,25 @@
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- Needed by the optional DJI Mobile SDK build (see app/build.gradle.kts).
+         Unused when dji.msdk is off. Enabling MSDK will additionally require its
+         full permission set (location, storage, bluetooth, ...). -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
     <application
+        android:name=".EdgeTxApplication"
         android:label="EdgeTX"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher"
         android:allowBackup="false"
         android:supportsRtl="false">
+
+        <!-- DJI Mobile SDK App Key. Empty unless dji.appKey is set in
+             local.properties (SDKManager.registerApp() reads it from here). -->
+        <meta-data
+            android:name="com.dji.sdk.API_KEY"
+            android:value="${djiAppKey}" />
 
         <activity
             android:name="android.app.NativeActivity"

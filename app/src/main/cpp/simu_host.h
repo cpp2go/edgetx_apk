@@ -30,9 +30,14 @@ void simuTouchUp();
 // Key injection. `key` is an index into EdgeTX's EnumKeys
 // (radio/src/hal/key_driver.h): 0 MENU, 1 EXIT, 2 ENTER, 3 PAGEUP, 4 PAGEDN,
 // 5 UP, 6 DOWN, 7 LEFT, 8 RIGHT, 9 PLUS, 10 MINUS, 11 MODEL, 12 TELE,
-// 13 SYS, 14 SHIFT, 15 BIND.  Only the ones the target defines do anything:
-// TX16SMK3 has EXIT, ENTER, PAGEUP, PAGEDN, MODEL, TELE and SYS.
+// 13 SYS, 14 SHIFT, 15 BIND.
+//
+// simuSetKey() only writes to the state array, and the polling loop does not
+// filter, so any index is deliverable - but only the keys the target's GUI
+// actually consumes do anything. TX16SMK3's colour LCD reacts to exactly seven:
+// EXIT, ENTER, PAGEUP, PAGEDN, MODEL, TELE and SYS.
 void simuSetKey(uint8_t key, bool state);
+void simuSetSwitch(uint8_t swtch, int8_t state);
 
 // Implemented by the Android host layer inside the simulator library
 // (radio/src/targets/simu/android_host.cpp). They let the app feed real
@@ -89,5 +94,10 @@ void setAnalogSource(bool external);
 
 // EdgeTX key index (see the EnumKeys note above); `down` = pressed.
 void setKey(uint8_t key, bool down);
+
+// Hardware switch position. `index` follows the board's switch table
+// (radio/src/boards/hw_defs/tx16smk3.json): 0 = SA, 1 = SB, 2 = SC, ... and
+// `state` is <0 = up, 0 = middle, >0 = down, matching boardSwitchGetPosition().
+void setSwitch(uint8_t index, int8_t state);
 
 }  // namespace simu

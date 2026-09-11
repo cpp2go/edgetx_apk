@@ -101,5 +101,6 @@ void setAnalogSource(bool external) {
 }
 
 void setKey(uint8_t key, bool down) { simuSetKey(key, down); }
+void setSwitch(uint8_t index, int8_t state) { simuSetSwitch(index, state); }
 
 }  // namespace simu

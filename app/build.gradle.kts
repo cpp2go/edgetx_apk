@@ -1,6 +1,43 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
 }
+
+// ---------------------------------------------------------------------------
+// DJI Mobile SDK (optional)
+//
+// The RC Plus 2's 5-way switch directions are reported as ABS_HAT0X/HAT0Y motion
+// events, which the RC firmware never dispatches to apps, so Android's input
+// layer cannot see them. The DJI Mobile SDK is the only documented API that knows
+// about them, so it is wired up here as an opt-in extra.
+//
+//   local.properties:
+//       dji.msdk=true          -> package the 132 MB SDK (default: off)
+//       dji.appKey=<App Key>   -> from developer.dji.com, bound to the package
+//                                 name + signing certificate fingerprint
+//
+// With the flag off, the build and the resulting APK are unchanged.
+// ---------------------------------------------------------------------------
+val localProps = Properties().apply {
+    val f = rootProject.file("local.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+val djiMsdkEnabled = ((project.findProperty("dji.msdk") as String?) ?: localProps.getProperty("dji.msdk") ?: "false").toBoolean()
+val djiMsdkVersion = (project.findProperty("dji.msdkVersion") as String?) ?: localProps.getProperty("dji.msdkVersion") ?: "5.18.0"
+val djiAppKey = (project.findProperty("dji.appKey") as String?) ?: localProps.getProperty("dji.appKey") ?: ""
+
+// ---------------------------------------------------------------------------
+// Target ABI
+//
+// Only the DJI RC Plus 2 (rc701) is supported, and it is 64-bit ARM. Building a
+// single ABI keeps the APK small - the DJI SDK alone contributes 60+ shared
+// objects per ABI. Override when an emulator build is needed:
+//
+//     ./gradlew :app:assembleRelease -Pabis=arm64-v8a,x86_64
+// ---------------------------------------------------------------------------
+val targetAbis = ((findProperty("abis") as String?) ?: "arm64-v8a")
+    .split(",").map { it.trim() }.filter { it.isNotEmpty() }
 
 android {
     namespace = "com.edgetx.droidui"
@@ -16,6 +53,10 @@ android {
         versionCode = 1
         versionName = "0.1.0"
 
+        // The DJI Mobile SDK reads its App Key from this manifest meta-data
+        // (SDKManager.registerApp() takes no argument). Empty when MSDK is unused.
+        manifestPlaceholders["djiAppKey"] = djiAppKey
+
         externalNativeBuild {
             cmake {
                 // EdgeTX-like target uses C++17. Keep exceptions/RTTI on for Lua.
@@ -25,10 +66,8 @@ android {
         }
 
         ndk {
-            // arm64 for real hardware, x86_64 for the local emulator, and
-            // armeabi-v7a because many phones report only 32-bit ARM
-            // (64-bit kernel with a 32-bit userspace).
-            abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86_64")
+            // The RC Plus 2 is arm64-v8a only (see targetAbis above).
+            abiFilters += targetAbis
         }
     }
 
@@ -45,6 +84,62 @@ android {
             // Signed with the debug keystore so the release APK can be installed
             // directly on a phone. Swap in a real keystore for distribution.
             signingConfig = signingConfigs.getByName("debug")
+        }
+    }
+
+    packaging {
+        jniLibs {
+            // The DJI SDK contributes ~300 MB of shared objects for a single ABI.
+            // AGP stores native libraries uncompressed by default from API 24 on,
+            // which makes the APK enormous. Compressing them (this is what
+            // extractNativeLibs="true" means) roughly halves it, and the DJI docs
+            // ask for extractNativeLibs="true" from MSDK 5.17.0 anyway.
+            useLegacyPackaging = true
+
+            // The SDK only ships as one 132 MB blob, but this app uses nothing
+            // beyond the Key-Value API (sticks, buttons). Everything below was
+            // removed one group at a time and the app re-run to confirm
+            // SDKManager.init(), registerApp() and the stick/button listeners all
+            // still work. 168.5 MB -> 111.1 MB.
+            //
+            // Measured boundary - these look removable but are NOT, each one was
+            // tried and made SDKManager.init() throw UnsatisfiedLinkError:
+            //   libFlightRecordEngine.so  DT_NEEDED of libdjisdk_jni.so, so
+            //                             dropping it breaks the Key-Value JNI
+            //                             (native_get_sync) even though we never
+            //                             use flight records
+            //   libDJIUpgradeCore.so      + libDJIUpgradeJNI.so - loaded by
+            //                             CSDKManager.setServerUrlMode() at init
+            //   libsqlcipher.so           System.loadLibrary("sqlcipher") at init
+            //   libDJIFlySafeCore-CSDK.so loaded at init
+            //
+            // Before adding anything here, check what links against it:
+            //   llvm-readelf -d <lib>.so | grep NEEDED
+            // A missing dependency is only fatal if the depending library is
+            // actually dlopen'ed - that is why the ffmpeg group can go even though
+            // the (never loaded) libDJIOpus.so needs it.
+            excludes += listOf(
+                // Live streaming: Agora, private RTMP, WebRTC, RTSP, NDI.
+                "**/libagora-*.so",
+                "**/libmrtc_*.so",
+                "**/libndi.so",
+                "**/libopuspilot.so",
+                // FFmpeg, used only to decode/encode those streams.
+                "**/libavcodec.so",
+                "**/libavdevice.so",
+                "**/libavfilter.so",
+                "**/libavformat.so",
+                "**/libavresample.so",
+                "**/libswresample.so",
+                "**/libswscale.so",
+                // DJI Cloud API: nothing in the init path touches it.
+                "**/libcloud_access_jni.so",
+                // Waypoint missions: a separate manager the Key-Value API never
+                // instantiates; only libdjiwpv2-CSDK.so links against it, and that
+                // is never loaded either.
+                "**/libwpmz_jni.so",
+                "**/libDJIWaypointV2Core-CSDK.so",
+            )
         }
     }
 }
@@ -65,7 +160,7 @@ val cmakeExe = "$sdkDir/cmake/3.22.1/bin/cmake.exe"
 val simuPcb = (findProperty("edgetx.pcb") as String?) ?: "TX16SMK3"
 val simuName = (findProperty("edgetx.simuName") as String?) ?: "st16mk3"
 val simuLibName = "libedgetx-$simuName-simulator.so"
-val simuAbis = ((findProperty("edgetx.abis") as String?) ?: "armeabi-v7a,arm64-v8a,x86_64")
+val simuAbis = ((findProperty("edgetx.abis") as String?) ?: targetAbis.joinToString(","))
     .split(",").map { it.trim() }.filter { it.isNotEmpty() }
 
 // Python interpreter for EdgeTX's build-time code generators (pydantic +
@@ -174,6 +269,26 @@ val buildEdgeTxSimulator = tasks.register("buildEdgeTxSimulator") {
             built.copyTo(File(abiOut, simuLibName), overwrite = true)
             println("staged $abi -> ${File(abiOut, simuLibName)}")
         }
+
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DJI Mobile SDK dependencies
+//
+// The `-provided` artifact is a compile-only stub set, so DjiMsdkBridge.java
+// always compiles. The real SDK (a 132 MB AAR carrying the native libraries) is
+// only packaged when dji.msdk=true.
+// ---------------------------------------------------------------------------
+dependencies {
+    compileOnly("com.dji:dji-sdk-v5-aircraft-provided:$djiMsdkVersion")
+    if (djiMsdkEnabled) {
+        implementation("com.dji:dji-sdk-v5-aircraft:$djiMsdkVersion")
+        // The SDK's analytics module probes permissions through
+        // androidx.core.app.ActivityCompat. This app is pure native and depends on
+        // no AndroidX of its own, so without this the SDK dies with a
+        // NoClassDefFoundError as soon as it is initialised.
+        implementation("androidx.core:core:1.13.1")
     }
 }
 

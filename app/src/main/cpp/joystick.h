@@ -35,4 +35,27 @@ bool handleMotionEvent(AInputEvent* event);
 // mapping can be settled against a real device.
 bool handleKeyEvent(AInputEvent* event);
 
+// Queue a synthetic key press (used by the DJI SDK bridge, which cannot press a
+// key by itself - see joystick.cpp). Call once per frame from the host loop:
+// the firmware only samples key state periodically, and every setKey() call has
+// to come from the same thread as the Android input path.
+void requestKey(uint8_t key);
+void tick();
+
+// Queue a stick position from the DJI SDK (axis 0..3, see nativeOnDjiStick).
+// Applied from tick() for the same reasons as requestKey().
+void requestStick(int axis, int32_t value);
+
+// Queue an absolute dial position (P1 = channel 4, P2 = channel 5). The dials
+// report the same -660..660 range as the sticks.
+void requestDial(uint8_t channel, int32_t value);
+
+// Queue scroll-wheel movement. The wheel only reports relative steps, so they are
+// accumulated into an EdgeTX slider (channel 7 = SL2).
+void requestScrollWheel(int32_t steps);
+
+// Queue a hardware switch position from the DJI SDK. `index` is 0 = SA, 1 = SB
+// (see nativeOnDjiSwitch); `state` is <0 up, 0 middle, >0 down.
+void requestSwitch(int index, int8_t state);
+
 }  // namespace joystick

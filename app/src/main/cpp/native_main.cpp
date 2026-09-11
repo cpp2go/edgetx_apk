@@ -328,6 +328,9 @@ extern "C" void android_main(struct android_app* app) {
         }
         if (app->destroyRequested) break;
 
+        // Service queued synthetic key presses (DJI SDK buttons).
+        joystick::tick();
+
         // Present a new firmware frame when one is ready.
         if (g_uiRunning && g_window != nullptr) {
             if (simu::takeFrame(reinterpret_cast<uint8_t*>(g_frame.data()),
