@@ -250,13 +250,29 @@ void on_app_cmd(struct android_app* app, int32_t cmd) {
 
 int32_t on_input_event(struct android_app* app, AInputEvent* event) {
     (void)app;
-    if (AInputEvent_getType(event) != AINPUT_EVENT_TYPE_MOTION) return 0;
+    const int32_t type = AInputEvent_getType(event);
 
-    // A hardware joystick (gamepad, or an RC transmitter enumerating as a HID
-    // joystick) drives the firmware's analog channels. It has to be consumed
-    // here: every MotionEvent carries an X/Y pair, so a stick event would
-    // otherwise be interpreted as a touch somewhere on the LCD.
+    // Buttons on a hardware controller (gamepad, or an RC transmitter that
+    // enumerates as one) become EdgeTX key presses.
+    if (type == AINPUT_EVENT_TYPE_KEY) {
+        if (joystick::handleKeyEvent(event)) return 1;
+        return 0;
+    }
+
+    if (type != AINPUT_EVENT_TYPE_MOTION) return 0;
+
+    // Axes from the same controllers drive the firmware's analog channels. The
+    // stick event has to be consumed here: every MotionEvent carries an X/Y
+    // pair, so it would otherwise be interpreted as a touch somewhere on the
+    // LCD.
     if (joystick::handleMotionEvent(event)) return 1;
+
+    // Only a real touchscreen drives EdgeTX's touch input. A mouse or any other
+    // pointer device must not be turned into taps on the LCD.
+    if ((AInputEvent_getSource(event) & AINPUT_SOURCE_TOUCHSCREEN) !=
+        AINPUT_SOURCE_TOUCHSCREEN) {
+        return 0;
+    }
 
     if (!g_uiRunning || g_lcdW <= 0) return 0;
 

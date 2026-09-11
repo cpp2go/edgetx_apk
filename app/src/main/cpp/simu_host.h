@@ -27,6 +27,13 @@ void simuLcdFlushed();
 void simuTouchDown(int16_t x, int16_t y);
 void simuTouchUp();
 
+// Key injection. `key` is an index into EdgeTX's EnumKeys
+// (radio/src/hal/key_driver.h): 0 MENU, 1 EXIT, 2 ENTER, 3 PAGEUP, 4 PAGEDN,
+// 5 UP, 6 DOWN, 7 LEFT, 8 RIGHT, 9 PLUS, 10 MINUS, 11 MODEL, 12 TELE,
+// 13 SYS, 14 SHIFT, 15 BIND.  Only the ones the target defines do anything:
+// TX16SMK3 has EXIT, ENTER, PAGEUP, PAGEDN, MODEL, TELE and SYS.
+void simuSetKey(uint8_t key, bool state);
+
 // Implemented by the Android host layer inside the simulator library
 // (radio/src/targets/simu/android_host.cpp). They let the app feed real
 // hardware-joystick values into the firmware's ADC channels.
@@ -79,5 +86,8 @@ void pushAnalog(uint8_t idx, uint16_t value);
 // false = the firmware generates its demo sine wave (no joystick attached),
 // true = use the values pushed with pushAnalog().
 void setAnalogSource(bool external);
+
+// EdgeTX key index (see the EnumKeys note above); `down` = pressed.
+void setKey(uint8_t key, bool down);
 
 }  // namespace simu

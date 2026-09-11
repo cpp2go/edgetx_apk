@@ -100,4 +100,6 @@ void setAnalogSource(bool external) {
     edgetxAndroidSetAnalogExternal(external ? 1 : 0);
 }
 
+void setKey(uint8_t key, bool down) { simuSetKey(key, down); }
+
 }  // namespace simu

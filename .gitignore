@@ -7,6 +7,10 @@ build/
 .idea/
 *.iml
 local.properties
+
+# VS Code workspace config: machine-specific (e.g. the ESP-IDF setup path),
+# never shared.
+.vscode/
 captures/
 .externalNativeBuild/
 .cxx/
