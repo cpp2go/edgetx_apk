@@ -369,6 +369,12 @@ extern "C" void android_main(struct android_app* app) {
         static int frames = 0;
         if (++frames == 240 && g_uiRunning) {
             simu::logFirmwareBattery();
+            // Says which protocol drives the external module port (ModuleType:
+            // 0 none, 1 ppm, 2 xjt, 3 isrm, 4 dsm2, 5 crsf, 6 multimodule). 0 means the
+            // model has the slot switched off, and then EdgeTX never opens it - no bytes
+            // will flow however well the USB serial link itself is working.
+            LOGI("module: external RF protocol = %u (0 off, 5 crsf)",
+                 static_cast<unsigned>(simu::externalModuleType()));
         }
 
         // Present a new firmware frame when one is ready.

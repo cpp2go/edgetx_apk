@@ -74,6 +74,15 @@ void edgetxAndroidSetBattery(uint16_t millivolts, uint8_t charging) __attribute_
 // library has it but the reading does not use it".
 uint16_t edgetxAndroidBatteryMillivolts() __attribute__((weak));
 
+// The firmware's battery warning threshold and the range behind its percentage, all in
+// 100 mV steps. Weak like the others: an older simulator library simply has no such
+// entry point and then the log omits them.
+void edgetxAndroidBatterySettings(uint16_t* warn, uint16_t* batMin, uint16_t* batMax)
+    __attribute__((weak));
+
+// Protocol the model selected for the external module (MODULE_TYPE_*, 0 = slot off).
+uint8_t edgetxAndroidExternalModuleType() __attribute__((weak));
+
 // Aux serial bridge (radio/src/targets/simu/simulib.h). The firmware calls the
 // sink when its external-module serial port starts, stops, changes baud rate or
 // transmits; the app feeds bytes back in with simuAuxSerialReceive().
@@ -197,5 +206,8 @@ uint32_t audioDroppedBytes();
 void edgetxAndroidSetHostAudioPending(uint32_t bytes) __attribute__((weak));
 void setAudioPending(uint32_t bytes);
 uint32_t audioPendingBytes();
+
+// Protocol the model selected for the external module slot, 0 when it is off.
+uint8_t externalModuleType();
 
 }  // namespace simu

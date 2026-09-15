@@ -163,6 +163,10 @@ void setAudioPending(uint32_t bytes) {
 
 uint32_t audioPendingBytes() { return g_audioPending.load(); }
 
+uint8_t externalModuleType() {
+    return edgetxAndroidExternalModuleType != nullptr ? edgetxAndroidExternalModuleType() : 0;
+}
+
 void logFirmwareBattery() {
     // Only valid once the firmware is up: adcGetMaxInputs() walks tables that do not
     // exist before simuInit(), and calling it earlier is a null dereference.
@@ -171,11 +175,22 @@ void logFirmwareBattery() {
     const uint16_t tenths = static_cast<uint16_t>(raw / 10);
     const uint16_t hostSeen =
         edgetxAndroidBatteryMillivolts != nullptr ? edgetxAndroidBatteryMillivolts() : 0;
-    LOGI("battery: rc %u mV %u%% %s | firmware shows %u.%u V, charger icon %d | "
-         "firmware-side host mV %u",
+
+    // Radio Setup -> Alarms (warning) and -> Hardware (the range that scales the %).
+    // Worth logging: the range does not drive the low-voltage warning, and the two are
+    // easy to confuse when the pack sits just above the default 7.4 V threshold.
+    uint16_t warn = 0, batMin = 0, batMax = 0;
+    if (edgetxAndroidBatterySettings != nullptr)
+        edgetxAndroidBatterySettings(&warn, &batMin, &batMax);
+
+    LOGI("battery: rc %u mV %u%% %s | firmware %u.%u V, warn %u.%u V, range %u.%u-%u.%u V, "
+         "charger %d | firmware-side host mV %u",
          g_batteryMv.load(), g_batteryPercent.load(),
          g_batteryCharging.load() ? "charging" : "not charging",
          static_cast<unsigned>(tenths / 10), static_cast<unsigned>(tenths % 10),
+         static_cast<unsigned>(warn / 10), static_cast<unsigned>(warn % 10),
+         static_cast<unsigned>(batMin / 10), static_cast<unsigned>(batMin % 10),
+         static_cast<unsigned>(batMax / 10), static_cast<unsigned>(batMax % 10),
          usbChargerLed() ? 1 : 0, static_cast<unsigned>(hostSeen));
 }
 
