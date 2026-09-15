@@ -282,6 +282,12 @@ val buildEdgeTxSimulator = tasks.register("buildEdgeTxSimulator") {
 // ---------------------------------------------------------------------------
 dependencies {
     compileOnly("com.dji:dji-sdk-v5-aircraft-provided:$djiMsdkVersion")
+
+    // External RF module on a USB serial port. Supports CDC-ACM and the usual
+    // USB-serial bridges (FTDI, CP210x, CH34x, PL2303), which is what a module
+    // or a module adapter presents to the RC.
+    implementation("com.github.mik3y:usb-serial-for-android:3.8.1")
+
     if (djiMsdkEnabled) {
         implementation("com.dji:dji-sdk-v5-aircraft:$djiMsdkVersion")
         // The SDK's analytics module probes permissions through

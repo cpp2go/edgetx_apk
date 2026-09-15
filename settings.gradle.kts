@@ -17,6 +17,8 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // usb-serial-for-android (external RF module over a USB serial port).
+        maven { url = uri("https://jitpack.io") }
     }
 }
 

@@ -15,6 +15,15 @@
 void simuInit();
 void simuFatfsSetPaths(const char* sdPath, const char* settingsPath);
 void simuCreateDefaults();
+
+// Boot with the EdgeTX splash screen, but skip the first-boot calibration wizard
+// and the throttle/switch startup checks. Call before simuStart().
+//
+// The splash dismisses itself after SPLASH_TIMEOUT; the wizard and the startup
+// checks wait for key presses, and this RC's touch panel does not reach the
+// firmware, so they would be dead ends.
+void simuSetSplashStartup();
+
 void simuStart(bool tests);
 void simuStop();
 bool simuIsRunning();
@@ -36,6 +45,13 @@ void simuTouchUp();
 // filter, so any index is deliverable - but only the keys the target's GUI
 // actually consumes do anything. TX16SMK3's colour LCD reacts to exactly seven:
 // EXIT, ENTER, PAGEUP, PAGEDN, MODEL, TELE and SYS.
+// Rotary encoder steps (positive = clockwise), from radio/src/targets/simu/simulib.h.
+//
+// Each step moves the firmware's encoder position, which EdgeTX feeds to LVGL as
+// encoder input: it walks the focus between the controls of the current window and,
+// with a field in edit mode, changes its value.
+void simuRotaryEncoderEvent(int32_t steps);
+
 void simuSetKey(uint8_t key, bool state);
 void simuSetSwitch(uint8_t swtch, int8_t state);
 
@@ -44,6 +60,40 @@ void simuSetSwitch(uint8_t swtch, int8_t state);
 // hardware-joystick values into the firmware's ADC channels.
 void edgetxAndroidSetAnalog(uint8_t idx, uint16_t value);
 void edgetxAndroidSetAnalogExternal(uint8_t on);
+
+// Battery and charging state, read by the firmware's own battery and charger paths
+// (targets/simu/adc_driver.cpp and led_driver.cpp).
+//
+// Weak on purpose: it only exists in simulator libraries built after the injection was
+// added, and a strong reference would make the whole app fail to load against an older
+// one. Check for null before calling (see setBattery).
+void edgetxAndroidSetBattery(uint16_t millivolts, uint8_t charging) __attribute__((weak));
+
+// Aux serial bridge (radio/src/targets/simu/simulib.h). The firmware calls the
+// sink when its external-module serial port starts, stops, changes baud rate or
+// transmits; the app feeds bytes back in with simuAuxSerialReceive().
+//
+// This is what lets the external RF module live on a USB serial port: the
+// protocol is the one EdgeTX is configured for, and its bytes come out here.
+struct edgetxAndroidSerialSink {
+    void (*start)(uint8_t port_nr, uint32_t baudrate, uint8_t encoding);
+    void (*stop)(uint8_t port_nr);
+    void (*setBaudrate)(uint8_t port_nr, uint32_t baudrate);
+    void (*send)(uint8_t port_nr, const uint8_t* data, uint32_t len);
+};
+
+// Weak for the same reason as edgetxAndroidSetBattery: an older simulator library
+// without the bridge must not stop the app from loading (see module_serial::init).
+void edgetxAndroidSetAuxSerialSink(const edgetxAndroidSerialSink* sink) __attribute__((weak));
+
+// port_nr is 0 for AUX1, 1 for AUX2 - the external module port uses AUX1.
+void simuAuxSerialReceive(uint8_t port_nr, const uint8_t* data, uint32_t len);
+
+// Readings the firmware exposes. Used to report what the UI is actually showing.
+// getBatteryVoltage() returns the raw ADC value, which the UI divides by 20 to
+// get tenths of a volt; usbChargerLed() drives the charging icon in the top bar.
+uint16_t getBatteryVoltage();
+bool usbChargerLed();
 
 namespace simu {
 
@@ -92,6 +142,11 @@ void pushAnalog(uint8_t idx, uint16_t value);
 // true = use the values pushed with pushAnalog().
 void setAnalogSource(bool external);
 
+// Queue rotary encoder steps (positive = clockwise). One step is one encoder detent:
+// it moves the focus, and edits the value of a field that is in edit mode. This is
+// the navigation control on this target - the UP/DOWN/LEFT/RIGHT keys do nothing.
+void rotaryEncoderEvent(int32_t steps);
+
 // EdgeTX key index (see the EnumKeys note above); `down` = pressed.
 void setKey(uint8_t key, bool down);
 
@@ -99,5 +154,18 @@ void setKey(uint8_t key, bool down);
 // (radio/src/boards/hw_defs/tx16smk3.json): 0 = SA, 1 = SB, 2 = SC, ... and
 // `state` is <0 = up, 0 = middle, >0 = down, matching boardSwitchGetPosition().
 void setSwitch(uint8_t index, int8_t state);
+
+// Battery state reported by Android (see RcBattery.java).
+//
+// Note the battery is the one reading the firmware does not take from the host:
+// targets/simu/adc_driver.cpp recomputes it from the configured warning voltage on
+// every conversion, so the firmware keeps showing its own value - logFirmwareBattery()
+// records both. It takes effect once that driver prefers the host's value, which needs
+// the simulator library to be rebuilt.
+void setBattery(uint16_t millivolts, uint8_t percent, bool charging);
+
+// Logs the battery the firmware itself reports, next to the RC's. Only call this once
+// the firmware is running (the ADC tables are set up by simuInit()).
+void logFirmwareBattery();
 
 }  // namespace simu

@@ -46,9 +46,17 @@ void tick();
 // Applied from tick() for the same reasons as requestKey().
 void requestStick(int axis, int32_t value);
 
-// Queue an absolute dial position (P1 = channel 4, P2 = channel 5). The dials
+// Queue an absolute dial position. `dial` is 0 = left, 1 = right; the dials
 // report the same -660..660 range as the sticks.
-void requestDial(uint8_t channel, int32_t value);
+//
+// The dials drive EdgeTX's rotary encoder, not P1/P2: the movement between two
+// readings is turned into encoder steps, which move the focus and edit values in
+// the colour-LCD UI.
+void requestDial(uint8_t dial, int32_t value);
+
+// Queue rotary encoder steps directly (positive = clockwise = right). The 5-way's
+// up/down use it: up is one step left, down is one step right.
+void requestRotary(int32_t steps);
 
 // Queue scroll-wheel movement. The wheel only reports relative steps, so they are
 // accumulated into an EdgeTX slider (channel 7 = SL2).

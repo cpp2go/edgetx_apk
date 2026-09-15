@@ -29,17 +29,23 @@ namespace {
 // EVT_KEY_FIRST(KEY_LEFT/RIGHT) is exactly equivalent to the rotary encoder
 // turning - but that equivalence lives under NAVIGATION_9X / NAVIGATION_XLITE
 // (gui/navigation/common.cpp), which TX16SMK3 does not use. Its colour LCD GUI
-// reacts to seven keys and nothing else:
+// reacts to seven keys:
 //
 //     EXIT  ENTER  PAGEUP  PAGEDN  MODEL  TELE  SYS
 //
-// Injecting LEFT/RIGHT therefore yields a well-formed event that no window
-// consumes; LvglWrapper's evt_to_indev_data() forwards only ENTER and EXIT into
-// LVGL. There is no "step to the next field" key on this target.
+// UP and DOWN are not produced by anything: they are consumed only by the
+// monochrome UIs (gui/128x64, navigation_9x) and by Lua, so nothing in
+// gui/colorlcd would react to them. LEFT/RIGHT are worse still, because
+// LvglWrapper's evt_to_indev_data() forwards only ENTER and EXIT into LVGL. There
+// is no "step to the next field" key on this target - its navigation control is
+// the rotary encoder, which the dials and the 5-way's up/down drive instead (see
+// simu::rotaryEncoderEvent()).
 constexpr uint8_t kKeyExit = 1;
 constexpr uint8_t kKeyEnter = 2;
 constexpr uint8_t kKeyPageUp = 3;
 constexpr uint8_t kKeyPageDn = 4;
+constexpr uint8_t kKeyUp = 5;
+constexpr uint8_t kKeyDown = 6;
 constexpr uint8_t kKeyModel = 11;
 constexpr uint8_t kKeyTele = 12;
 constexpr uint8_t kKeySys = 13;
@@ -212,6 +218,8 @@ const char* etkey_name(uint8_t key) {
         case kKeyEnter: return "ENTER";
         case kKeyPageUp: return "PAGEUP";
         case kKeyPageDn: return "PAGEDN";
+        case kKeyUp: return "UP";
+        case kKeyDown: return "DOWN";
         case kKeyModel: return "MODEL";
         case kKeyTele: return "TELE";
         case kKeySys: return "SYS";
@@ -275,8 +283,8 @@ const NamedId kAndroidKeyNames[] = {
 
 const NamedId kEtKeyNames[] = {
     {"EXIT", kKeyExit},     {"ENTER", kKeyEnter}, {"PAGEUP", kKeyPageUp},
-    {"PAGEDN", kKeyPageDn}, {"MODEL", kKeyModel}, {"TELE", kKeyTele},
-    {"SYS", kKeySys},
+    {"PAGEDN", kKeyPageDn}, {"UP", kKeyUp},       {"DOWN", kKeyDown},
+    {"MODEL", kKeyModel},   {"TELE", kKeyTele},   {"SYS", kKeySys},
 };
 
 std::string trim(const std::string& s) {
@@ -737,7 +745,8 @@ constexpr auto kThumbLDedup = std::chrono::milliseconds(500);
 // The RC's L1/L2/L3/R1/R2/R3 buttons arrive as plain Android key codes F1..F6
 // (measured - the SDK's own boolean button keys are all silent on this remote).
 // They are momentary, so each drives an EdgeTX switch: pressed = down, released
-// = up. SA (index 0) belongs to the flight-mode switch, so these start at SB.
+// = up. SA and SB are taken by the takeoff button and the flight-mode switch, so
+// these start at SC.
 //
 // A key code listed in joystick.keys wins, which is how any of these can be made
 // an EdgeTX key instead.
@@ -747,12 +756,12 @@ struct SwitchKey {
 };
 
 const SwitchKey kSwitchKeys[] = {
-    {AKEYCODE_F1, 1},  // L1 -> SB
-    {AKEYCODE_F2, 2},  // L2 -> SC
-    {AKEYCODE_F3, 3},  // L3 -> SD
-    {AKEYCODE_F4, 4},  // R1 -> SE
-    {AKEYCODE_F5, 5},  // R2 -> SF
-    {AKEYCODE_F6, 6},  // R3 -> SG
+    {AKEYCODE_F1, 2},  // L1 -> SC
+    {AKEYCODE_F2, 3},  // L2 -> SD
+    {AKEYCODE_F3, 4},  // L3 -> SE
+    {AKEYCODE_F4, 5},  // R1 -> SF
+    {AKEYCODE_F5, 6},  // R2 -> SG
+    {AKEYCODE_F6, 7},  // R3 -> SH
 };
 
 std::vector<int32_t> g_loggedSwitchKeys;
@@ -866,10 +875,12 @@ constexpr uint8_t kStickChannels[4] = {0, 1, 3, 2};
 constexpr int32_t kDjiStickRange = 660;
 
 // Switches we drive, indexed by the board's switch table
-// (radio/src/boards/hw_defs/tx16smk3.json): 0 = SA .. 7 = SH.
-//   0    flight-mode switch          (DJI SDK)
-//   1-6  L1/L2/L3/R1/R2/R3           (Android key codes, see kSwitchKeys)
-constexpr int kSwitchCount = 8;
+// (radio/src/boards/hw_defs/tx16smk3.json): 0 = SA .. 9 = SJ.
+//   0    takeoff button                 (DJI SDK, press toggles high/low)
+//   1    flight-mode switch             (DJI SDK, three-position)
+//   2-7  L1/L2/L3/R1/R2/R3              (Android key codes, see kSwitchKeys)
+//   9    aircraft arm state             (DJI SDK KeyAreMotorsOn; SJ is unused otherwise)
+constexpr int kSwitchCount = 10;
 
 std::mutex g_switchMutex;
 bool g_switchQueued[kSwitchCount] = {};
@@ -884,6 +895,27 @@ std::mutex g_analogMutex;
 bool g_analogQueued[kMaxAnalogChannels] = {};
 uint16_t g_analogValue[kMaxAnalogChannels] = {};
 int32_t g_scrollWheelValue = 0;
+
+// ---- dials -> rotary encoder -----------------------------------------------
+//
+// The two dials are absolute (-660..660, like the sticks) while EdgeTX's rotary
+// encoder is relative, one detent at a time, so the dial movement is accumulated
+// and whole detents are emitted with the remainder carried over - slow, fine turns
+// then still register. The steps are handed to the firmware by tick(), which moves
+// the encoder EdgeTX already has: turning walks the focus through the controls of
+// the current screen, and with a field in edit mode it changes its value.
+//
+// The dials do not drive P1/P2, because the encoder is a real input device on this
+// board: ROTARY_ENCODER_NAVIGATION is defined - the TX16SMK3 hal header is generated
+// into the build directory - so every window's group is attached to it.
+constexpr uint8_t kDialCount = 2;      // 0 = left dial, 1 = right dial
+constexpr int32_t kDialDetent = 33;    // SDK units of dial travel per detent
+
+std::mutex g_dialMutex;
+bool g_dialSeen[kDialCount] = {};
+int32_t g_dialLast[kDialCount] = {};
+int32_t g_dialRemainder[kDialCount] = {};
+int32_t g_rotaryQueued = 0;
 
 // One wheel detent covers this much of the range, so ~20 detents is full travel.
 constexpr int32_t kScrollWheelStep = 33;
@@ -906,16 +938,42 @@ void requestStick(int axis, int32_t value) {
     requestAnalog(kStickChannels[axis], dji_analog(value));
 }
 
-void requestDial(uint8_t channel, int32_t value) {
-    requestAnalog(channel, dji_analog(value));
+void requestDial(uint8_t dial, int32_t value) {
+    if (dial >= kDialCount) return;
+
+    std::lock_guard<std::mutex> lock(g_dialMutex);
+
+    if (!g_dialSeen[dial]) {
+        // The first reading is the reference position, not a movement.
+        g_dialSeen[dial] = true;
+        g_dialLast[dial] = value;
+        return;
+    }
+
+    g_dialRemainder[dial] += value - g_dialLast[dial];
+    g_dialLast[dial] = value;
+
+    const int32_t steps = g_dialRemainder[dial] / kDialDetent;
+    if (steps != 0) {
+        g_dialRemainder[dial] -= steps * kDialDetent;
+        g_rotaryQueued += steps;
+    }
 }
 
+// Queue rotary encoder steps directly (positive = clockwise = right). Used by the
+// 5-way's up/down, and drained by tick() along with whatever the dials produced.
+void requestRotary(int32_t steps) {
+    std::lock_guard<std::mutex> lock(g_dialMutex);
+    g_rotaryQueued += steps;
+}
+
+// The wheel reports relative steps that fall back to 0 after each detent, so they
+// are accumulated into a slider.
+//
+// Nothing produces the MODEL or TELE keys: they remain valid EdgeTX keys and can
+// still be assigned through the key-map file, but no built-in control sends them.
 void requestScrollWheel(int32_t steps) {
     std::lock_guard<std::mutex> lock(g_analogMutex);
-    // The wheel reports relative steps: it returns to 0 after each detent.
-    // ROTARY_ENCODER_NAVIGATION is not compiled in for TX16SMK3 (see the board
-    // table), so simuRotaryEncoderEvent() is a no-op and accumulating into a
-    // slider is the only way to make the wheel usable.
     g_scrollWheelValue += steps * kScrollWheelStep;
     if (g_scrollWheelValue > kDjiStickRange) g_scrollWheelValue = kDjiStickRange;
     if (g_scrollWheelValue < -kDjiStickRange) g_scrollWheelValue = -kDjiStickRange;
@@ -985,6 +1043,26 @@ void tick() {
         }
         if (queued) simu::setSwitch(static_cast<uint8_t>(index), state);
     }
+
+    // Rotary steps collected since the last frame, from the dials and from the
+    // 5-way's up/down.
+    int32_t steps;
+    {
+        std::lock_guard<std::mutex> lock(g_dialMutex);
+        steps = g_rotaryQueued;
+        g_rotaryQueued = 0;
+    }
+    if (steps != 0) {
+        // Rate-limited: turning a dial or leaning on the 5-way produces a burst of
+        // steps and only the fact that they are flowing is interesting in the log.
+        static auto lastLog = std::chrono::steady_clock::time_point{};
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastLog >= std::chrono::milliseconds(500)) {
+            lastLog = now;
+            LOGI("joystick: rotary -> %d step(s)", static_cast<int>(steps));
+        }
+        simu::rotaryEncoderEvent(steps);
+    }
 }
 
 // Called from DjiMsdkBridge.java (DJI Mobile SDK) for RC buttons that Android's
@@ -1001,8 +1079,18 @@ Java_com_edgetx_droidui_DjiMsdkBridge_nativeOnDjiButton(JNIEnv* env, jclass claz
 
     uint8_t key = 0;
     switch (id) {
-        case 1: key = kKeyModel; break;    // 5-way up    -> model menu
-        case 2: key = kKeyTele; break;     // 5-way down  -> telemetry        // The SDK's leftwards/rightwards flags do match the physical directions
+        // Up and down drive EdgeTX's rotary encoder, one detent per press: up turns
+        // it left, down turns it right. They do not report UP/DOWN (the colour UI
+        // ignores those), and nothing maps to MODEL/TELE any more either.
+        case 1:
+            LOGI("joystick: DJI SDK button id %d -> rotary left", id);
+            requestRotary(-1);
+            return;
+        case 2:
+            LOGI("joystick: DJI SDK button id %d -> rotary right", id);
+            requestRotary(1);
+            return;
+        // The SDK's leftwards/rightwards flags do match the physical directions
         // (verified against the log), so this is purely about which way the page
         // should turn: left goes back, right goes forward.
         case 3: key = kKeyPageUp; break;   // 5-way left  -> previous page
@@ -1016,7 +1104,6 @@ Java_com_edgetx_droidui_DjiMsdkBridge_nativeOnDjiButton(JNIEnv* env, jclass claz
             }
             key = kKeyEnter;               // 5-way press -> confirm
             break;
-        case 6: key = kKeySys; break;      // go-home button -> SYS
         default:
             LOGI("joystick: DJI SDK button id %d (unmapped)", id);
             return;
@@ -1041,14 +1128,16 @@ Java_com_edgetx_droidui_DjiMsdkBridge_nativeOnDjiStick(JNIEnv* env, jclass clazz
     requestStick(axis, value);
 }
 
-// Called from DjiMsdkBridge.java with a dial position. `channel` is an EdgeTX
-// analog channel index (4 = P1, 5 = P2 for this board).
+// Called from DjiMsdkBridge.java with a dial position. `dial` is 0 = left,
+// 1 = right; `value` is the SDK's absolute reading in the same -660..660 range
+// as the sticks. The movement is turned into rotary encoder steps (see
+// requestDial).
 extern "C" JNIEXPORT void JNICALL
-Java_com_edgetx_droidui_DjiMsdkBridge_nativeOnDjiDial(JNIEnv* env, jclass clazz, jint channel,
+Java_com_edgetx_droidui_DjiMsdkBridge_nativeOnDjiDial(JNIEnv* env, jclass clazz, jint dial,
                                                       jint value) {
     (void)env;
     (void)clazz;
-    requestDial(static_cast<uint8_t>(channel), value);
+    requestDial(static_cast<uint8_t>(dial), value);
 }
 
 // Called from DjiMsdkBridge.java with scroll-wheel movement in detents.

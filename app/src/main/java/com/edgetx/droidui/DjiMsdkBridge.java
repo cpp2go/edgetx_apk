@@ -3,10 +3,12 @@ package com.edgetx.droidui;
 import android.app.Application;
 import android.util.Log;
 
+import dji.sdk.keyvalue.key.DJIFlightControllerKey;
 import dji.sdk.keyvalue.key.DJIKey;
 import dji.sdk.keyvalue.key.DJIKeyInfo;
 import dji.sdk.keyvalue.key.DJIRemoteControllerKey;
 import dji.sdk.keyvalue.key.KeyTools;
+import dji.sdk.keyvalue.value.remotecontroller.BatteryInfo;
 import dji.sdk.keyvalue.value.remotecontroller.FiveDimensionPressedStatus;
 import dji.sdk.keyvalue.value.remotecontroller.RcCustomButtonEvent;
 import dji.sdk.keyvalue.value.remotecontroller.RcCustomButtonHardwareStatus;
@@ -40,7 +42,6 @@ public final class DjiMsdkBridge {
     static final int BTN_LEFT = 3;
     static final int BTN_RIGHT = 4;
     static final int BTN_PRESS = 5;
-    static final int BTN_SYS = 6;
 
     private static final Object OWNER = new Object();
     private static DJIKey<RcCustomButtonEvent> sButtonKey;
@@ -61,6 +62,13 @@ public final class DjiMsdkBridge {
 
     private DjiMsdkBridge() {}
 
+    /**
+     * A 5-way direction (one of the {@code BTN_*} ids above).
+     *
+     * <p>Up and down turn EdgeTX's rotary encoder by one detent - up is a step
+     * left, down a step right. Left and right page back and forward, and press is
+     * Enter. See the switch in joystick.cpp for the whole table.
+     */
     static native void nativeOnDjiButton(int buttonId);
 
     /**
@@ -78,13 +86,21 @@ public final class DjiMsdkBridge {
     static native void nativeOnDjiSwitch(int index, int state);
 
     /**
-     * Absolute dial position. `channel` is an EdgeTX analog channel index:
-     * 4 = P1, 5 = P2 for this board. The dials report the same -660..660 range as
-     * the sticks.
+     * Absolute dial position. `dial` is 0 = left, 1 = right; the dials report the
+     * same -660..660 range as the sticks.
+     *
+     * The dials drive EdgeTX's rotary encoder: the movement between two readings
+     * becomes encoder steps, which move the focus and edit values in the UI. They
+     * do not map to P1/P2 - see joystick.cpp.
      */
-    static native void nativeOnDjiDial(int channel, int value);
+    static native void nativeOnDjiDial(int dial, int value);
 
-    /** Scroll-wheel movement, in detents (the SDK value is relative). */
+    /**
+     * Scroll-wheel movement, in detents (the SDK value is relative).
+     *
+     * No built-in control produces the MODEL or TELE keys: the 5-way's up/down
+     * report the plain UP/DOWN keys instead.
+     */
     static native void nativeOnDjiScrollWheel(int steps);
 
     public static void init(Application app) {
@@ -152,6 +168,8 @@ public final class DjiMsdkBridge {
             listenFiveDimension();
             listenSticks();
             listenSwitches();
+            listenArmState();
+            listenBattery();
             listenDials();
             Log.i(TAG, "dji: registered, product category "
                     + SDKManager.getInstance().getProductCategory());
@@ -203,24 +221,6 @@ public final class DjiMsdkBridge {
                     });
         } catch (Throwable t) {
             Log.w(TAG, "dji: rc hardware listen failed", t);
-        }
-
-        // The go-home (RTH) button. Android never reports it and it has no entry
-        // in RcCustomButtonEvent either, so this key is the only source. It is a
-        // level as well, hence the rising edge.
-        try {
-            final DJIKey<Boolean> key =
-                    KeyTools.createKey(DJIRemoteControllerKey.KeyGoHomeButtonDown);
-            KeyManager.getInstance().listen(key, OWNER,
-                    new CommonCallbacks.KeyListener<Boolean>() {
-                        @Override
-                        public void onValueChange(Boolean oldValue, Boolean newValue) {
-                            Log.i(TAG, "dji: go-home button = " + newValue);
-                            edgeGoHome(newValue);
-                        }
-                    });
-        } catch (Throwable t) {
-            Log.w(TAG, "dji: go-home listen failed", t);
         }
     }
 
@@ -279,18 +279,149 @@ public final class DjiMsdkBridge {
         }
     }
 
-    /** Indices in the board's switch table (tx16smk3.json): 0 = SA, 1 = SB. */
+    /** Indices in the board's switch table (tx16smk3.json): 0 = SA, 1 = SB, 9 = SJ. */
     static final int SW_SA = 0;
     static final int SW_SB = 1;
 
     /**
-     * The RC's physical switches. Its flight-mode switch is three-position and its
-     * transformation switch is two-position, which line up with EdgeTX's switch
-     * positions (-1 up / 0 middle / 1 down).
+     * Free slot used to carry the aircraft's arm state into EdgeTX, where any screen,
+     * logical switch or special function can pick it up. On this board SJ is a real
+     * 2POS position that nothing else drives.
+     */
+    static final int SW_SJ = 9;
+
+    /**
+     * The takeoff button and the flight-mode switch.
+     *
+     * The takeoff button latches in hardware and has its own red/green LED (red = low,
+     * green = high), but the SDK only reports the moment it is pressed: a ~200 ms
+     * false -> true -> false pulse on KeyRCAuthLedButtonDown, never the latched level.
+     * Mirroring the value therefore never moves the switch, so each press toggles
+     * instead - one press high, the next low, which is exactly what the hardware does.
+     *
+     * KeyRCTransformationSwitchState is deliberately not listened to: the RC Plus 2
+     * does not have that switch and the key never fires on it.
      */
     private static void listenSwitches() {
-        listenEnumSwitch(SW_SA, DJIRemoteControllerKey.KeyFlightModeSwitchState);
-        listenEnumSwitch(SW_SB, DJIRemoteControllerKey.KeyRCTransformationSwitchState);
+        listenToggleSwitch(SW_SA, "takeoff", DJIRemoteControllerKey.KeyRCAuthLedButtonDown);
+        listenEnumSwitch(SW_SB, DJIRemoteControllerKey.KeyFlightModeSwitchState);
+    }
+
+    /**
+     * The takeoff button's two states as EdgeTX switch positions. The button powers up
+     * low with a red LED and that low state is SA down; the green LED is high, SA up -
+     * so the arrow points up whenever the LED is green.
+     */
+    private static final int TAKEOFF_LOW = 1;
+    private static final int TAKEOFF_HIGH = -1;
+
+    /**
+     * Latched state of the takeoff button as EdgeTX sees it. It tracks the hardware's
+     * own high/low because one SDK press pulse maps to exactly one toggle.
+     */
+    private static boolean sTakeoffHigh;
+
+    /** A button reporting only its press, driving a two-position EdgeTX switch. */
+    private static void listenToggleSwitch(final int index, final String label,
+                                           DJIKeyInfo<Boolean> info) {
+        try {
+            final DJIKey<Boolean> key = KeyTools.createKey(info);
+            KeyManager.getInstance().listen(key, OWNER,
+                    new CommonCallbacks.KeyListener<Boolean>() {
+                        @Override
+                        public void onValueChange(Boolean oldValue, Boolean newValue) {
+                            // The first callback is the initial snapshot, not a press,
+                            // and the SDK also reports the release half of the pulse.
+                            if (oldValue == null || !Boolean.TRUE.equals(newValue)) {
+                                return;
+                            }
+                            final boolean high;
+                            synchronized (DjiMsdkBridge.class) {
+                                sTakeoffHigh = !sTakeoffHigh;
+                                high = sTakeoffHigh;
+                            }
+                            Log.i(TAG, "dji: switch " + index + " (" + label + ") -> "
+                                    + (high ? "high" : "low"));
+                            dispatchToggle(index, high);
+                        }
+                    });
+            // Presses are all the SDK reports, so the latched level has to be assumed:
+            // the button starts out low (red LED), which is also how SA should look.
+            sTakeoffHigh = false;
+            dispatchToggle(index, false);
+        } catch (Throwable t) {
+            Log.w(TAG, "dji: " + label + " listen failed", t);
+        }
+    }
+
+    private static void dispatchToggle(int index, boolean high) {
+        try {
+            nativeOnDjiSwitch(index, high ? TAKEOFF_HIGH : TAKEOFF_LOW);
+        } catch (Throwable t) {
+            Log.w(TAG, "dji: switch " + index + " dispatch failed", t);
+        }
+    }
+
+    /**
+     * The RC's own battery as the SDK sees it. Only a cross-check: it carries a percentage
+     * but no charging state, so RcBattery (Android's BatteryManager) is the source of
+     * truth. Logging both makes it obvious if they ever disagree.
+     */
+    private static void listenBattery() {
+        try {
+            final DJIKey<BatteryInfo> key =
+                    KeyTools.createKey(DJIRemoteControllerKey.KeyBatteryInfo);
+            KeyManager.getInstance().listen(key, OWNER,
+                    new CommonCallbacks.KeyListener<BatteryInfo>() {
+                        @Override
+                        public void onValueChange(BatteryInfo oldValue, BatteryInfo newValue) {
+                            if (newValue == null) {
+                                return;
+                            }
+                            Log.i(TAG, "dji: rc battery " + newValue.getBatteryPercent() + "%, "
+                                    + "power=" + newValue.getBatteryPower()
+                                    + ", enabled=" + newValue.getEnabled());
+                        }
+                    });
+        } catch (Throwable t) {
+            Log.w(TAG, "dji: battery listen failed", t);
+        }
+    }
+
+    /**
+     * The aircraft's real arm state, as opposed to the button's latch.
+     *
+     * KeyAreMotorsOn is an input rather than a way to light anything - listening to it
+     * cannot colour an LED by itself - but it is the honest source of truth for what the
+     * remote is really doing, and it is what the arm indicator should be driven from.
+     * It only ever reports while an aircraft is connected.
+     */
+    private static void listenArmState() {
+        try {
+            final DJIKey<Boolean> key =
+                    KeyTools.createKey(DJIFlightControllerKey.KeyAreMotorsOn);
+            KeyManager.getInstance().listen(key, OWNER,
+                    new CommonCallbacks.KeyListener<Boolean>() {
+                        @Override
+                        public void onValueChange(Boolean oldValue, Boolean newValue) {
+                            if (newValue == null) {
+                                return;
+                            }
+                            Log.i(TAG, "dji: motors " + oldValue + " -> " + newValue);
+                            announce("motor state");
+                            // The one lamp this app can reach is not the one on the arm
+                            // button, but it is a real lamp, so it follows the arm state.
+                            RcLed.setColor(newValue ? RcLed.GREEN : RcLed.RED);
+                            try {
+                                nativeOnDjiSwitch(SW_SJ, newValue ? 1 : -1);
+                            } catch (Throwable t) {
+                                Log.w(TAG, "dji: arm state dispatch failed", t);
+                            }
+                        }
+                    });
+        } catch (Throwable t) {
+            Log.w(TAG, "dji: arm state listen failed", t);
+        }
     }
 
     private static <T> void listenEnumSwitch(final int index, DJIKeyInfo<T> info) {
@@ -342,22 +473,22 @@ public final class DjiMsdkBridge {
         return null;
     }
 
-    /** EdgeTX analog channels for this board's two pots (hw_defs/tx16smk3.json). */
-    static final int DIAL_P1 = 4;
-    static final int DIAL_P2 = 5;
+    /** The RC's two dials, as rotary encoder sources (see nativeOnDjiDial). */
+    static final int DIAL_LEFT = 0;
+    static final int DIAL_RIGHT = 1;
 
     /**
      * The two dials and the scroll wheel. The dials are absolute (-660..660, same
-     * as the sticks); the wheel only reports relative steps, which the native side
-     * accumulates into the SL2 slider because this target has no rotary navigation.
+     * as the sticks) and drive EdgeTX's rotary encoder; the wheel only reports
+     * relative steps, which the native side accumulates into the SL2 slider.
      */
     private static void listenDials() {
-        listenDial(DIAL_P1, DJIRemoteControllerKey.KeyLeftDial);
-        listenDial(DIAL_P2, DJIRemoteControllerKey.KeyRightDial);
+        listenDial(DIAL_LEFT, DJIRemoteControllerKey.KeyLeftDial);
+        listenDial(DIAL_RIGHT, DJIRemoteControllerKey.KeyRightDial);
         listenScrollWheel();
     }
 
-    private static void listenDial(final int channel, DJIKeyInfo<Integer> info) {
+    private static void listenDial(final int dial, DJIKeyInfo<Integer> info) {
         try {
             final DJIKey<Integer> key = KeyTools.createKey(info);
             KeyManager.getInstance().listen(key, OWNER,
@@ -367,16 +498,16 @@ public final class DjiMsdkBridge {
                             if (newValue == null) {
                                 return;
                             }
-                            announce("dial " + channel);
+                            announce("dial " + dial);
                             try {
-                                nativeOnDjiDial(channel, newValue);
+                                nativeOnDjiDial(dial, newValue);
                             } catch (Throwable t) {
                                 Log.w(TAG, "dji: dial dispatch failed", t);
                             }
                         }
                     });
         } catch (Throwable t) {
-            Log.w(TAG, "dji: dial listen failed for channel " + channel, t);
+            Log.w(TAG, "dji: dial listen failed for dial " + dial, t);
         }
     }
 
@@ -404,7 +535,6 @@ public final class DjiMsdkBridge {
     }
 
     private static final boolean[] sFiveDimPrev = new boolean[5];
-    private static boolean sGoHomePrev;
 
     private static void dispatchFiveDimension(FiveDimensionPressedStatus status) {
         if (status == null) {
@@ -423,15 +553,6 @@ public final class DjiMsdkBridge {
             dispatch(buttonId);
         }
         sFiveDimPrev[slot] = on;
-    }
-
-    /** Rising edge of the go-home button, which has no slot in sFiveDimPrev. */
-    private static void edgeGoHome(Boolean now) {
-        final boolean on = now != null && now;
-        if (on && !sGoHomePrev) {
-            dispatch(BTN_SYS);
-        }
-        sGoHomePrev = on;
     }
 
     private static void dispatch(int buttonId) {

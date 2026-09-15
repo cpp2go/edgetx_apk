@@ -32,6 +32,11 @@ public class EdgeTxApplication extends Application {
     @Override
     public void onCreate() {
         super.onCreate();
+        RcBattery.start(this);
+        // The external RF module lives on a USB serial port (see RcModuleSerial).
+        // Started here rather than from the activity so the permission prompt and
+        // the port are ready before the firmware opens its module port.
+        RcModuleSerial.start(this);
         // The bridge only loads when the SDK is packaged; without it this throws
         // NoClassDefFoundError, which we deliberately swallow.
         try {

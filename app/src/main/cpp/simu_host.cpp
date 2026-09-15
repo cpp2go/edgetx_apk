@@ -29,8 +29,11 @@ void firmwareMain(const char* sdPath, const char* settingsPath) {
     simuCreateDefaults();
 
     LOGI("firmware: simuStart (sd=%s settings=%s)", sdPath, settingsPath);
-    // tests=false -> OPENTX_START_NO_SPLASH | NO_CALIBRATION | NO_CHECKS, i.e.
-    // boot straight into the UI instead of stopping on the startup warnings.
+    // Show the boot splash (it is EdgeTX's own startup screen and was missing
+    // because of the flags below), but keep the first-boot calibration wizard and
+    // the throttle/switch startup checks off: those wait for key presses and there
+    // is no reliable way to answer them on this RC.
+    simuSetSplashStartup();
     simuStart(false);  // blocks until the firmware shuts down
     LOGI("firmware: simuStart returned");
 
@@ -102,5 +105,45 @@ void setAnalogSource(bool external) {
 
 void setKey(uint8_t key, bool down) { simuSetKey(key, down); }
 void setSwitch(uint8_t index, int8_t state) { simuSetSwitch(index, state); }
+void rotaryEncoderEvent(int32_t steps) { simuRotaryEncoderEvent(steps); }
+
+// VBAT's position in the board's ADC input list (radio/src/boards/hw_defs/
+// tx16smk3.json): LH, LV, RV, RH, P1, P2, SL1, SL2, EXT1, EXT2, VBAT, RTC_BAT, LUX.
+constexpr uint8_t kVBatChannel = 10;
+
+std::atomic<uint16_t> g_batteryMv{0};
+std::atomic<uint8_t> g_batteryPercent{0};
+std::atomic<bool> g_batteryCharging{false};
+
+void setBattery(uint16_t millivolts, uint8_t percent, bool charging) {
+    g_batteryMv = millivolts;
+    g_batteryPercent = percent;
+    g_batteryCharging = charging;
+
+    // The firmware's battery and charger paths read this (see the simulator's
+    // adc_driver.cpp and led_driver.cpp), and the ADC channel is set as well because
+    // that is where the value ends up once the driver prefers the host's reading.
+    //
+    // This arrives from Application.onCreate, before the firmware exists, so nothing
+    // here may call into the firmware - see logFirmwareBattery() for that.
+    if (edgetxAndroidSetBattery != nullptr) {
+        edgetxAndroidSetBattery(millivolts, charging ? 1 : 0);
+    }
+    if (millivolts > 0) {
+        edgetxAndroidSetAnalog(kVBatChannel, static_cast<uint16_t>(millivolts / 5));
+    }
+}
+
+void logFirmwareBattery() {
+    // Only valid once the firmware is up: adcGetMaxInputs() walks tables that do not
+    // exist before simuInit(), and calling it earlier is a null dereference.
+    const uint16_t raw = getBatteryVoltage();
+    const uint16_t tenths = static_cast<uint16_t>(raw / 20);
+    LOGI("battery: rc %u mV %u%% %s | firmware shows %u.%u V, charger icon %d",
+         g_batteryMv.load(), g_batteryPercent.load(),
+         g_batteryCharging.load() ? "charging" : "not charging",
+         static_cast<unsigned>(tenths / 10), static_cast<unsigned>(tenths % 10),
+         usbChargerLed() ? 1 : 0);
+}
 
 }  // namespace simu
