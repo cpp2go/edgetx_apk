@@ -69,6 +69,11 @@ void edgetxAndroidSetAnalogExternal(uint8_t on);
 // one. Check for null before calling (see setBattery).
 void edgetxAndroidSetBattery(uint16_t millivolts, uint8_t charging) __attribute__((weak));
 
+// What the firmware's battery path sees, i.e. what was injected above. Weak for the
+// same reason; used to tell "the value never reached the library" apart from "the
+// library has it but the reading does not use it".
+uint16_t edgetxAndroidBatteryMillivolts() __attribute__((weak));
+
 // Aux serial bridge (radio/src/targets/simu/simulib.h). The firmware calls the
 // sink when its external-module serial port starts, stops, changes baud rate or
 // transmits; the app feeds bytes back in with simuAuxSerialReceive().
@@ -88,6 +93,14 @@ void edgetxAndroidSetAuxSerialSink(const edgetxAndroidSerialSink* sink) __attrib
 
 // port_nr is 0 for AUX1, 1 for AUX2 - the external module port uses AUX1.
 void simuAuxSerialReceive(uint8_t port_nr, const uint8_t* data, uint32_t len);
+
+// Audio (radio/src/targets/simu/android_host.cpp): the firmware queues the PCM its
+// own mixer produces and the app drains it here and plays it. That is the whole
+// audio path - there is nothing to synthesise on this side.
+uint32_t edgetxAndroidTakeAudio(uint8_t* dst, uint32_t maxLen);
+uint32_t edgetxAndroidAudioSampleRate();
+uint32_t edgetxAndroidAudioWrittenBytes();
+uint32_t edgetxAndroidAudioDroppedBytes();
 
 // Readings the firmware exposes. Used to report what the UI is actually showing.
 // getBatteryVoltage() returns the raw ADC value, which the UI divides by 20 to
@@ -167,5 +180,22 @@ void setBattery(uint16_t millivolts, uint8_t percent, bool charging);
 // Logs the battery the firmware itself reports, next to the RC's. Only call this once
 // the firmware is running (the ADC tables are set up by simuInit()).
 void logFirmwareBattery();
+
+// Drains up to maxLen bytes of the firmware's audio, oldest first. Returns how many
+// were copied, 0 when nothing is queued (see RcAudio.java).
+uint32_t takeAudio(uint8_t* dst, uint32_t maxLen);
+
+// The firmware's audio format: RcAudio sizes its AudioTrack from these.
+uint32_t audioSampleRate();
+uint32_t audioWrittenBytes();
+uint32_t audioDroppedBytes();
+
+// How much of the firmware's audio the host device has accepted but not played yet.
+// RcAudio keeps this in step with AudioTrack's playback head; the firmware uses it to
+// hold the boot splash open until the greeting has actually finished. Weak because an
+// older simulator library has no such entry point, and then the boot is not delayed.
+void edgetxAndroidSetHostAudioPending(uint32_t bytes) __attribute__((weak));
+void setAudioPending(uint32_t bytes);
+uint32_t audioPendingBytes();
 
 }  // namespace simu

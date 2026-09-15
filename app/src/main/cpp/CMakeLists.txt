@@ -24,6 +24,7 @@ add_library(edgetx_ui SHARED
     simu_host.cpp
     joystick.cpp
     battery.cpp
+    audio.cpp
     module_serial.cpp
     ${NATIVE_APP_GLUE_DIR}/android_native_app_glue.c
 )

@@ -30,9 +30,10 @@ void firmwareMain(const char* sdPath, const char* settingsPath) {
 
     LOGI("firmware: simuStart (sd=%s settings=%s)", sdPath, settingsPath);
     // Show the boot splash (it is EdgeTX's own startup screen and was missing
-    // because of the flags below), but keep the first-boot calibration wizard and
-    // the throttle/switch startup checks off: those wait for key presses and there
-    // is no reliable way to answer them on this RC.
+    // because of the flags below) together with the normal startup checks - the
+    // throttle/stick/switch warnings are expected at boot. Only the first-boot
+    // calibration wizard stays off: it just needs to be seen once and the settings
+    // file this port ships already carries a valid calibration.
     simuSetSplashStartup();
     simuStart(false);  // blocks until the firmware shuts down
     LOGI("firmware: simuStart returned");
@@ -128,22 +129,54 @@ void setBattery(uint16_t millivolts, uint8_t percent, bool charging) {
     // here may call into the firmware - see logFirmwareBattery() for that.
     if (edgetxAndroidSetBattery != nullptr) {
         edgetxAndroidSetBattery(millivolts, charging ? 1 : 0);
+    } else {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LOGE("battery: the simulator library has no battery injection");
+        }
     }
     if (millivolts > 0) {
         edgetxAndroidSetAnalog(kVBatChannel, static_cast<uint16_t>(millivolts / 5));
     }
 }
 
+uint32_t takeAudio(uint8_t* dst, uint32_t maxLen) {
+    return edgetxAndroidTakeAudio(dst, maxLen);
+}
+
+uint32_t audioSampleRate() { return edgetxAndroidAudioSampleRate(); }
+uint32_t audioWrittenBytes() { return edgetxAndroidAudioWrittenBytes(); }
+uint32_t audioDroppedBytes() { return edgetxAndroidAudioDroppedBytes(); }
+
+// Bytes handed to AudioTrack that have not reached the speaker yet (see RcAudio.java).
+// The firmware keeps its own copy (it drives the boot splash); this is the host-side
+// mirror, so both sides can be told apart when logging.
+std::atomic<uint32_t> g_audioPending{0};
+
+void setAudioPending(uint32_t bytes) {
+    g_audioPending.store(bytes);
+    if (edgetxAndroidSetHostAudioPending != nullptr) {
+        edgetxAndroidSetHostAudioPending(bytes);
+    }
+}
+
+uint32_t audioPendingBytes() { return g_audioPending.load(); }
+
 void logFirmwareBattery() {
     // Only valid once the firmware is up: adcGetMaxInputs() walks tables that do not
     // exist before simuInit(), and calling it earlier is a null dereference.
+    // getBatteryVoltage() is in 10 mV steps (see battery_driver.h), so volts = raw/100.
     const uint16_t raw = getBatteryVoltage();
-    const uint16_t tenths = static_cast<uint16_t>(raw / 20);
-    LOGI("battery: rc %u mV %u%% %s | firmware shows %u.%u V, charger icon %d",
+    const uint16_t tenths = static_cast<uint16_t>(raw / 10);
+    const uint16_t hostSeen =
+        edgetxAndroidBatteryMillivolts != nullptr ? edgetxAndroidBatteryMillivolts() : 0;
+    LOGI("battery: rc %u mV %u%% %s | firmware shows %u.%u V, charger icon %d | "
+         "firmware-side host mV %u",
          g_batteryMv.load(), g_batteryPercent.load(),
          g_batteryCharging.load() ? "charging" : "not charging",
          static_cast<unsigned>(tenths / 10), static_cast<unsigned>(tenths % 10),
-         usbChargerLed() ? 1 : 0);
+         usbChargerLed() ? 1 : 0, static_cast<unsigned>(hostSeen));
 }
 
 }  // namespace simu
