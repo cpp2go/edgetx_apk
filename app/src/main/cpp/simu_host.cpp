@@ -58,6 +58,13 @@ LcdInfo lcdInfo() {
 bool start(const char* sdPath, const char* settingsPath) {
     if (g_started) return true;
 
+    // The firmware thread clears g_started as soon as simuStart() returns, but the
+    // std::thread object stays joinable until somebody joins it. Assigning over a
+    // joinable thread calls std::terminate, which is the SIGABRT ("terminating") seen
+    // when the host is started again inside the same process - an Activity being
+    // recreated, or the firmware stopping on its own without stop() being called.
+    if (g_thread.joinable()) g_thread.join();
+
     g_stopRequested = false;
     g_started = true;
     g_thread = std::thread(firmwareMain, sdPath, settingsPath);

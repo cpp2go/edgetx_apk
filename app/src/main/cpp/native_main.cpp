@@ -19,6 +19,7 @@
 #include <android/native_activity.h>
 #include <android/native_window.h>
 #include <android_native_app_glue.h>
+#include <dirent.h>
 #include <jni.h>
 #include <sys/stat.h>
 
@@ -46,9 +47,13 @@ constexpr int32_t kFp = 1024;  // fixed-point scale denominator
 struct android_app* g_app = nullptr;
 
 // Set by the activity thread while a window is up, cleared when it goes away.
-// Also read by the link thread, which only takes over frame polling while it is
-// null (see link_thread_main).
 std::atomic<ANativeWindow*> g_window{nullptr};
+
+// Guards the activity's side of the link: the window, the frame buffers and the
+// transform, plus the render step itself. Everything in there normally runs on the
+// activity thread; the mutex is what keeps the service's thread (link_start /
+// link_stop) out of a render that is already in flight.
+std::mutex g_renderMutex;
 
 int32_t g_lcdW = 0;
 int32_t g_lcdH = 0;
@@ -81,9 +86,6 @@ std::atomic<bool> g_linkRunning{false};
 // behaviour is kept for the case where the service could not be started.
 std::atomic<bool> g_keepAlive{false};
 
-// Frame sink for the link thread while no window is attached.
-std::vector<uint16_t> g_drainFrame;
-
 void sleep_ms(uint32_t ms) {
     std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 }
@@ -99,14 +101,17 @@ void ensure_parent_dirs(const std::string& path) {
     }
 }
 
-// Copy the bundled SD-card content into the simulated card root.
+// Copy the bundled SD-card content into the card root, without touching what is
+// already there.
 //
-// The file list comes from the manifest CMake generated (AAssetDir enumeration
-// proved unreliable). Existing files with the expected size are skipped, so this
-// is idempotent and never clobbers what the firmware wrote (radio.yml, models).
+// The card belongs to the user: models, radio.yml and anything edited by hand live
+// in it, and the firmware writes to it as well (LOGS/, screenshots). So a file
+// that exists and has content is never overwritten - only missing files (and
+// zero-length ones, i.e. an interrupted copy) are written. Delete a file, or the
+// whole folder, and relaunch to get the bundled version back.
 void seed_assets(AAssetManager* mgr, const std::string& sdRoot) {
     unsigned copied = 0;
-    unsigned skipped = 0;
+    unsigned kept = 0;
 
     for (unsigned i = 0; i < kSdcardAssetCount; ++i) {
         const std::string rel = kSdcardAssets[i];
@@ -122,9 +127,9 @@ void seed_assets(AAssetManager* mgr, const std::string& sdRoot) {
         const off_t size = AAsset_getLength(asset);
 
         struct stat st;
-        if (stat(outPath.c_str(), &st) == 0 && st.st_size == size) {
+        if (stat(outPath.c_str(), &st) == 0 && st.st_size > 0) {
             AAsset_close(asset);
-            ++skipped;
+            ++kept;
             continue;
         }
 
@@ -144,7 +149,121 @@ void seed_assets(AAssetManager* mgr, const std::string& sdRoot) {
         ++copied;
     }
 
-    LOGI("sdcard: %u copied, %u up-to-date, %u total", copied, skipped, kSdcardAssetCount);
+    LOGI("sdcard: %u copied, %u kept, %u bundled", copied, kept, kSdcardAssetCount);
+}
+
+// ------------------------------------------------------------- SD card root --
+//
+// The simulated SD card lives in the app's *external* files directory whenever the
+// device has one:
+//
+//     /sdcard/Android/data/com.edgetx.droidui/files/sdcard
+//
+// It is the same tree a real radio has on its card, but unlike the app-private
+// directory this path needs no permission at all and can be browsed and edited
+// over adb (or with a file manager on older Androids), which is the whole point:
+//
+//     adb push main.lua /sdcard/Android/data/com.edgetx.droidui/files/sdcard/SCRIPTS/
+//     adb pull /sdcard/Android/data/com.edgetx.droidui/files/sdcard/RADIO/radio.yml .
+//
+// The internal directory stays as the fallback for devices without external
+// storage, and a card that already lives there is copied over on first run so
+// models and calibration survive the move.
+const char* const kSdcardSubdir = "/sdcard";
+
+bool file_has_content(const std::string& path) {
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0;
+}
+
+bool copy_file(const std::string& from, const std::string& to) {
+    FILE* in = std::fopen(from.c_str(), "rb");
+    if (in == nullptr) return false;
+
+    FILE* out = std::fopen(to.c_str(), "wb");
+    if (out == nullptr) {
+        std::fclose(in);
+        return false;
+    }
+
+    std::vector<char> buffer(64 * 1024);
+    bool ok = true;
+    size_t n = 0;
+    while ((n = std::fread(buffer.data(), 1, buffer.size(), in)) > 0) {
+        if (std::fwrite(buffer.data(), 1, n, out) != n) {
+            ok = false;
+            break;
+        }
+    }
+    if (std::ferror(in)) ok = false;
+
+    std::fclose(out);
+    std::fclose(in);
+    return ok;
+}
+
+// Copies the files under `from` that `to` does not have yet. Missing directories
+// are silently ignored, which is what makes this safe to call on the old card
+// location before it exists.
+unsigned copy_missing_tree(const std::string& from, const std::string& to) {
+    DIR* dir = opendir(from.c_str());
+    if (dir == nullptr) return 0;
+
+    unsigned copied = 0;
+    const struct dirent* entry = nullptr;
+    while ((entry = readdir(dir)) != nullptr) {
+        const std::string name = entry->d_name;
+        if (name == "." || name == "..") continue;
+
+        const std::string src = from + "/" + name;
+        const std::string dst = to + "/" + name;
+
+        struct stat st;
+        if (stat(src.c_str(), &st) != 0) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            ensure_dir(dst);
+            copied += copy_missing_tree(src, dst);
+        } else if (S_ISREG(st.st_mode) && !file_has_content(dst)) {
+            ensure_parent_dirs(dst);
+            if (copy_file(src, dst)) ++copied;
+        }
+    }
+
+    closedir(dir);
+    return copied;
+}
+
+// Picks the card root, creates it, and moves an internal card over if there is one.
+// Returns an empty string when neither directory is usable.
+std::string prepare_sd_root(const char* filesDir, const char* externalFilesDir) {
+    const bool hasFilesDir = filesDir != nullptr && filesDir[0] != '\0';
+    const bool hasExternal = externalFilesDir != nullptr && externalFilesDir[0] != '\0';
+
+    std::string sd;
+    if (hasExternal) {
+        sd = std::string(externalFilesDir) + kSdcardSubdir;
+    } else if (hasFilesDir) {
+        sd = std::string(filesDir) + kSdcardSubdir;
+        LOGW("sdcard: no external files directory on this device, the card stays in %s",
+             sd.c_str());
+    } else {
+        return std::string();
+    }
+
+    ensure_dir(sd);
+
+    if (hasFilesDir) {
+        const std::string internal = std::string(filesDir) + kSdcardSubdir;
+        if (internal != sd) {
+            const unsigned moved = copy_missing_tree(internal, sd);
+            if (moved > 0) {
+                LOGI("sdcard: %u file(s) taken over from %s", moved, internal.c_str());
+            }
+        }
+    }
+
+    return sd;
 }
 
 // Recompute how the LCD frame maps onto the window (aspect-fit + centred).
@@ -208,12 +327,15 @@ void blit() {
 
 bool link_running() { return g_linkRunning.load(); }
 
-// Drives the parts of the firmware that need a periodic kick, and keeps the
-// firmware's frame handshake moving while no window is attached.
+// Drives the parts of the firmware that need a periodic kick while the activity
+// is not there to do it.
 //
-// joystick::tick() lives here rather than in android_main on purpose: it has to
-// keep running when the activity does not, and it is the single place the queued
-// input (DJI SDK sticks, dials, buttons) reaches the firmware - see joystick.cpp.
+// Deliberately NOT consuming LCD frames: takeFrame() ends in lcdFlushed(), which
+// calls lv_disp_flush_ready() inside the firmware - LVGL state that only the
+// thread owning the window should touch. While no window is attached the firmware
+// simply parks after its last flush (its mixer and module tasks keep running, so
+// frames keep going to the RF module), and the next takeFrame() from the activity
+// lets it render again.
 void link_thread_main() {
     using clock = std::chrono::steady_clock;
     auto nextHeartbeat = clock::now() + std::chrono::seconds(5);
@@ -221,14 +343,6 @@ void link_thread_main() {
 
     while (!g_linkStop.load()) {
         joystick::tick();
-
-        // Nothing else consumes the firmware's frames while there is no window.
-        // takeFrame() is what calls simuLcdFlushed(), and leaving that handshake
-        // untouched for hours is not something to leave to chance.
-        if (g_window.load() == nullptr && !g_drainFrame.empty()) {
-            simu::takeFrame(reinterpret_cast<uint8_t*>(g_drainFrame.data()),
-                            static_cast<uint32_t>(g_drainFrame.size() * sizeof(uint16_t)));
-        }
 
         const auto now = clock::now();
         if (now >= nextHeartbeat) {
@@ -262,32 +376,35 @@ void link_thread_main() {
 
 // Starts the firmware and its module bridge. Idempotent, and callable from either
 // the service (the normal path) or the activity (fallback, see android_main).
-bool link_start(AAssetManager* assets, const char* filesDir) {
+bool link_start(AAssetManager* assets, const char* filesDir, const char* externalFilesDir) {
     std::lock_guard<std::mutex> lock(g_linkMutex);
     if (g_linkRunning.load()) return true;
 
-    if (filesDir == nullptr || filesDir[0] == '\0') {
-        LOGE("link: no files directory for the simulated SD card");
+    // Where the firmware sees its SD card, and where the user can edit it. The
+    // external directory is preferred - see prepare_sd_root().
+    const std::string sd = prepare_sd_root(filesDir, externalFilesDir);
+    if (sd.empty()) {
+        LOGE("link: no directory to hold the simulated SD card");
         return false;
     }
-
-    // App-private storage for the simulated SD card. Externally the firmware
-    // sees this directory as the card root (RADIO/, MODELS/, THEMES/, ...).
-    const std::string sd = std::string(filesDir) + "/sdcard";
-    ensure_dir(sd);
+    LOGI("sdcard: root %s (push files into it to edit the card, no reboot needed)",
+         sd.c_str());
 
     if (assets != nullptr) {
         seed_assets(assets, sd);
     }
 
     const simu::LcdInfo lcd = simu::lcdInfo();
-    g_lcdW = lcd.width;
-    g_lcdH = lcd.height;
+    {
+        // blit() reads the LCD geometry: never let it see a half-updated value.
+        std::lock_guard<std::mutex> renderLock(g_renderMutex);
+        g_lcdW = lcd.width;
+        g_lcdH = lcd.height;
+    }
     if (g_lcdW <= 0 || g_lcdH <= 0) {
         LOGE("link: bad LCD size %dx%d", g_lcdW, g_lcdH);
         return false;
     }
-    g_drainFrame.assign(static_cast<size_t>(g_lcdW) * g_lcdH, 0);
 
     // The firmware's analog channels belong to this app, never to the simulator's
     // demo sine wave. Until the first real value arrives the firmware would
@@ -322,9 +439,12 @@ void link_stop() {
     g_linkStop.store(true);
     if (g_linkThread.joinable()) g_linkThread.join();
 
-    simu::stop();
+    // No render can be in flight while the firmware is torn down underneath it.
+    {
+        std::lock_guard<std::mutex> renderLock(g_renderMutex);
+        simu::stop();
+    }
     g_linkRunning.store(false);
-    g_drainFrame.clear();
     LOGI("link: stopped");
 }
 
@@ -351,13 +471,14 @@ bool window_attach(ANativeWindow* window) {
     }
 
     const simu::LcdInfo lcd = simu::lcdInfo();
-    g_lcdW = lcd.width;
-    g_lcdH = lcd.height;
-    if (g_lcdW <= 0 || g_lcdH <= 0) {
-        LOGE("window: bad LCD size %dx%d", g_lcdW, g_lcdH);
+    if (lcd.width <= 0 || lcd.height <= 0) {
+        LOGE("window: bad LCD size %dx%d", lcd.width, lcd.height);
         return false;
     }
 
+    std::lock_guard<std::mutex> renderLock(g_renderMutex);
+    g_lcdW = lcd.width;
+    g_lcdH = lcd.height;
     g_frame.assign(static_cast<size_t>(g_lcdW) * g_lcdH, 0);
     update_transform(winW, winH);
     g_window.store(window);
@@ -366,11 +487,13 @@ bool window_attach(ANativeWindow* window) {
     return true;
 }
 
+// The buffers stay allocated on purpose: the render step reads them and a window
+// can come back at any time, so tearing them down here would only create a
+// lifetime problem for no gain.
 void window_detach() {
+    std::lock_guard<std::mutex> renderLock(g_renderMutex);
     if (g_window.exchange(nullptr) == nullptr) return;
 
-    g_frame.clear();
-    g_srcX.clear();
     // Deliberately not touching the firmware: the RF module still needs its frames.
     LOGI("window: detached, the link keeps running");
 }
@@ -478,7 +601,8 @@ extern "C" void android_main(struct android_app* app) {
         // Application.onCreate). This is the fallback for when the service could not
         // be started at all: a UI without a service is better than a black screen.
         if (!link_running() && app->activity != nullptr) {
-            link_start(app->activity->assetManager, app->activity->internalDataPath);
+            link_start(app->activity->assetManager, app->activity->internalDataPath,
+                       app->activity->externalDataPath);
         }
 
         // A window that was not usable when APP_CMD_INIT_WINDOW arrived makes
@@ -491,16 +615,32 @@ extern "C" void android_main(struct android_app* app) {
                 // controllers do not). Only meaningful with a window: only a focused
                 // window receives their input events.
                 joystick::init(app->activity);
+
+                // Show the newest frame we hold straight away. The firmware may be
+                // sitting on a screen that only repaints on input, so waiting for the
+                // next frame would leave the window black until the user presses
+                // something.
+                std::lock_guard<std::mutex> renderLock(g_renderMutex);
+                if (!g_frame.empty()) blit();
             }
         }
 
-        // Present a new firmware frame when one is ready. joystick::tick() and the
-        // frame polling that has to happen without a window both live on the link
-        // thread - see link_thread_main().
-        if (g_window.load() != nullptr && link_running() && !g_frame.empty()) {
-            if (simu::takeFrame(reinterpret_cast<uint8_t*>(g_frame.data()),
-                                static_cast<uint32_t>(g_frame.size() * sizeof(uint16_t)))) {
-                blit();
+        // Present a new firmware frame when one is ready. joystick::tick() lives on
+        // the link thread - see link_thread_main() - but the frames are consumed here
+        // and only here, because takeFrame() ends inside LVGL (lcdFlushed() ->
+        // lv_disp_flush_ready()), which belongs to the thread that owns the window.
+        // Frames are taken even while no window is attached. RcLinkService starts the
+        // firmware from Application.onCreate, so it paints its first screens before the
+        // activity has a surface; those frames were previously dropped, and the firmware
+        // then only paints again on an input event - which is exactly why the screen
+        // used to stay black until a key was pressed.
+        if (link_running()) {
+            std::lock_guard<std::mutex> renderLock(g_renderMutex);
+            if (!g_frame.empty()) {
+                const bool fresh =
+                    simu::takeFrame(reinterpret_cast<uint8_t*>(g_frame.data()),
+                                    static_cast<uint32_t>(g_frame.size() * sizeof(uint16_t)));
+                if (fresh && g_window.load() != nullptr) blit();
             }
         }
 
@@ -525,12 +665,21 @@ extern "C" void android_main(struct android_app* app) {
 
 // Starts the firmware on behalf of the service and marks the process as "keep me
 // alive": android_main only stops the link when this flag is clear.
+//
+// `externalFilesDir` is the app's external files directory (shared storage); the
+// simulated SD card is put there so it can be edited from outside the app. When it
+// is null the internal directory is used instead.
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_edgetx_droidui_RcLinkService_nativeStartLink(JNIEnv* env, jclass, jstring filesDir,
-                                                      jobject assets) {
+                                                      jstring externalFilesDir, jobject assets) {
     const char* dir = nullptr;
     if (filesDir != nullptr) {
         dir = env->GetStringUTFChars(filesDir, nullptr);
+    }
+
+    const char* external = nullptr;
+    if (externalFilesDir != nullptr) {
+        external = env->GetStringUTFChars(externalFilesDir, nullptr);
     }
 
     // AAssetManager_fromJava returns the manager the activity used to expose as
@@ -538,10 +687,13 @@ Java_com_edgetx_droidui_RcLinkService_nativeStartLink(JNIEnv* env, jclass, jstri
     AAssetManager* manager = assets != nullptr ? AAssetManager_fromJava(env, assets) : nullptr;
 
     g_keepAlive.store(true);
-    const bool ok = link_start(manager, dir);
+    const bool ok = link_start(manager, dir, external);
 
     if (dir != nullptr) {
         env->ReleaseStringUTFChars(filesDir, dir);
+    }
+    if (external != nullptr) {
+        env->ReleaseStringUTFChars(externalFilesDir, external);
     }
     return ok ? JNI_TRUE : JNI_FALSE;
 }
