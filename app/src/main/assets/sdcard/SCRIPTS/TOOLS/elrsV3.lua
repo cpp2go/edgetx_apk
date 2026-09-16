@@ -6,9 +6,9 @@
 ---- # License GPLv2: http://www.gnu.org/licenses/gpl-2.0.html               #
 ---- #                                                                       #
 ---- #########################################################################
-local EXITVER = "-- EXIT (Lua r18) --"
+local EXITVER = "-- EXIT (Lua r16) --"
 local deviceId = 0xEE
-local handsetId = 0xEA
+local handsetId = 0xEF
 local deviceName = nil
 local lineIndex = 1
 local pageOffset = 0
@@ -26,7 +26,6 @@ local elrsFlagsInfo = ""
 local fields_count = 0
 local devicesRefreshTimeout = 50
 local currentFolderId = nil
-local currentFolderName = nil
 local commandRunningIndicator = 1
 local expectChunksRemain = -1
 local deviceIsELRS_TX = nil
@@ -310,15 +309,12 @@ end
 
 local function fieldFolderOpen(field)
   currentFolderId = field.id
-  currentFolderName = string.match(field.name, "^(.-)%s*%(.*%)$") or field.name
-
   local backFld = fields[#fields]
   backFld.name = "----BACK----"
   -- Store the lineIndex and pageOffset to return to in the backFld
   backFld.li = lineIndex
   backFld.po = pageOffset
   backFld.parent = currentFolderId
-  backFld.grandParent = fields[currentFolderId].parent
 
   lineIndex = 1
   pageOffset = 0
@@ -363,9 +359,7 @@ local function fieldCommandDisplay(field, y, attr)
 end
 
 local function fieldBackExec(field)
-  if field.grandParent then -- Back from Sub-menu
-    fieldFolderOpen(fields[field.grandParent])
-  elseif field.parent then
+  if field.parent then
     lineIndex = field.li or 1
     pageOffset = field.po or 0
 
@@ -374,8 +368,7 @@ local function fieldBackExec(field)
     field.li = nil
     field.po = nil
     currentFolderId = nil
-    currentFolderName = nil
-  else -- Executing EXIT
+  else
     exitscript = 1
   end
 end
@@ -387,10 +380,10 @@ local function changeDeviceId(devId) --change to selected device ID
   deviceId = devId
   elrsFlags = 0
   currentFolderId = nil
-  currentFolderName = nil
   deviceName = device.name
   fields_count = device.fldcnt
   deviceIsELRS_TX = device.isElrs and devId == 0xEE or nil -- ELRS and ID is TX module
+  handsetId = deviceIsELRS_TX and 0xEF or 0xEA -- Address ELRS_LUA vs RADIO_TRANSMITTER
 
   allocateFields()
   reloadAllField()
@@ -618,7 +611,6 @@ local function lcd_title_color()
     lcd.drawText(COL1 + 1, barTextSpacing, elrsFlagsInfo, CUSTOM_COLOR)
   else
     lcd.drawText(COL1 + 1, barTextSpacing, deviceName, CUSTOM_COLOR)
-    lcd.drawText(LCD_W / 2, barTextSpacing, currentFolderName or "", CENTER + BOLD + CUSTOM_COLOR)
     lcd.drawText(LCD_W - 5, barTextSpacing, goodBadPkt, RIGHT + BOLD + CUSTOM_COLOR)
   end
   -- progress bar
@@ -648,8 +640,7 @@ local function lcd_title_bw()
     if titleShowWarn then
       lcd.drawText(COL1, 1, elrsFlagsInfo, INVERS)
     else
-      -- Due to space, show the folder name, or if top level, deviceName
-      lcd.drawText(COL1, 1, currentFolderName or deviceName, INVERS)
+      lcd.drawText(COL1, 1, deviceName, INVERS)
     end
   end
 end
@@ -674,7 +665,7 @@ local function reloadRelatedFields(field)
     local fldType = fldTest.type or 99 -- type could be nil if still loading
     if fieldId ~= field.id
       and fldTest.parent == field.parent
-      and (fldType < 11 or fldType == 12 or fldType == 13) then -- ignores FOLDER/devices/EXIT
+      and (fldType < 11 or fldType == 12) then -- ignores FOLDER/COMMAND/devices/EXIT
       fldTest.nc = true -- "no cache" the options
       loadQ[#loadQ+1] = fieldId
     end
