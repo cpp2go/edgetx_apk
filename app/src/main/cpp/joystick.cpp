@@ -119,11 +119,18 @@ struct KeyChoice {
 // DjiMsdkBridge -> nativeOnDjiButton), because the RC firmware never dispatches
 // their events to apps.
 //
-// These two are the only controller buttons Android itself reports for this
-// remote. Pressing anything else logs "unmapped button keycode N" once.
+// The RC's right-hand shoulder buttons are EdgeTX keys rather than switches, so
+// that a single press opens the setup, model and telemetry pages - the same
+// thing the hardware TX16S does with its SYS/MDL/TELE buttons, which this remote
+// does not have. The DJI SDK's own C1/C2/C3 custom-button event is not usable
+// here: the RcCustomButtonEvent listener never fires on this remote, so the
+// buttons are taken from the Android key codes the kernel reports for them.
 const KeyChoice kKeyMap[] = {
     {AKEYCODE_BACK, kKeyExit},            // the remote's back button
     {AKEYCODE_BUTTON_THUMBL, kKeyEnter},  // 5-way centre press
+    {AKEYCODE_F4, kKeySys},               // R1 -> SYS  (radio setup)
+    {AKEYCODE_F5, kKeyModel},             // R2 -> MDL  (model setup)
+    {AKEYCODE_F6, kKeyTele},              // R3 -> TELE (telemetry)
 };
 
 // ------------------------------------------------------------------ state ----
@@ -762,14 +769,20 @@ std::chrono::steady_clock::time_point g_thumbLAt{};
 bool g_thumbLSeen = false;
 constexpr auto kThumbLDedup = std::chrono::milliseconds(500);
 
-// The RC's L1/L2/L3/R1/R2/R3 buttons arrive as plain Android key codes F1..F6
-// (measured - the SDK's own boolean button keys are all silent on this remote).
-// They are momentary, so each drives an EdgeTX switch: pressed = down, released
-// = up. SA and SB are taken by the takeoff button and the flight-mode switch, so
-// these start at SC.
+// The RC's L1/L2/L3 buttons arrive as plain Android key codes F1..F3 (measured -
+// the SDK's own boolean button keys are all silent on this remote). They are
+// momentary, so each drives an EdgeTX switch: pressed = down, released = up. SA
+// and SB are taken by the takeoff button and the flight-mode switch, so these
+// start at SC.
+//
+// The photo, video and pause buttons are NOT here: their kernel key codes never
+// reach an app (the RC's own dpad service consumes them, and pause is not in the
+// kernel input stream at all), so SF/SG/SH are driven from the DJI SDK instead -
+// see DjiMsdkBridge.listenButtonKeys().
 //
 // A key code listed in joystick.keys wins, which is how any of these can be made
-// an EdgeTX key instead.
+// an EdgeTX key instead - R1/R2/R3 (F4..F6) are mapped that way above, so they
+// open the SYS/MODEL/TELE pages and no longer move SF/SG/SH.
 struct SwitchKey {
     int32_t keycode;
     uint8_t index;
@@ -779,9 +792,6 @@ const SwitchKey kSwitchKeys[] = {
     {AKEYCODE_F1, 2},  // L1 -> SC
     {AKEYCODE_F2, 3},  // L2 -> SD
     {AKEYCODE_F3, 4},  // L3 -> SE
-    {AKEYCODE_F4, 5},  // R1 -> SF
-    {AKEYCODE_F5, 6},  // R2 -> SG
-    {AKEYCODE_F6, 7},  // R3 -> SH
 };
 
 std::vector<int32_t> g_loggedSwitchKeys;

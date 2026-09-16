@@ -166,6 +166,7 @@ public final class DjiMsdkBridge {
                         }
                     });
             listenFiveDimension();
+            listenButtonKeys();
             listenSticks();
             listenSwitches();
             listenArmState();
@@ -222,6 +223,47 @@ public final class DjiMsdkBridge {
         } catch (Throwable t) {
             Log.w(TAG, "dji: rc hardware listen failed", t);
         }
+    }
+
+    // ------------------------------------------------------- RC buttons -> switches
+    //
+    // The RC's photo, video and pause buttons reach neither Android's input layer
+    // nor KeyRcButtonEventPro: the kernel key codes behind them are eaten by the
+    // RC's own dpad service in SystemUI, and the pause button is not even in the
+    // kernel input stream (the raw gpio-keys device stays silent for it). The
+    // SDK's plain Boolean button keys do work, so SF/SG/SH are driven from those.
+    // Indices are the board's switch table, see joystick.cpp requestSwitch().
+    //
+    // Measured on the RC: pause and video fire, photo does not - KeyShutterButtonDown
+    // is the camera's shutter, which only reports once a camera/aircraft is
+    // connected. The wiring is there for when one is.
+
+    static final int SWITCH_F = 5;   // video button
+    static final int SWITCH_G = 6;   // photo button
+    static final int SWITCH_H = 7;   // pause button
+
+    private static void listenSwitchButton(DJIKeyInfo<Boolean> info, String name, int index) {
+        try {
+            final DJIKey<Boolean> key = KeyTools.createKey(info);
+            KeyManager.getInstance().listen(key, OWNER,
+                    new CommonCallbacks.KeyListener<Boolean>() {
+                        @Override
+                        public void onValueChange(Boolean oldValue, Boolean newValue) {
+                            final boolean down = newValue != null && newValue;
+                            Log.i(TAG, "dji: " + name + (down ? " pressed" : " released")
+                                    + " -> EdgeTX switch " + (char) ('A' + index));
+                            nativeOnDjiSwitch(index, down ? 1 : -1);
+                        }
+                    });
+        } catch (Throwable t) {
+            Log.w(TAG, "dji: " + name + " listen failed", t);
+        }
+    }
+
+    private static void listenButtonKeys() {
+        listenSwitchButton(DJIRemoteControllerKey.KeyRecordButtonDown, "video", SWITCH_F);
+        listenSwitchButton(DJIRemoteControllerKey.KeyShutterButtonDown, "photo", SWITCH_G);
+        listenSwitchButton(DJIRemoteControllerKey.KeyPauseButtonDown, "pause", SWITCH_H);
     }
 
     static final int STICK_LEFT_H = 0;
