@@ -180,6 +180,18 @@ uint8_t externalModuleType() {
     return edgetxAndroidExternalModuleType != nullptr ? edgetxAndroidExternalModuleType() : 0;
 }
 
+bool firmwareRunning() {
+    return simuIsRunning != nullptr && simuIsRunning();
+}
+
+void requestFullRefresh() {
+    LOGI("link: full refresh request (firmware symbol %s)",
+         lcdRequestFullRefresh != nullptr ? "resolved" : "MISSING");
+    if (lcdRequestFullRefresh != nullptr) {
+        lcdRequestFullRefresh();
+    }
+}
+
 void logFirmwareBattery() {
     // Only valid once the firmware is up: adcGetMaxInputs() walks tables that do not
     // exist before simuInit(), and calling it earlier is a null dereference.

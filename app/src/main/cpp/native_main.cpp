@@ -484,6 +484,17 @@ bool window_attach(ANativeWindow* window) {
     g_window.store(window);
 
     LOGI("window: attached (%dx%d)", winW, winH);
+
+    // Present the newest frame we hold and ask the firmware to repaint. It may have
+    // drawn its screens while no window was attached (it runs from RcLinkService, and
+    // on a return from the background this attach comes from on_app_cmd(), not from the
+    // render loop), and it only repaints on input otherwise - which left the window
+    // black until a key was pressed.
+    LOGI("window: attached, link %s, frame %s",
+         link_running() ? "up" : "down", g_frame.empty() ? "empty" : "held");
+    simu::requestFullRefresh();
+    if (!g_frame.empty()) blit();
+
     return true;
 }
 
@@ -619,8 +630,12 @@ extern "C" void android_main(struct android_app* app) {
                 // Show the newest frame we hold straight away. The firmware may be
                 // sitting on a screen that only repaints on input, so waiting for the
                 // next frame would leave the window black until the user presses
-                // something.
+                // something. The refresh request covers the case where the firmware
+                // has nothing pending to flush at all.
                 std::lock_guard<std::mutex> renderLock(g_renderMutex);
+                LOGI("window: attached, link %s, frame %s", link_running() ? "up" : "down",
+                     g_frame.empty() ? "empty" : "held");
+                simu::requestFullRefresh();
                 if (!g_frame.empty()) blit();
             }
         }
@@ -634,7 +649,7 @@ extern "C" void android_main(struct android_app* app) {
         // activity has a surface; those frames were previously dropped, and the firmware
         // then only paints again on an input event - which is exactly why the screen
         // used to stay black until a key was pressed.
-        if (link_running()) {
+        if (simu::firmwareRunning() || link_running()) {
             std::lock_guard<std::mutex> renderLock(g_renderMutex);
             if (!g_frame.empty()) {
                 const bool fresh =

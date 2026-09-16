@@ -83,6 +83,13 @@ void edgetxAndroidBatterySettings(uint16_t* warn, uint16_t* batMin, uint16_t* ba
 // Protocol the model selected for the external module (MODULE_TYPE_*, 0 = slot off).
 uint8_t edgetxAndroidExternalModuleType() __attribute__((weak));
 
+// Implemented by the simulator library (gui/colorlcd/lcd.cpp). Weak so an older
+// library without it still links, and then nothing is done.
+void lcdRequestFullRefresh() __attribute__((weak));
+
+// Implemented by the simulator library too: the firmware's own running state.
+bool simuIsRunning() __attribute__((weak));
+
 // Aux serial bridge (radio/src/targets/simu/simulib.h). The firmware calls the
 // sink when its external-module serial port starts, stops, changes baud rate or
 // transmits; the app feeds bytes back in with simuAuxSerialReceive().
@@ -206,6 +213,15 @@ uint32_t audioDroppedBytes();
 void edgetxAndroidSetHostAudioPending(uint32_t bytes) __attribute__((weak));
 void setAudioPending(uint32_t bytes);
 uint32_t audioPendingBytes();
+
+// Asks the firmware to repaint the whole screen, so a window that attaches after the
+// firmware has already drawn its first screens has something to show.
+void requestFullRefresh();
+
+// Whether the firmware itself is up. The activity must not gate its rendering on the
+// activity's own link-thread flag: RcLinkService can be holding the firmware while that
+// link is stopped, and then nothing is taken or presented and the screen stays black.
+bool firmwareRunning();
 
 // Protocol the model selected for the external module slot, 0 when it is off.
 uint8_t externalModuleType();
