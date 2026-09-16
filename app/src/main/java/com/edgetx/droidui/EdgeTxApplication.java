@@ -1,12 +1,18 @@
 package com.edgetx.droidui;
 
 import android.app.Application;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.Settings;
 import android.util.Log;
 
@@ -88,15 +94,97 @@ public class EdgeTxApplication extends Application {
             }
             prefs.edit().putBoolean("sdAccessAsked", true).apply();
 
-            Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+            final Intent settings = new Intent(
+                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
                     Uri.parse("package:" + getPackageName()));
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            startActivity(intent);
+
+            // Opening the page straight away is what usually works, but an Application
+            // context may not be allowed to start an activity at all (background
+            // activity start restrictions). A notification is tappable in any case, so
+            // post one as well - tapping it lands on the same page.
+            try {
+                startActivity(new Intent(settings).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+            } catch (Throwable t) {
+                Log.w(TAG, "sdcard: could not open the settings page directly", t);
+            }
+
+            notifySdAccess(settings);
             Log.i(TAG, "sdcard: asking for all-files access");
+            watchForSdAccess();
         } catch (Throwable t) {
             // Some vendor builds have no such settings page; the app then simply keeps
             // its card in the app directory.
             Log.w(TAG, "sdcard: could not ask for all-files access", t);
+        }
+    }
+
+    /**
+     * Moves the card to the user directory the moment the grant arrives, instead of
+     * waiting for the next launch: the firmware picked its directory when it started,
+     * so nothing changes until the link is restarted - and the whole point of asking is
+     * that the card should be in /storage/emulated/0/EdgeTX from the start.
+     */
+    private void watchForSdAccess() {
+        final Handler handler = new Handler(Looper.getMainLooper());
+        final long deadline = System.currentTimeMillis() + 10 * 60 * 1000;
+
+        handler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    if (Environment.isExternalStorageManager()) {
+                        Log.i(TAG, "sdcard: access granted, restarting the link to use "
+                                + "/storage/emulated/0/EdgeTX");
+                        stopService(new Intent(EdgeTxApplication.this, RcLinkService.class));
+                        RcLinkService.start(EdgeTxApplication.this);
+                        return;
+                    }
+                } catch (Throwable t) {
+                    Log.w(TAG, "sdcard: could not move the card to the user directory", t);
+                    return;
+                }
+
+                if (System.currentTimeMillis() < deadline) {
+                    handler.postDelayed(this, 2000);
+                }
+            }
+        }, 2000);
+    }
+
+    /**
+     * Puts the permission request in the notification shade as well. The card works
+     * without it (it then lives in the app's own directory), so this is an offer, not a
+     * blocker; it disappears once the page has been opened.
+     */
+    private void notifySdAccess(Intent settings) {
+        try {
+            final String channelId = "link";
+            NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            if (manager == null) return;
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                NotificationChannel channel = new NotificationChannel(channelId,
+                        "EdgeTX link", NotificationManager.IMPORTANCE_DEFAULT);
+                channel.setDescription("Keeps the firmware running and the SD card visible");
+                manager.createNotificationChannel(channel);
+            }
+
+            PendingIntent open = PendingIntent.getActivity(this, 0, settings,
+                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+            Notification.Builder builder = (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                    ? new Notification.Builder(this, channelId)
+                    : new Notification.Builder(this);
+
+            manager.notify(1, builder
+                    .setSmallIcon(R.mipmap.ic_launcher)
+                    .setContentTitle("允许 EdgeTX 访问存储")
+                    .setContentText("点此授予\"所有文件访问\"，模拟 SD 卡会放到 /storage/emulated/0/EdgeTX")
+                    .setContentIntent(open)
+                    .setAutoCancel(true)
+                    .build());
+        } catch (Throwable t) {
+            Log.w(TAG, "sdcard: could not post the permission notification", t);
         }
     }
 }
