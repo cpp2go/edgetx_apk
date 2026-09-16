@@ -236,31 +236,69 @@ unsigned copy_missing_tree(const std::string& from, const std::string& to) {
 
 // Picks the card root, creates it, and moves an internal card over if there is one.
 // Returns an empty string when neither directory is usable.
+// `/storage/emulated/0/Android/data/<pkg>/files` -> `/storage/emulated/0/EdgeTX`.
+// That is the directory the user sees in a file manager, which is where the simulated
+// card should live: models, sounds and radio.yml can then be edited from outside.
+static std::string user_sd_root(const char* externalFilesDir) {
+    const std::string ext(externalFilesDir);
+    const size_t pos = ext.find("/Android/");
+    if (pos == std::string::npos) return std::string();
+    return ext.substr(0, pos) + "/EdgeTX";
+}
+
+// Creates and removes a probe file: a directory can exist and still reject writes
+// (shared storage without "All files access" on Android 11 and later).
+static bool dir_writable(const std::string& dir) {
+    const std::string probe = dir + "/.write-probe";
+    FILE* f = fopen(probe.c_str(), "wb");
+    if (f == nullptr) return false;
+    fclose(f);
+    remove(probe.c_str());
+    return true;
+}
+
 std::string prepare_sd_root(const char* filesDir, const char* externalFilesDir) {
     const bool hasFilesDir = filesDir != nullptr && filesDir[0] != '\0';
     const bool hasExternal = externalFilesDir != nullptr && externalFilesDir[0] != '\0';
 
     std::string sd;
+
+    // Preferred: a directory the user can reach.
     if (hasExternal) {
+        const std::string user = user_sd_root(externalFilesDir);
+        if (!user.empty()) {
+            ensure_dir(user);
+            if (dir_writable(user))
+                sd = user;
+            else
+                LOGW("sdcard: %s is not writable (grant \"All files access\"), staying in "
+                     "the app directory", user.c_str());
+        }
+    }
+
+    if (sd.empty() && hasExternal) {
         sd = std::string(externalFilesDir) + kSdcardSubdir;
-    } else if (hasFilesDir) {
+    } else if (sd.empty() && hasFilesDir) {
         sd = std::string(filesDir) + kSdcardSubdir;
         LOGW("sdcard: no external files directory on this device, the card stays in %s",
              sd.c_str());
-    } else {
+    } else if (sd.empty()) {
         return std::string();
     }
 
     ensure_dir(sd);
 
-    if (hasFilesDir) {
-        const std::string internal = std::string(filesDir) + kSdcardSubdir;
-        if (internal != sd) {
-            const unsigned moved = copy_missing_tree(internal, sd);
-            if (moved > 0) {
-                LOGI("sdcard: %u file(s) taken over from %s", moved, internal.c_str());
-            }
-        }
+    // Take over whatever an earlier root already holds, so switching directories does
+    // not look like a wiped card.
+    std::vector<std::string> previous;
+    if (hasFilesDir) previous.push_back(std::string(filesDir) + kSdcardSubdir);
+    if (hasExternal) previous.push_back(std::string(externalFilesDir) + kSdcardSubdir);
+
+    for (const std::string& from : previous) {
+        if (from == sd) continue;
+        const unsigned moved = copy_missing_tree(from, sd);
+        if (moved > 0)
+            LOGI("sdcard: %u file(s) taken over from %s", moved, from.c_str());
     }
 
     return sd;

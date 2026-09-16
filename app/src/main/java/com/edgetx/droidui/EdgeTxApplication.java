@@ -2,6 +2,12 @@ package com.edgetx.droidui;
 
 import android.app.Application;
 import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Environment;
+import android.provider.Settings;
 import android.util.Log;
 
 /**
@@ -32,6 +38,7 @@ public class EdgeTxApplication extends Application {
     @Override
     public void onCreate() {
         super.onCreate();
+        askForSdCardAccess();
         RcBattery.start(this);
         // The squelch, beeps and voice prompts are the firmware's own audio; this only
         // gives it an output device (see RcAudio).
@@ -52,6 +59,44 @@ public class EdgeTxApplication extends Application {
             bridge.getMethod("init", Application.class).invoke(null, this);
         } catch (Throwable t) {
             Log.i(TAG, "dji: sdk bridge inactive (" + t.getClass().getSimpleName() + ")");
+        }
+    }
+
+    /**
+     * The simulated SD card lives in {@code /storage/emulated/0/EdgeTX} so the models,
+     * sounds and radio.yml can be edited with a file manager. Writing there needs
+     * "All files access" ({@code MANAGE_EXTERNAL_STORAGE}); without it the card stays in
+     * the app's own directory, which is why this asks for it - once, at start-up, since
+     * there is no in-app dialog for this particular permission.
+     */
+    private void askForSdCardAccess() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            return;  // legacy external storage was handed to apps on request
+        }
+
+        try {
+            if (Environment.isExternalStorageManager()) {
+                Log.i(TAG, "sdcard: all-files access granted, the card lives in /storage/emulated/0/EdgeTX");
+                return;
+            }
+
+            SharedPreferences prefs = getSharedPreferences("link", MODE_PRIVATE);
+            if (prefs.getBoolean("sdAccessAsked", false)) {
+                // Asked before and still not granted: keep quiet, the firmware logs the
+                // directory it fell back to.
+                return;
+            }
+            prefs.edit().putBoolean("sdAccessAsked", true).apply();
+
+            Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    Uri.parse("package:" + getPackageName()));
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(intent);
+            Log.i(TAG, "sdcard: asking for all-files access");
+        } catch (Throwable t) {
+            // Some vendor builds have no such settings page; the app then simply keeps
+            // its card in the app directory.
+            Log.w(TAG, "sdcard: could not ask for all-files access", t);
         }
     }
 }

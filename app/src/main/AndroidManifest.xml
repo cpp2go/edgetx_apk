@@ -32,6 +32,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- The simulated SD card lives in /storage/emulated/0/EdgeTX, where the models,
+         sounds and radio.yml can be edited with a file manager. On Android 11+ writing
+         there needs "All files access", which the user grants once in system settings;
+         without it the card stays in the app's own directory (see prepare_sd_root). -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
     <application
         android:name=".EdgeTxApplication"
