@@ -274,6 +274,23 @@ val buildEdgeTxSimulator = tasks.register("buildEdgeTxSimulator") {
 }
 
 // ---------------------------------------------------------------------------
+// Reusing an already built simulator library
+//
+// The EdgeTX checkout only builds on a machine that carries the Android patches
+// (see README). With -Pedgetx.skipBuild=true the task above is not run and
+// whatever is already staged in build/edgetx-libs/<abi>/ is packaged as is:
+//
+//     gradlew :app:assembleDebug -Pedgetx.skipBuild=true
+// ---------------------------------------------------------------------------
+val skipEdgeTxBuild = ((findProperty("edgetx.skipBuild") as String?) ?: "false").toBoolean()
+
+if (skipEdgeTxBuild) {
+    logger.lifecycle("EdgeTX build skipped: packaging the libraries staged in ${simuLibsDir.get().asFile}")
+} else {
+    tasks.named("preBuild") { dependsOn(buildEdgeTxSimulator) }
+}
+
+// ---------------------------------------------------------------------------
 // DJI Mobile SDK dependencies
 //
 // The `-provided` artifact is a compile-only stub set, so DjiMsdkBridge.java
@@ -297,5 +314,3 @@ dependencies {
         implementation("androidx.core:core:1.13.1")
     }
 }
-
-tasks.named("preBuild") { dependsOn(buildEdgeTxSimulator) }

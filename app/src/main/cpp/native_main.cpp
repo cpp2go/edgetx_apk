@@ -1,24 +1,34 @@
-// NativeActivity entry point: a thin host for the ported EdgeTX simulator.
+// NativeActivity entry point: a thin host for the ported EdgeTX simulator, plus
+// the JNI entry points RcLinkService uses to own the firmware.
 //
 // Everything the user sees is the real EdgeTX firmware running inside
-// libedgetx-<flavour>-simulator.so. This file only:
-//   * seeds the simulated SD card from the APK assets on first run,
-//   * owns the ANativeWindow and blits the firmware's LCD frames to it,
+// libedgetx-<flavour>-simulator.so. This file:
+//   * owns the *link* - the firmware, the external-module serial bridge and the
+//     timer that keeps feeding both. RcLinkService (a foreground service) starts
+//     it and keeps the process alive, so the link outlives the UI: that is what
+//     makes stick/switch data keep reaching the external RF module after the app
+//     is closed,
+//   * attaches the activity's window to that link while the UI is on screen and
+//     blits the firmware's LCD frames to it,
 //   * forwards touch events into the firmware as LCD coordinates.
 //
 // See simu_host.{h,cpp} for the firmware lifecycle, and
 // radio/src/targets/simu/simulib.h for the platform API being used.
 #include <android/asset_manager.h>
+#include <android/asset_manager_jni.h>
 #include <android/native_activity.h>
 #include <android/native_window.h>
 #include <android_native_app_glue.h>
+#include <jni.h>
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -34,28 +44,45 @@ namespace {
 constexpr int32_t kFp = 1024;  // fixed-point scale denominator
 
 struct android_app* g_app = nullptr;
-ANativeWindow* g_window = nullptr;
+
+// Set by the activity thread while a window is up, cleared when it goes away.
+// Also read by the link thread, which only takes over frame polling while it is
+// null (see link_thread_main).
+std::atomic<ANativeWindow*> g_window{nullptr};
 
 int32_t g_lcdW = 0;
 int32_t g_lcdH = 0;
 
-// LCD -> window mapping.
+// LCD -> window mapping. Activity thread only.
 int32_t g_scaleFP = kFp;
 int32_t g_scaledW = 0;
 int32_t g_offX = 0;
 int32_t g_offY = 0;
 std::vector<int32_t> g_srcX;
 
-std::vector<uint16_t> g_frame;  // LCD frame buffer (RGB565)
+std::vector<uint16_t> g_frame;  // LCD frame buffer (RGB565), activity thread only
 
-bool g_uiRunning = false;
+// ---------------------------------------------------------------------------
+// The link host: firmware + external module bridge, deliberately independent of
+// the activity's window.
+//
+// RcLinkService starts this and keeps the process alive with a foreground
+// service, so the mixer keeps producing module frames with no UI on screen. The
+// activity attaches a window to it while it is visible and detaches it when it
+// goes away - neither starts nor stops the firmware.
+// ---------------------------------------------------------------------------
+std::mutex g_linkMutex;
+std::thread g_linkThread;
+std::atomic<bool> g_linkStop{false};
+std::atomic<bool> g_linkRunning{false};
 
-uint64_t now_ms() {
-    using clock = std::chrono::steady_clock;
-    return static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch())
-            .count());
-}
+// True while a foreground service is holding the process open for the link. When
+// it is clear, the firmware stops with the activity, i.e. the pre-service
+// behaviour is kept for the case where the service could not be started.
+std::atomic<bool> g_keepAlive{false};
+
+// Frame sink for the link thread while no window is attached.
+std::vector<uint16_t> g_drainFrame;
 
 void sleep_ms(uint32_t ms) {
     std::this_thread::sleep_for(std::chrono::milliseconds(ms));
@@ -145,10 +172,11 @@ void update_transform(int32_t winW, int32_t winH) {
 
 // Push the current LCD frame to the window, letterboxed in black.
 void blit() {
-    if (g_window == nullptr || g_frame.empty()) return;
+    ANativeWindow* window = g_window.load();
+    if (window == nullptr || g_frame.empty()) return;
 
     ANativeWindow_Buffer buffer;
-    if (ANativeWindow_lock(g_window, &buffer, nullptr) != 0) return;
+    if (ANativeWindow_lock(window, &buffer, nullptr) != 0) return;
 
     const uint16_t* src = g_frame.data();
     for (int32_t y = 0; y < buffer.height; ++y) {
@@ -170,53 +198,96 @@ void blit() {
         for (; x < buffer.width; ++x) dst[x] = 0;
     }
 
-    ANativeWindow_unlockAndPost(g_window);
+    ANativeWindow_unlockAndPost(window);
 }
 
-void ui_start() {
-    if (g_uiRunning) return;
-    if (g_app == nullptr || g_app->window == nullptr || g_app->activity == nullptr) {
-        LOGW("ui_start: no window yet");
-        return;
-    }
+// ------------------------------------------------------------------ link ---
+//
+// The firmware and everything that feeds it. Owned by RcLinkService, running
+// whether or not the activity has a window.
 
-    g_window = g_app->window;
-    const int32_t winW = ANativeWindow_getWidth(g_window);
-    const int32_t winH = ANativeWindow_getHeight(g_window);
-    if (winW <= 0 || winH <= 0) {
-        // APP_CMD_INIT_WINDOW can arrive before the surface has a size. The main
-        // loop retries, so this is not fatal - but it must not start the firmware
-        // either, or the render loop ends up reading an uninitialised LCD.
-        LOGW("ui_start: window has no size yet (%dx%d)", winW, winH);
-        return;
-    }
+bool link_running() { return g_linkRunning.load(); }
 
-    if (ANativeWindow_setBuffersGeometry(g_window, winW, winH, WINDOW_FORMAT_RGB_565) != 0) {
-        LOGE("ANativeWindow_setBuffersGeometry failed");
-        return;
+// Drives the parts of the firmware that need a periodic kick, and keeps the
+// firmware's frame handshake moving while no window is attached.
+//
+// joystick::tick() lives here rather than in android_main on purpose: it has to
+// keep running when the activity does not, and it is the single place the queued
+// input (DJI SDK sticks, dials, buttons) reaches the firmware - see joystick.cpp.
+void link_thread_main() {
+    using clock = std::chrono::steady_clock;
+    auto nextHeartbeat = clock::now() + std::chrono::seconds(5);
+    bool loggedOnce = false;
+
+    while (!g_linkStop.load()) {
+        joystick::tick();
+
+        // Nothing else consumes the firmware's frames while there is no window.
+        // takeFrame() is what calls simuLcdFlushed(), and leaving that handshake
+        // untouched for hours is not something to leave to chance.
+        if (g_window.load() == nullptr && !g_drainFrame.empty()) {
+            simu::takeFrame(reinterpret_cast<uint8_t*>(g_drainFrame.data()),
+                            static_cast<uint32_t>(g_drainFrame.size() * sizeof(uint16_t)));
+        }
+
+        const auto now = clock::now();
+        if (now >= nextHeartbeat) {
+            nextHeartbeat = now + std::chrono::seconds(10);
+
+            // Proof of life in logcat, and the only way to tell from outside
+            // whether the link really survived the UI going away.
+            LOGI("link: firmware %s, module tx %u B rx %u B dropped %u B, port %s, window %s",
+                 simu::running() ? "running" : "stopped", module_serial::txBytes(),
+                 module_serial::rxBytes(), module_serial::droppedBytes(),
+                 module_serial::portOpen() ? "open" : "closed",
+                 g_window.load() != nullptr ? "attached" : "detached");
+
+            if (!loggedOnce) {
+                loggedOnce = true;
+                // Says which protocol drives the external module port (ModuleType:
+                // 0 none, 1 ppm, 2 xjt, 3 isrm, 4 dsm2, 5 crsf, 6 multimodule). 0 means
+                // the model has the slot switched off, and then EdgeTX never opens it -
+                // no bytes will flow however well the USB serial link itself is working.
+                LOGI("module: external RF protocol = %u (0 off, 5 crsf)",
+                     static_cast<unsigned>(simu::externalModuleType()));
+                // The ADC driver tables exist by now, so the firmware's own battery
+                // reading can be logged next to what the RC reports.
+                simu::logFirmwareBattery();
+            }
+        }
+
+        sleep_ms(8);  // ~120 Hz, same cadence the activity loop used
+    }
+}
+
+// Starts the firmware and its module bridge. Idempotent, and callable from either
+// the service (the normal path) or the activity (fallback, see android_main).
+bool link_start(AAssetManager* assets, const char* filesDir) {
+    std::lock_guard<std::mutex> lock(g_linkMutex);
+    if (g_linkRunning.load()) return true;
+
+    if (filesDir == nullptr || filesDir[0] == '\0') {
+        LOGE("link: no files directory for the simulated SD card");
+        return false;
     }
 
     // App-private storage for the simulated SD card. Externally the firmware
     // sees this directory as the card root (RADIO/, MODELS/, THEMES/, ...).
-    const std::string base = g_app->activity->internalDataPath != nullptr
-                                 ? g_app->activity->internalDataPath
-                                 : "/data/local/tmp";
-    const std::string sd = base + "/sdcard";
+    const std::string sd = std::string(filesDir) + "/sdcard";
     ensure_dir(sd);
 
-    if (g_app->activity->assetManager != nullptr) {
-        seed_assets(g_app->activity->assetManager, sd);
+    if (assets != nullptr) {
+        seed_assets(assets, sd);
     }
 
     const simu::LcdInfo lcd = simu::lcdInfo();
     g_lcdW = lcd.width;
     g_lcdH = lcd.height;
     if (g_lcdW <= 0 || g_lcdH <= 0) {
-        LOGE("bad LCD size %dx%d", g_lcdW, g_lcdH);
-        return;
+        LOGE("link: bad LCD size %dx%d", g_lcdW, g_lcdH);
+        return false;
     }
-    g_frame.assign(static_cast<size_t>(g_lcdW) * g_lcdH, 0);
-    update_transform(winW, winH);
+    g_drainFrame.assign(static_cast<size_t>(g_lcdW) * g_lcdH, 0);
 
     // The firmware's analog channels belong to this app, never to the simulator's
     // demo sine wave. Until the first real value arrives the firmware would
@@ -231,27 +302,77 @@ void ui_start() {
     module_serial::init();
 
     if (!simu::start(sd.c_str(), sd.c_str())) {
-        LOGE("failed to start the EdgeTX simulator");
-        return;
+        LOGE("link: failed to start the EdgeTX simulator");
+        return false;
     }
 
-    // Report the input devices once so logcat shows whether this device exposes
-    // its sticks to Android at all (many vendor remote controllers do not).
-    joystick::init(g_app->activity);
+    g_linkStop.store(false);
+    g_linkThread = std::thread(link_thread_main);
+    g_linkRunning.store(true);
 
-    g_uiRunning = true;
-    LOGI("EdgeTX host started (%dx%d window)", winW, winH);
+    LOGI("link: EdgeTX host started (sd=%s)", sd.c_str());
+    return true;
 }
 
-void ui_stop() {
-    if (!g_uiRunning) return;
+// Stops the firmware. Only called when nothing is left to keep the link alive.
+void link_stop() {
+    std::lock_guard<std::mutex> lock(g_linkMutex);
+    if (!g_linkRunning.load() && !g_linkThread.joinable()) return;
+
+    g_linkStop.store(true);
+    if (g_linkThread.joinable()) g_linkThread.join();
 
     simu::stop();
-    g_uiRunning = false;
-    g_window = nullptr;
+    g_linkRunning.store(false);
+    g_drainFrame.clear();
+    LOGI("link: stopped");
+}
+
+// --------------------------------------------------------------- window ------
+//
+// The activity side of the link: attach while visible, detach when the UI goes
+// away. Neither touches the firmware.
+
+// Returns false when the window is not usable yet; android_main retries.
+bool window_attach(ANativeWindow* window) {
+    if (window == nullptr) return false;
+
+    const int32_t winW = ANativeWindow_getWidth(window);
+    const int32_t winH = ANativeWindow_getHeight(window);
+    if (winW <= 0 || winH <= 0) {
+        // APP_CMD_INIT_WINDOW can arrive before the surface has a size.
+        LOGW("window: no size yet (%dx%d)", winW, winH);
+        return false;
+    }
+
+    if (ANativeWindow_setBuffersGeometry(window, winW, winH, WINDOW_FORMAT_RGB_565) != 0) {
+        LOGE("window: ANativeWindow_setBuffersGeometry failed");
+        return false;
+    }
+
+    const simu::LcdInfo lcd = simu::lcdInfo();
+    g_lcdW = lcd.width;
+    g_lcdH = lcd.height;
+    if (g_lcdW <= 0 || g_lcdH <= 0) {
+        LOGE("window: bad LCD size %dx%d", g_lcdW, g_lcdH);
+        return false;
+    }
+
+    g_frame.assign(static_cast<size_t>(g_lcdW) * g_lcdH, 0);
+    update_transform(winW, winH);
+    g_window.store(window);
+
+    LOGI("window: attached (%dx%d)", winW, winH);
+    return true;
+}
+
+void window_detach() {
+    if (g_window.exchange(nullptr) == nullptr) return;
+
     g_frame.clear();
     g_srcX.clear();
-    LOGI("EdgeTX host stopped");
+    // Deliberately not touching the firmware: the RF module still needs its frames.
+    LOGI("window: detached, the link keeps running");
 }
 
 // ------------------------------------------------------------ app callbacks --
@@ -260,10 +381,13 @@ void on_app_cmd(struct android_app* app, int32_t cmd) {
     (void)app;
     switch (cmd) {
         case APP_CMD_INIT_WINDOW:
-            if (g_app != nullptr && g_app->window != nullptr) ui_start();
+            // Attaching can fail while the surface has no size; android_main retries.
+            if (g_app != nullptr && g_app->window != nullptr) window_attach(g_app->window);
             break;
         case APP_CMD_TERM_WINDOW:
-            ui_stop();
+            // The window going away must not stop the firmware: RcLinkService keeps
+            // the module fed on purpose.
+            window_detach();
             break;
         default:
             break;
@@ -296,7 +420,8 @@ int32_t on_input_event(struct android_app* app, AInputEvent* event) {
         return 0;
     }
 
-    if (!g_uiRunning || g_lcdW <= 0) return 0;
+    // No window means no touch anyway; the firmware may well still be up.
+    if (g_window.load() == nullptr || g_lcdW <= 0) return 0;
 
     const int32_t action = AMotionEvent_getAction(event);
     const int32_t action_code = action & AMOTION_EVENT_ACTION_MASK;
@@ -334,8 +459,7 @@ extern "C" void android_main(struct android_app* app) {
     app->onAppCmd = on_app_cmd;
     app->onInputEvent = on_input_event;
 
-    LOGI("native_main: starting EdgeTX host (%u bundled sdcard assets)",
-         kSdcardAssetCount);
+    LOGI("native_main: activity started (%u bundled sdcard assets)", kSdcardAssetCount);
 
     while (!app->destroyRequested) {
         // Drain pending Android lifecycle / input events.
@@ -350,35 +474,30 @@ extern "C" void android_main(struct android_app* app) {
         }
         if (app->destroyRequested) break;
 
+        // Normally RcLinkService started the firmware already (it is started from
+        // Application.onCreate). This is the fallback for when the service could not
+        // be started at all: a UI without a service is better than a black screen.
+        if (!link_running() && app->activity != nullptr) {
+            link_start(app->activity->assetManager, app->activity->internalDataPath);
+        }
+
         // A window that was not usable when APP_CMD_INIT_WINDOW arrived makes
-        // ui_start() bail out, and nothing else would ever call it again: the app
+        // window_attach() bail out, and nothing else would ever call it again: the app
         // would sit on a black screen for good. Keep retrying while the window is up.
-        if (!g_uiRunning && g_app != nullptr && g_app->window != nullptr) {
-            ui_start();
+        if (g_window.load() == nullptr && app->window != nullptr) {
+            if (window_attach(app->window) && app->activity != nullptr) {
+                // Report the input devices once so logcat shows whether this device
+                // exposes its sticks to Android at all (many vendor remote
+                // controllers do not). Only meaningful with a window: only a focused
+                // window receives their input events.
+                joystick::init(app->activity);
+            }
         }
 
-        // Service queued synthetic key presses (DJI SDK buttons).
-        joystick::tick();
-
-        // Once the firmware has been up for a couple of seconds, record the battery it
-        // reports next to what the RC actually has.
-        //
-        // Gated on g_uiRunning: getBatteryVoltage() walks the ADC driver table that
-        // simuInit() installs, so without the firmware it is a null dereference. The
-        // firmware only starts from ui_start(), which is why that flag is the guard.
-        static int frames = 0;
-        if (++frames == 240 && g_uiRunning) {
-            simu::logFirmwareBattery();
-            // Says which protocol drives the external module port (ModuleType:
-            // 0 none, 1 ppm, 2 xjt, 3 isrm, 4 dsm2, 5 crsf, 6 multimodule). 0 means the
-            // model has the slot switched off, and then EdgeTX never opens it - no bytes
-            // will flow however well the USB serial link itself is working.
-            LOGI("module: external RF protocol = %u (0 off, 5 crsf)",
-                 static_cast<unsigned>(simu::externalModuleType()));
-        }
-
-        // Present a new firmware frame when one is ready.
-        if (g_uiRunning && g_window != nullptr) {
+        // Present a new firmware frame when one is ready. joystick::tick() and the
+        // frame polling that has to happen without a window both live on the link
+        // thread - see link_thread_main().
+        if (g_window.load() != nullptr && link_running() && !g_frame.empty()) {
             if (simu::takeFrame(reinterpret_cast<uint8_t*>(g_frame.data()),
                                 static_cast<uint32_t>(g_frame.size() * sizeof(uint16_t)))) {
                 blit();
@@ -388,6 +507,52 @@ extern "C" void android_main(struct android_app* app) {
         sleep_ms(8);  // ~120 Hz poll, cheap while the firmware idles
     }
 
-    ui_stop();
-    LOGI("native_main: exit");
+    // The activity is going away. The link only stops with it when nothing is
+    // holding the process open: with RcLinkService up, the firmware (and with it the
+    // stick data reaching the external RF module) survives the UI, and the next
+    // launch attaches to the same running firmware.
+    window_detach();
+    if (g_keepAlive.load()) {
+        LOGI("native_main: activity exit, the link stays up");
+    } else {
+        link_stop();
+        LOGI("native_main: activity exit, the link stops with it");
+    }
+}
+
+// ------------------------------------------------------- service entry points --
+// Called from RcLinkService.java.
+
+// Starts the firmware on behalf of the service and marks the process as "keep me
+// alive": android_main only stops the link when this flag is clear.
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_edgetx_droidui_RcLinkService_nativeStartLink(JNIEnv* env, jclass, jstring filesDir,
+                                                      jobject assets) {
+    const char* dir = nullptr;
+    if (filesDir != nullptr) {
+        dir = env->GetStringUTFChars(filesDir, nullptr);
+    }
+
+    // AAssetManager_fromJava returns the manager the activity used to expose as
+    // ANativeActivity::assetManager, which is where the bundled SD card is read from.
+    AAssetManager* manager = assets != nullptr ? AAssetManager_fromJava(env, assets) : nullptr;
+
+    g_keepAlive.store(true);
+    const bool ok = link_start(manager, dir);
+
+    if (dir != nullptr) {
+        env->ReleaseStringUTFChars(filesDir, dir);
+    }
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_edgetx_droidui_RcLinkService_nativeStopLink(JNIEnv*, jclass) {
+    g_keepAlive.store(false);
+    link_stop();
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_edgetx_droidui_RcLinkService_nativeLinkRunning(JNIEnv*, jclass) {
+    return link_running() ? JNI_TRUE : JNI_FALSE;
 }

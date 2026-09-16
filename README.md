@@ -33,6 +33,10 @@ platform-agnostic core already used by the WASI/web build, and `simulib.h`
 documents the exact host boundary. The SDL+ImGui desktop simulator is *not*
 involved — this build links only the core UI.
 
+The firmware is **not** owned by the activity: `RcLinkService` (a foreground
+service, same process) starts it and keeps the process alive, and the activity
+only attaches a window to it while it is on screen. See *Link lifetime* below.
+
 ## Requirements
 
 | Tool                  | Verified version / path                          |
@@ -81,6 +85,11 @@ as a `jniLibs` source directory.
 | `edgetx.simuName`    | `st16mk3`                     | Library name suffix                       |
 | `edgetx.abis`        | `armeabi-v7a,arm64-v8a,x86_64`| ABIs to build                             |
 | `edgetx.python`      | `<edgetx.dir>/.venv/...`      | Python interpreter for the code generators|
+| `edgetx.skipBuild`   | `false`                       | Package the libraries already staged in `app/build/edgetx-libs/` instead of building them |
+
+`-Pedgetx.skipBuild=true` is what a machine without the patched EdgeTX checkout
+uses: build or copy `libedgetx-st16mk3-simulator.so` into
+`app/build/edgetx-libs/<abi>/` once, then build the APK from it.
 
 In PowerShell, **quote** Gradle properties, otherwise the value is parsed as a
 task name: `.\gradlew.bat :app:assembleRelease "-Pedgetx.abis=x86_64"`.
@@ -136,6 +145,43 @@ input device 4: "fts" sources=0x00001002  axes=[X,Y,...]
 If a remote controller's sticks do not show up there with a `JOYSTICK` marker,
 Android never sees them — a vendor SDK would be needed instead.
 
+## Link lifetime
+
+On a radio the sticks never stop reaching the RF module while the radio is on.
+Android is not a radio: a process with no visible activity is torn down, so
+pressing Back or swiping the app away used to stop the mixer and the module
+stopped getting frames. `RcLinkService` exists to prevent that.
+
+* It is a **foreground service** (`connectedDevice`, falling back to
+  `specialUse`), started from `EdgeTxApplication.onCreate`. The process is then
+  kept alive and is not touched by the cached-app freezer.
+* It owns the firmware: `nativeStartLink()` (JNI) seeds the simulated SD card,
+  installs the module bridge and calls `simu::start()`, and a link thread keeps
+  calling `joystick::tick()` and draining frames while no window is attached.
+* It holds a **partial wake lock**, so the frames also keep flowing with the RC's
+  display switched off.
+* `android:stopWithTask="false"`: removing the task does not stop it.
+* The activity only attaches/detaches its window (`window_attach`/
+  `window_detach` in `native_main.cpp`). Neither stops the firmware, and
+  reopening the app re-attaches to the firmware that is already running — the
+  model and the channel values are right where they were.
+
+What keeps flowing after the UI is gone, and what does not:
+
+| Source | After the activity is gone |
+|--------|----------------------------|
+| DJI SDK (sticks, dials, 5-way, switches — the RC Plus 2's sticks) | **keeps flowing**: the callbacks come from Java inside this process |
+| Android input events (a gamepad, or any controller whose events Android dispatches) | **stops**: only a focused window receives them, and a service has no window |
+| Touch / the UI itself | stops until the app is opened again |
+
+Watch it from outside with the link heartbeat (every 10 s):
+
+```
+link: firmware running, module tx 4213 B rx 0 B dropped 0 B, port open, window detached
+```
+
+`window detached` with `tx` still climbing is the whole point of the service.
+
 ## Simulated SD card
 
 `app/src/main/assets/sdcard/` holds a full EdgeTX SD-card tree (RADIO, MODELS,
@@ -162,6 +208,12 @@ launchers shrink into the safe zone and wrap in their own shape.
 * **`EdgeTX simulator library not found`** while configuring the app module —
   the staging directory has no library for an ABI listed in `abiFilters`.
   Build every ABI you ship, or drop the extra ABI.
+* **Link errors on `simuSetSplashStartup`, `edgetxAndroidTakeAudio`,
+  `edgetxAndroidSetAuxSerialSink`, or `simuStart(bool)`.** The `.so` that was
+  built is not from the patched EdgeTX checkout: check `CMAKE_HOME_DIRECTORY` in
+  `app/build/edgetx-build/<abi>/CMakeCache.txt`, and pass the right tree with
+  `-Pedgetx.dir=...`. A CMake build directory remembers its source tree, so
+  delete `app/build/edgetx-build/<abi>` when switching trees.
 * Log tags: `EdgeTXUI` (host), `EdgeTXSim` (firmware `TRACE()` output).
 
 ## License

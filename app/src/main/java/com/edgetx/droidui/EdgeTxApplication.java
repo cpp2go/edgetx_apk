@@ -40,6 +40,11 @@ public class EdgeTxApplication extends Application {
         // Started here rather than from the activity so the permission prompt and
         // the port are ready before the firmware opens its module port.
         RcModuleSerial.start(this);
+        // The firmware itself is owned by a foreground service, not by the activity:
+        // that is what keeps stick/switch data flowing to the module after the UI is
+        // gone. Started here for the same reason as the bridge above - it has to be
+        // up before the activity attaches to it.
+        RcLinkService.start(this);
         // The bridge only loads when the SDK is packaged; without it this throws
         // NoClassDefFoundError, which we deliberately swallow.
         try {

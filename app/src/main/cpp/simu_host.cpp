@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -18,6 +19,7 @@ std::atomic<bool> g_stopRequested{false};
 
 LcdInfo g_lcd;
 std::vector<uint8_t> g_frame;  // scratch buffer for simuLcdCopy()
+std::mutex g_frameMutex;       // takeFrame() has two possible callers, see below
 
 void firmwareMain(const char* sdPath, const char* settingsPath) {
     LOGI("firmware: simuInit");
@@ -77,6 +79,10 @@ bool running() { return g_started && !g_stopRequested; }
 
 bool takeFrame(uint8_t* dst, uint32_t dstLen) {
     if (!simuLcdChanged()) return false;
+
+    // Called from the activity thread while a window is attached and from the link
+    // thread while none is (see native_main.cpp); the scratch buffer below is shared.
+    std::lock_guard<std::mutex> lock(g_frameMutex);
 
     const LcdInfo info = lcdInfo();
     const uint32_t frameBytes =

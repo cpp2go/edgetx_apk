@@ -36,9 +36,12 @@ bool handleMotionEvent(AInputEvent* event);
 bool handleKeyEvent(AInputEvent* event);
 
 // Queue a synthetic key press (used by the DJI SDK bridge, which cannot press a
-// key by itself - see joystick.cpp). Call once per frame from the host loop:
-// the firmware only samples key state periodically, and every setKey() call has
-// to come from the same thread as the Android input path.
+// key by itself - see joystick.cpp).
+//
+// tick() is what applies the queues to the firmware, and it has to keep being
+// called: the link thread (native_main.cpp) drives it, which is what makes the
+// queued input keep flowing after the UI is gone. The firmware samples key state
+// periodically, so a press cannot be a bare setKey(true)/setKey(false) pair.
 void requestKey(uint8_t key);
 void tick();
 

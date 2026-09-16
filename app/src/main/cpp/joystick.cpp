@@ -668,6 +668,27 @@ void init(ANativeActivity* activity) {
 
 bool present() { return g_present; }
 
+// ---------------------------------------------------------------------------
+// Firmware write serialisation.
+//
+// Two threads reach the firmware: the link thread applies the queued input in
+// tick() (DJI SDK sticks, dials, the 5-way, switches), and the activity's thread
+// delivers Android input events. They must not write the firmware's key/analog
+// state at the same time, so every write goes through these two helpers.
+// ---------------------------------------------------------------------------
+std::mutex g_firmwareMutex;
+
+void set_key(uint8_t key, bool down) {
+    std::lock_guard<std::mutex> lock(g_firmwareMutex);
+    simu::setKey(key, down);
+}
+
+void push_analog(uint8_t channel, uint16_t value) {
+    std::lock_guard<std::mutex> lock(g_firmwareMutex);
+    simu::pushAnalog(channel, value);
+    simu::setAnalogSource(true);
+}
+
 bool handleMotionEvent(AInputEvent* event) {
     const int32_t source = AInputEvent_getSource(event);
 
@@ -722,12 +743,11 @@ bool handleMotionEvent(AInputEvent* event) {
 
         log_axis_once(deviceId, route.axis);
         const float value = AMotionEvent_getAxisValue(event, route.axis, 0);
-        simu::pushAnalog(choice.analog, to_analog(value, range, route.invert));
+        push_analog(choice.analog, to_analog(value, range, route.invert));
         pushed = true;
     }
 
     if (pushed) {
-        simu::setAnalogSource(true);
         if (!present()) g_present = true;
         log_analog_throttled(event, info);
     }
@@ -807,7 +827,7 @@ bool handleKeyEvent(AInputEvent* event) {
     uint8_t key = 0;
     if (lookup_key(keycode, &key)) {
         log_mapped_key_once(keycode, key);
-        simu::setKey(key, down);
+        set_key(key, down);
         return true;
     }
 
@@ -833,8 +853,9 @@ bool handleKeyEvent(AInputEvent* event) {
 //    and up within a single call is never observed. It has to stay down for a
 //    few frames, which is what tick() is for.
 //  * The DJI SDK hands us button events on the Java main thread, whereas the
-//    working Android path feeds keys from the android_main thread. Doing the
-//    transition in tick() keeps every setKey() call on that one thread.
+//    Android input path feeds keys from the activity's thread. Doing the
+//    transition in tick() keeps the two apart, and tick() runs on the link thread
+//    - see native_main.cpp, which keeps it running with no UI on screen.
 // ---------------------------------------------------------------------------
 std::mutex g_synthMutex;
 bool g_synthQueued = false;
@@ -1008,9 +1029,9 @@ void tick() {
         }
     }
 
-    if (release) simu::setKey(releasedKey, false);
+    if (release) set_key(releasedKey, false);
     if (press) {
-        simu::setKey(pressedKey, true);
+        set_key(pressedKey, true);
         std::lock_guard<std::mutex> lock(g_synthMutex);
         g_synthHeld = true;
         g_synthHeldKey = pressedKey;
@@ -1027,8 +1048,7 @@ void tick() {
             g_analogQueued[channel] = false;
         }
         if (queued) {
-            simu::pushAnalog(static_cast<uint8_t>(channel), value);
-            simu::setAnalogSource(true);
+            push_analog(static_cast<uint8_t>(channel), value);
         }
     }
 

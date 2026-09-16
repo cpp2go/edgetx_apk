@@ -19,6 +19,20 @@
         android:name="android.hardware.usb.host"
         android:required="false" />
 
+    <!-- RcLinkService: keeps the firmware (and therefore the frames reaching the
+         external RF module) running after the UI is gone.
+
+         FOREGROUND_SERVICE_CONNECTED_DEVICE and FOREGROUND_SERVICE_SPECIAL_USE
+         are the two types that service tries, in that order; see
+         RcLinkService.promoteToForeground(). WAKE_LOCK lets it keep streaming
+         with the screen off, POST_NOTIFICATIONS only affects whether the ongoing
+         notification is visible on Android 13 and later. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:name=".EdgeTxApplication"
         android:label="EdgeTX"
@@ -50,6 +64,24 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Outlives the activity on purpose: `stopWithTask=false` means removing
+             the task from recents does not stop it, so the firmware keeps feeding
+             the external RF module. Started from EdgeTxApplication.
+
+             Both foreground service types are declared because the runtime picks
+             connectedDevice when the platform accepts it and falls back to
+             specialUse; the property below is the mandatory subtype label for
+             specialUse (Android 14+). -->
+        <service
+            android:name=".RcLinkService"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="connectedDevice|specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps an EdgeTX transmitter link to an external RF module on a USB serial port" />
+        </service>
     </application>
 
 </manifest>

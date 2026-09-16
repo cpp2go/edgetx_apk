@@ -1,0 +1,22 @@
+<!-- Ongoing notification icon for RcLinkService.
+
+     A plain white signal glyph: the notification icons are tinted by the system,
+     so only the alpha shape matters. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M3,19h3v3h-3z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M8,15h3v7h-3z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M13,11h3v11h-3z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M18,7h3v15h-3z" />
+</vector>
