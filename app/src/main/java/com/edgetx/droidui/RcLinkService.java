@@ -14,6 +14,8 @@ import android.os.IBinder;
 import android.os.PowerManager;
 import android.util.Log;
 
+import java.io.File;
+
 /**
  * Keeps the EdgeTX link alive after the UI goes away.
  *
@@ -73,11 +75,16 @@ public final class RcLinkService extends Service {
      * Starts the firmware, the external module bridge and the timer that keeps
      * feeding the firmware after the UI is gone. Idempotent.
      *
-     * @param filesDir the app's internal files directory (where the simulated SD
-     *                 card lives), or null to use the activity's.
-     * @param assets   the APK assets holding the bundled SD-card content.
+     * @param filesDir         the app's internal files directory, used for the
+     *                         simulated SD card when there is no external one.
+     * @param externalFilesDir the app's external files directory, or null. The
+     *                         simulated SD card is put there when it exists, so it
+     *                         can be edited with adb or a file manager instead of
+     *                         being hidden in the app's private storage.
+     * @param assets           the APK assets holding the bundled SD-card content.
      */
-    private static native boolean nativeStartLink(String filesDir, AssetManager assets);
+    private static native boolean nativeStartLink(String filesDir, String externalFilesDir,
+                                                  AssetManager assets);
 
     /** Stops the firmware and gives up the process's reason to stay alive. */
     private static native void nativeStopLink();
@@ -163,7 +170,13 @@ public final class RcLinkService extends Service {
 
     private void startLink() {
         try {
-            final boolean ok = nativeStartLink(getFilesDir().getAbsolutePath(), getAssets());
+            // The card goes to the external files directory when the device has
+            // one: /sdcard/Android/data/<pkg>/files/sdcard. No permission is
+            // needed for it, and it can be edited over adb:
+            //   adb push main.lua /sdcard/Android/data/com.edgetx.droidui/files/sdcard/SCRIPTS/
+            final File external = getExternalFilesDir(null);
+            final boolean ok = nativeStartLink(getFilesDir().getAbsolutePath(),
+                    external != null ? external.getAbsolutePath() : null, getAssets());
             Log.i(TAG, "link: service start, firmware "
                     + (ok ? "running" : "FAILED to start"));
         } catch (Throwable t) {

@@ -157,7 +157,12 @@ stopped getting frames. `RcLinkService` exists to prevent that.
   kept alive and is not touched by the cached-app freezer.
 * It owns the firmware: `nativeStartLink()` (JNI) seeds the simulated SD card,
   installs the module bridge and calls `simu::start()`, and a link thread keeps
-  calling `joystick::tick()` and draining frames while no window is attached.
+  calling `joystick::tick()` so the queued input keeps reaching the mixer.
+* While no window is attached the firmware parks after its last LVGL flush: the
+  mixer and module tasks keep running (that is what the RF module needs), but the
+  frame handshake is left to the activity, because `takeFrame()` ends inside LVGL
+  (`lcdFlushed()` → `lv_disp_flush_ready()`) and that belongs to the thread which
+  owns the window. Reopening the app resumes rendering where it left off.
 * It holds a **partial wake lock**, so the frames also keep flowing with the RC's
   display switched off.
 * `android:stopWithTask="false"`: removing the task does not stop it.
@@ -185,11 +190,44 @@ link: firmware running, module tx 4213 B rx 0 B dropped 0 B, port open, window d
 ## Simulated SD card
 
 `app/src/main/assets/sdcard/` holds a full EdgeTX SD-card tree (RADIO, MODELS,
-THEMES, SOUNDS, WIDGETS, …). It is copied into the app's private storage on
-first launch. `AAssetDir` enumeration proved unreliable for APK assets, so the
-file list is generated at configure time into `sdcard_manifest.h` and the
-runtime copies each entry individually, skipping files whose size already
-matches (so it never clobbers `radio.yml` or models the firmware wrote).
+THEMES, SOUNDS, WIDGETS, …). On first launch it is unpacked into the app's
+**external** files directory, so the card can be edited from outside the app:
+
+```
+/sdcard/Android/data/com.edgetx.droidui/files/sdcard      # the card the firmware sees
+/sdcard/Android/data/com.edgetx.droidui/files/joystick.keys
+```
+
+That path needs no permission at all (it belongs to the app) and adb can read and
+write it without root:
+
+```powershell
+adb push main.lua /sdcard/Android/data/com.edgetx.droidui/files/sdcard/SCRIPTS/
+adb pull /sdcard/Android/data/com.edgetx.droidui/files/sdcard/RADIO/radio.yml .
+adb shell ls /sdcard/Android/data/com.edgetx.droidui/files/sdcard
+```
+
+Files are picked up the next time the firmware reads them (a model is loaded from
+the card when it is selected), so editing one does not need a reinstall. Only
+`am force-stop` is needed to get a clean firmware restart.
+
+Devices without external storage fall back to the app-private directory
+(`<files>/sdcard`, reachable with `adb shell run-as com.edgetx.droidui`), and a
+card that already lives there is copied over on the first run so models and
+calibration survive the move.
+
+`AAssetDir` enumeration proved unreliable for APK assets, so the file list is
+generated at configure time into `sdcard_manifest.h` and the runtime copies each
+entry individually. **An existing file with content is never overwritten** — the
+card is the user's, and the firmware writes to it too (LOGS/, screenshots,
+`radio.yml`). Only missing (or zero-length) files are written, so delete a file
+or the whole folder and relaunch to get the bundled version back. The seeding
+result is in logcat:
+
+```
+sdcard: root /sdcard/Android/data/com.edgetx.droidui/files/sdcard (push files into it to edit the card, no reboot needed)
+sdcard: 918 copied, 0 kept, 918 bundled
+```
 
 ## Launcher icon
 
