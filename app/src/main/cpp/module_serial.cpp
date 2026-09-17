@@ -25,7 +25,7 @@
 
 namespace {
 
-// The external module port is bridged onto the first aux serial instance
+// The module port is bridged onto the first aux serial instance
 // (AUX1): that is the RX queue simuAuxSerialReceive() fills and the index the
 // driver installed in module_drivers.cpp reports.
 constexpr uint8_t kModulePortNr = 0;

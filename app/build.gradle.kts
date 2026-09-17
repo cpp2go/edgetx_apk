@@ -300,7 +300,7 @@ if (skipEdgeTxBuild) {
 dependencies {
     compileOnly("com.dji:dji-sdk-v5-aircraft-provided:$djiMsdkVersion")
 
-    // External RF module on a USB serial port. Supports CDC-ACM and the usual
+    // RF module on a USB serial port. Supports CDC-ACM and the usual
     // USB-serial bridges (FTDI, CP210x, CH34x, PL2303), which is what a module
     // or a module adapter presents to the RC.
     implementation("com.github.mik3y:usb-serial-for-android:3.8.1")

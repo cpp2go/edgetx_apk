@@ -1,6 +1,6 @@
-// External RF module over USB serial.
+// RF module over USB serial.
 //
-// EdgeTX talks to the external RF module over a serial port. This app has no such
+// EdgeTX talks to the RF module over a serial port. This app has no such
 // UART, so the firmware's module port is bridged to a real USB serial port that
 // RcModuleSerial.java owns:
 //
@@ -10,7 +10,7 @@
 //
 //   module -> USB -> Java -> nativePushRx() -> firmware RX -> telemetry screens
 //
-// The protocol is never chosen here: it comes from EdgeTX's own External RF
+// The protocol is never chosen here: it comes from the model's own module
 // settings, because the firmware's module driver is what produces and consumes
 // these bytes.
 #pragma once

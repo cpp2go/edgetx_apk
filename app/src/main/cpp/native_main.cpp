@@ -3,10 +3,10 @@
 //
 // Everything the user sees is the real EdgeTX firmware running inside
 // libedgetx-<flavour>-simulator.so. This file:
-//   * owns the *link* - the firmware, the external-module serial bridge and the
+//   * owns the *link* - the firmware, the module serial bridge and the
 //     timer that keeps feeding both. RcLinkService (a foreground service) starts
 //     it and keeps the process alive, so the link outlives the UI: that is what
-//     makes stick/switch data keep reaching the external RF module after the app
+//     makes stick/switch data keep reaching the RF module after the app
 //     is closed,
 //   * attaches the activity's window to that link while the UI is on screen and
 //     blits the firmware's LCD frames to it,
@@ -68,7 +68,7 @@ std::vector<int32_t> g_srcX;
 std::vector<uint16_t> g_frame;  // LCD frame buffer (RGB565), activity thread only
 
 // ---------------------------------------------------------------------------
-// The link host: firmware + external module bridge, deliberately independent of
+// The link host: firmware + module bridge, deliberately independent of
 // the activity's window.
 //
 // RcLinkService starts this and keeps the process alive with a foreground
@@ -396,7 +396,7 @@ void link_thread_main() {
 
             if (!loggedOnce) {
                 loggedOnce = true;
-                // Says which protocol drives the external module port (ModuleType:
+                // Says which protocol drives the module port (ModuleType:
                 // 0 none, 1 ppm, 2 xjt, 3 isrm, 4 dsm2, 5 crsf, 6 multimodule). 0 means
                 // the model has the slot switched off, and then EdgeTX never opens it -
                 // no bytes will flow however well the USB serial link itself is working.
@@ -451,7 +451,7 @@ bool link_start(AAssetManager* assets, const char* filesDir, const char* externa
     // Switching the source here makes the channels read a centred 2048 instead.
     simu::setAnalogSource(true);
 
-    // Install the external RF module serial bridge before the firmware boots: it
+    // Install the RF module serial bridge before the firmware boots: it
     // opens the module port on the mixer task and would otherwise start sending
     // frames into nothing.
     module_serial::init();
@@ -702,7 +702,7 @@ extern "C" void android_main(struct android_app* app) {
 
     // The activity is going away. The link only stops with it when nothing is
     // holding the process open: with RcLinkService up, the firmware (and with it the
-    // stick data reaching the external RF module) survives the UI, and the next
+    // stick data reaching the RF module) survives the UI, and the next
     // launch attaches to the same running firmware.
     window_detach();
     if (g_keepAlive.load()) {

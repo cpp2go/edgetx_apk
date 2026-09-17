@@ -19,7 +19,7 @@ import java.io.File;
 /**
  * Keeps the EdgeTX link alive after the UI goes away.
  *
- * <p>The activity is only a viewer: the firmware, the external RF module and the
+ * <p>The activity is only a viewer: the firmware, the RF module and the
  * whole stick/switch path live in this process. Android tears a process down as
  * soon as its last activity is gone unless something holds it, so without this
  * service pressing Back or swiping the app away stopped the mixer, and the RF
@@ -72,7 +72,7 @@ public final class RcLinkService extends Service {
     // --------------------------------------------------------------- natives --
 
     /**
-     * Starts the firmware, the external module bridge and the timer that keeps
+     * Starts the firmware, the module bridge and the timer that keeps
      * feeding the firmware after the UI is gone. Idempotent.
      *
      * @param filesDir         the app's internal files directory, used for the
@@ -186,7 +186,7 @@ public final class RcLinkService extends Service {
 
     /**
      * {@code FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE} is the accurate type (the
-     * service exists to keep a USB-serial RF module fed), but on a target that
+     * service exists to keep the RF module fed), but on a target that
      * requires the type's prerequisite - Android 14 and later for apps targeting
      * API 34 - it is rejected unless a USB device permission happens to be held.
      * {@code specialUse} has no prerequisite and is the declared fallback.
@@ -237,7 +237,7 @@ public final class RcLinkService extends Service {
 
         builder.setSmallIcon(R.drawable.ic_rc_link)
                 .setContentTitle("EdgeTX link running")
-                .setContentText("Sticks and switches keep going to the external RF module")
+                .setContentText("Sticks and switches keep going to the RF module")
                 .setOngoing(true)
                 .setShowWhen(false);
         if (contentIntent != null) {
@@ -257,7 +257,7 @@ public final class RcLinkService extends Service {
         }
         final NotificationChannel channel = new NotificationChannel(
                 CHANNEL_ID, "RC link", NotificationManager.IMPORTANCE_LOW);
-        channel.setDescription("Keeps the EdgeTX link to the external RF module alive");
+        channel.setDescription("Keeps the EdgeTX link to the RF module alive");
         channel.setShowBadge(false);
         manager.createNotificationChannel(channel);
     }

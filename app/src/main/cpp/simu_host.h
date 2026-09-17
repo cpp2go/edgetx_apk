@@ -80,7 +80,7 @@ uint16_t edgetxAndroidBatteryMillivolts() __attribute__((weak));
 void edgetxAndroidBatterySettings(uint16_t* warn, uint16_t* batMin, uint16_t* batMax)
     __attribute__((weak));
 
-// Protocol the model selected for the external module (MODULE_TYPE_*, 0 = slot off).
+// Protocol the model selected for the module (MODULE_TYPE_*, 0 = slot off).
 uint8_t edgetxAndroidExternalModuleType() __attribute__((weak));
 
 // Implemented by the simulator library (gui/colorlcd/lcd.cpp). Weak so an older
@@ -91,10 +91,10 @@ void lcdRequestFullRefresh() __attribute__((weak));
 bool simuIsRunning() __attribute__((weak));
 
 // Aux serial bridge (radio/src/targets/simu/simulib.h). The firmware calls the
-// sink when its external-module serial port starts, stops, changes baud rate or
+// sink when its module serial port starts, stops, changes baud rate or
 // transmits; the app feeds bytes back in with simuAuxSerialReceive().
 //
-// This is what lets the external RF module live on a USB serial port: the
+// This is what lets the RF module live on a USB serial port: the
 // protocol is the one EdgeTX is configured for, and its bytes come out here.
 struct edgetxAndroidSerialSink {
     void (*start)(uint8_t port_nr, uint32_t baudrate, uint8_t encoding);
@@ -107,7 +107,7 @@ struct edgetxAndroidSerialSink {
 // without the bridge must not stop the app from loading (see module_serial::init).
 void edgetxAndroidSetAuxSerialSink(const edgetxAndroidSerialSink* sink) __attribute__((weak));
 
-// port_nr is 0 for AUX1, 1 for AUX2 - the external module port uses AUX1.
+// port_nr is 0 for AUX1, 1 for AUX2 - the module port uses AUX1.
 void simuAuxSerialReceive(uint8_t port_nr, const uint8_t* data, uint32_t len);
 
 // Audio (radio/src/targets/simu/android_host.cpp): the firmware queues the PCM its
@@ -223,7 +223,7 @@ void requestFullRefresh();
 // link is stopped, and then nothing is taken or presented and the screen stays black.
 bool firmwareRunning();
 
-// Protocol the model selected for the external module slot, 0 when it is off.
+// Protocol the model selected for the module slot, 0 when it is off.
 uint8_t externalModuleType();
 
 }  // namespace simu

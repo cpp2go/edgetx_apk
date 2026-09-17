@@ -26,12 +26,12 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 /**
- * The external RF module, reached over a USB serial port.
+ * The RF module, reached over a USB serial port.
  *
- * <p>This app makes the RC behave like a radio with a module in its bay: EdgeTX runs the
- * module protocol (whatever is selected under External RF in the model settings - CRSF,
- * SBUS, DSM, PPM, ...) and this class is the wire that protocol travels on. The firmware's
- * module port has no UART on Android, so the simulator library hands its bytes to
+ * <p>This app makes the RC behave like a radio whose module is wired straight to the USB
+ * port: EdgeTX runs the module protocol (whatever the model's module settings select -
+ * CRSF, SBUS, DSM, PPM, ...) and this class is the wire that protocol travels on. The
+ * firmware's module port has no UART on Android, so the simulator library hands its bytes to
  * {@code module_serial.cpp}, which queues them here:
  *
  * <pre>

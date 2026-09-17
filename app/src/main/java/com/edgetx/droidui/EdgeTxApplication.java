@@ -49,7 +49,7 @@ public class EdgeTxApplication extends Application {
         // The squelch, beeps and voice prompts are the firmware's own audio; this only
         // gives it an output device (see RcAudio).
         RcAudio.start(this);
-        // The external RF module lives on a USB serial port (see RcModuleSerial).
+        // The RF module lives on a USB serial port (see RcModuleSerial).
         // Started here rather than from the activity so the permission prompt and
         // the port are ready before the firmware opens its module port.
         RcModuleSerial.start(this);
