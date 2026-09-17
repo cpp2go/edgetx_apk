@@ -44,6 +44,12 @@ namespace {
 
 constexpr int32_t kFp = 1024;  // fixed-point scale denominator
 
+// How often the activity loop and the link thread wake up. The input path from the
+// DJI SDK to the firmware runs through both of them, so this is latency the host
+// adds on top of whatever the SDK takes: 4 ms keeps it small without waking either
+// thread up unnecessarily often.
+constexpr uint32_t kPollIntervalMs = 4;
+
 struct android_app* g_app = nullptr;
 
 // Set by the activity thread while a window is up, cleared when it goes away.
@@ -408,7 +414,7 @@ void link_thread_main() {
             }
         }
 
-        sleep_ms(8);  // ~120 Hz, same cadence the activity loop used
+        sleep_ms(kPollIntervalMs);  // the link thread's cadence, see the constant
     }
 }
 
@@ -697,7 +703,7 @@ extern "C" void android_main(struct android_app* app) {
             }
         }
 
-        sleep_ms(8);  // ~120 Hz poll, cheap while the firmware idles
+        sleep_ms(kPollIntervalMs);  // ~250 Hz poll, cheap while the firmware idles
     }
 
     // The activity is going away. The link only stops with it when nothing is

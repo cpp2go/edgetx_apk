@@ -168,6 +168,7 @@ public final class DjiMsdkBridge {
             listenFiveDimension();
             listenButtonKeys();
             listenSticks();
+            startPolling();
             listenSwitches();
             listenArmState();
             listenBattery();
@@ -518,6 +519,78 @@ public final class DjiMsdkBridge {
     /** The RC's two dials, as rotary encoder sources (see nativeOnDjiDial). */
     static final int DIAL_LEFT = 0;
     static final int DIAL_RIGHT = 1;
+
+    // --------------------------------------------------------------- polling --
+    //
+    // The SDK hands out these values on change, and on this RC that push arrives at
+    // roughly 6-9 Hz per axis: measured on the device, 20-36 samples a second over
+    // the four axes, with gaps up to 370 ms between two of them. That is 100-200 ms
+    // of lag before the mixer sees a stick move, which is what makes the sticks feel
+    // remote-controlled rather than direct.
+    //
+    // KeyManager.getValue() reads the cache the SDK fills as the data arrives, so it
+    // is polled here instead. The listeners above stay as a fallback - a poll that
+    // returns the same value again pushes nothing.
+    private static final int POLL_INTERVAL_MS = 5;
+
+    private static void startPolling() {
+        final Thread thread = new Thread(DjiMsdkBridge::pollLoop, "dji-poll");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private static void pollLoop() {
+        final KeyManager manager = KeyManager.getInstance();
+
+        // The four sticks, then the two dials: the rotation of a dial is what moves
+        // the focus in the UI, so it wants the same treatment.
+        final DJIKey<Integer>[] keys = new DJIKey[] {
+                KeyTools.createKey(DJIRemoteControllerKey.KeyStickLeftHorizontal),
+                KeyTools.createKey(DJIRemoteControllerKey.KeyStickLeftVertical),
+                KeyTools.createKey(DJIRemoteControllerKey.KeyStickRightHorizontal),
+                KeyTools.createKey(DJIRemoteControllerKey.KeyStickRightVertical),
+                KeyTools.createKey(DJIRemoteControllerKey.KeyLeftDial),
+                KeyTools.createKey(DJIRemoteControllerKey.KeyRightDial),
+        };
+        final int[] last = new int[keys.length];
+        final boolean[] seen = new boolean[keys.length];
+
+        while (true) {
+            for (int i = 0; i < keys.length; i++) {
+                final Integer value;
+                try {
+                    value = manager.getValue(keys[i]);
+                } catch (Throwable t) {
+                    continue;
+                }
+                if (value == null) {
+                    continue;
+                }
+                final int raw = value;
+                if (seen[i] && raw == last[i]) {
+                    continue;
+                }
+                seen[i] = true;
+                last[i] = raw;
+                try {
+                    if (i < 4) {
+                        nativeOnDjiStick(i, raw);
+                    } else {
+                        nativeOnDjiDial(i - 4, raw);
+                    }
+                } catch (Throwable ignored) {
+                    // A missing native side must not kill the poller.
+                }
+            }
+
+            try {
+                Thread.sleep(POLL_INTERVAL_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
 
     /**
      * The two dials and the scroll wheel. The dials are absolute (-660..660, same
