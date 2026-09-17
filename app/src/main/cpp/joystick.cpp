@@ -38,8 +38,9 @@ namespace {
 // gui/colorlcd would react to them. LEFT/RIGHT are worse still, because
 // LvglWrapper's evt_to_indev_data() forwards only ENTER and EXIT into LVGL. There
 // is no "step to the next field" key on this target - its navigation control is
-// the rotary encoder, which the dials and the 5-way's up/down drive instead (see
-// simu::rotaryEncoderEvent()).
+// the rotary encoder, which the 5-way's up/down drives (see
+// simu::rotaryEncoderEvent()). The two dials are left to the P1/P2 inputs, where
+// they can be given a job of their own (Volume, Backlight - see requestDial).
 constexpr uint8_t kKeyExit = 1;
 constexpr uint8_t kKeyEnter = 2;
 constexpr uint8_t kKeyPageUp = 3;
@@ -927,25 +928,21 @@ bool g_analogQueued[kMaxAnalogChannels] = {};
 uint16_t g_analogValue[kMaxAnalogChannels] = {};
 int32_t g_scrollWheelValue = 0;
 
-// ---- dials -> rotary encoder -----------------------------------------------
+// ---- dials -> P1/P2 ---------------------------------------------------------
 //
-// The two dials are absolute (-660..660, like the sticks) while EdgeTX's rotary
-// encoder is relative, one detent at a time, so the dial movement is accumulated
-// and whole detents are emitted with the remainder carried over - slow, fine turns
-// then still register. The steps are handed to the firmware by tick(), which moves
-// the encoder EdgeTX already has: turning walks the focus through the controls of
-// the current screen, and with a field in edit mode it changes its value.
-//
-// The dials do not drive P1/P2, because the encoder is a real input device on this
-// board: ROTARY_ENCODER_NAVIGATION is defined - the TX16SMK3 hal header is generated
-// into the build directory - so every window's group is attached to it.
-constexpr uint8_t kDialCount = 2;      // 0 = left dial, 1 = right dial
-constexpr int32_t kDialDetent = 33;    // SDK units of dial travel per detent
+// The two dials are absolute, the same -660..660 the SDK reports for the sticks, and
+// they become the board's P1 and P2 inputs. That is what makes them usable as the
+// source of a special function - Volume, Backlight - which is how a radio with two
+// dials is normally set up; driving the 5-way's encoder instead would leave them
+// with nothing to do that the 5-way cannot already do.
+constexpr uint8_t kDialCount = 2;  // 0 = left dial, 1 = right dial
 
-std::mutex g_dialMutex;
-bool g_dialSeen[kDialCount] = {};
-int32_t g_dialLast[kDialCount] = {};
-int32_t g_dialRemainder[kDialCount] = {};
+constexpr uint8_t kDialChannels[kDialCount] = {
+    4,  // left dial  -> P1
+    5,  // right dial -> P2
+};
+
+std::mutex g_rotaryMutex;
 int32_t g_rotaryQueued = 0;
 
 // One wheel detent covers this much of the range, so ~20 detents is full travel.
@@ -971,30 +968,13 @@ void requestStick(int axis, int32_t value) {
 
 void requestDial(uint8_t dial, int32_t value) {
     if (dial >= kDialCount) return;
-
-    std::lock_guard<std::mutex> lock(g_dialMutex);
-
-    if (!g_dialSeen[dial]) {
-        // The first reading is the reference position, not a movement.
-        g_dialSeen[dial] = true;
-        g_dialLast[dial] = value;
-        return;
-    }
-
-    g_dialRemainder[dial] += value - g_dialLast[dial];
-    g_dialLast[dial] = value;
-
-    const int32_t steps = g_dialRemainder[dial] / kDialDetent;
-    if (steps != 0) {
-        g_dialRemainder[dial] -= steps * kDialDetent;
-        g_rotaryQueued += steps;
-    }
+    requestAnalog(kDialChannels[dial], dji_analog(value));
 }
 
 // Queue rotary encoder steps directly (positive = clockwise = right). Used by the
-// 5-way's up/down, and drained by tick() along with whatever the dials produced.
+// 5-way's up/down and drained by tick(); the dials no longer contribute.
 void requestRotary(int32_t steps) {
-    std::lock_guard<std::mutex> lock(g_dialMutex);
+    std::lock_guard<std::mutex> lock(g_rotaryMutex);
     g_rotaryQueued += steps;
 }
 
@@ -1074,11 +1054,10 @@ void tick() {
         if (queued) simu::setSwitch(static_cast<uint8_t>(index), state);
     }
 
-    // Rotary steps collected since the last frame, from the dials and from the
-    // 5-way's up/down.
+    // Rotary steps collected since the last frame, from the 5-way's up/down.
     int32_t steps;
     {
-        std::lock_guard<std::mutex> lock(g_dialMutex);
+        std::lock_guard<std::mutex> lock(g_rotaryMutex);
         steps = g_rotaryQueued;
         g_rotaryQueued = 0;
     }
@@ -1160,7 +1139,7 @@ Java_com_edgetx_droidui_DjiMsdkBridge_nativeOnDjiStick(JNIEnv* env, jclass clazz
 
 // Called from DjiMsdkBridge.java with a dial position. `dial` is 0 = left,
 // 1 = right; `value` is the SDK's absolute reading in the same -660..660 range
-// as the sticks. The movement is turned into rotary encoder steps (see
+// as the sticks. The dial becomes one of the board's two P1/P2 inputs (see
 // requestDial).
 extern "C" JNIEXPORT void JNICALL
 Java_com_edgetx_droidui_DjiMsdkBridge_nativeOnDjiDial(JNIEnv* env, jclass clazz, jint dial,

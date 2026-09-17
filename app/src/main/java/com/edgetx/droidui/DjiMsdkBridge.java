@@ -89,9 +89,8 @@ public final class DjiMsdkBridge {
      * Absolute dial position. `dial` is 0 = left, 1 = right; the dials report the
      * same -660..660 range as the sticks.
      *
-     * The dials drive EdgeTX's rotary encoder: the movement between two readings
-     * becomes encoder steps, which move the focus and edit values in the UI. They
-     * do not map to P1/P2 - see joystick.cpp.
+     * They are the board's P1 and P2 inputs, so whatever a radio normally does with
+     * a pot - Volume and Backlight through a special function - works with them.
      */
     static native void nativeOnDjiDial(int dial, int value);
 
@@ -500,9 +499,13 @@ public final class DjiMsdkBridge {
                 //     switch at the top    -> SWITCH_TWO
                 //     switch in the middle -> SWITCH_ONE
                 //     switch at the bottom -> SWITCH_THREE
-                case SWITCH_TWO: return -1;
+                //
+                // The two ends are the other way round in EdgeTX on purpose: the switch
+                // is labelled high/middle/low, and its high position is EdgeTX's down,
+                // so the sign is flipped here rather than left to every model to undo.
+                case SWITCH_TWO: return 1;
                 case SWITCH_ONE: return 0;
-                case SWITCH_THREE: return 1;
+                case SWITCH_THREE: return -1;
                 default: return null;              // UNKNOWN
             }
         }
@@ -542,8 +545,8 @@ public final class DjiMsdkBridge {
     private static void pollLoop() {
         final KeyManager manager = KeyManager.getInstance();
 
-        // The four sticks, then the two dials: the rotation of a dial is what moves
-        // the focus in the UI, so it wants the same treatment.
+        // The four sticks, then the two dials: both are absolute values that the app
+        // turns into analog inputs (the sticks are the axes, the dials are P1/P2).
         final DJIKey<Integer>[] keys = new DJIKey[] {
                 KeyTools.createKey(DJIRemoteControllerKey.KeyStickLeftHorizontal),
                 KeyTools.createKey(DJIRemoteControllerKey.KeyStickLeftVertical),
