@@ -9,10 +9,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <map>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "log.h"
@@ -771,28 +773,28 @@ bool g_thumbLSeen = false;
 constexpr auto kThumbLDedup = std::chrono::milliseconds(500);
 
 // The RC's L1/L2/L3 buttons arrive as plain Android key codes F1..F3 (measured -
-// the SDK's own boolean button keys are all silent on this remote). They are
-// momentary, so each drives an EdgeTX switch: pressed = down, released = up. SA
-// and SB are taken by the takeoff button and the flight-mode switch, so these
-// start at SC.
+// the SDK's own boolean button keys are all silent on this remote). They are used
+// as the three positions of one switch, SF: pressed = that position, and it stays
+// there until another of the three is pressed (so the release is ignored).
 //
 // The photo, video and pause buttons are NOT here: their kernel key codes never
 // reach an app (the RC's own dpad service consumes them, and pause is not in the
-// kernel input stream at all), so SF/SG/SH are driven from the DJI SDK instead -
+// kernel input stream at all), so SC/SD/SE are driven from the DJI SDK instead -
 // see DjiMsdkBridge.listenButtonKeys().
 //
 // A key code listed in joystick.keys wins, which is how any of these can be made
 // an EdgeTX key instead - R1/R2/R3 (F4..F6) are mapped that way above, so they
-// open the SYS/MODEL/TELE pages and no longer move SF/SG/SH.
+// open the SYS/MODEL/TELE pages.
 struct SwitchKey {
     int32_t keycode;
     uint8_t index;
+    int8_t  state;   // the position this button selects: -1 up, 0 middle, 1 down
 };
 
 const SwitchKey kSwitchKeys[] = {
-    {AKEYCODE_F1, 2},  // L1 -> SC
-    {AKEYCODE_F2, 3},  // L2 -> SD
-    {AKEYCODE_F3, 4},  // L3 -> SE
+    {AKEYCODE_F1, 5, -1},  // L1 -> SF up
+    {AKEYCODE_F2, 5,  0},  // L2 -> SF middle
+    {AKEYCODE_F3, 5,  1},  // L3 -> SF down
 };
 
 std::vector<int32_t> g_loggedSwitchKeys;
@@ -803,14 +805,14 @@ const char* switch_name(uint8_t index) {
     return buf;
 }
 
-void log_switch_key_once(int32_t keycode, uint8_t index) {
+void log_switch_key_once(int32_t keycode, uint8_t index, int8_t state) {
     if (std::find(g_loggedSwitchKeys.begin(), g_loggedSwitchKeys.end(), keycode) !=
         g_loggedSwitchKeys.end()) {
         return;
     }
     g_loggedSwitchKeys.push_back(keycode);
-    LOGI("joystick: button keycode %d (%s) -> EdgeTX switch %s", keycode, key_name(keycode),
-         switch_name(index));
+    LOGI("joystick: button keycode %d (%s) -> EdgeTX switch %s position %d", keycode,
+         key_name(keycode), switch_name(index), (int)state);
 }
 
 bool handleKeyEvent(AInputEvent* event) {
@@ -845,8 +847,11 @@ bool handleKeyEvent(AInputEvent* event) {
     // Not remapped, so fall back to the built-in role of these buttons.
     for (const SwitchKey& entry : kSwitchKeys) {
         if (entry.keycode == keycode) {
-            log_switch_key_once(keycode, entry.index);
-            requestSwitch(entry.index, down ? 1 : -1);
+            // The switch latches, so only the press moves it.
+            if (down) {
+                log_switch_key_once(keycode, entry.index, entry.state);
+                requestSwitch(entry.index, entry.state);
+            }
             return true;
         }
     }
@@ -978,6 +983,83 @@ void requestRotary(int32_t steps) {
     g_rotaryQueued += steps;
 }
 
+// ---- 5-way stick trim mode --------------------------------------------------
+//
+// The RC's go-home button (the one Android reports as FN and the SDK as
+// KeyGoHomeButtonDown) picks what the 5-way does, by how many times it is pressed
+// in one go:
+//
+//     one press     -> back to normal (rotary encoder, page keys, ENTER)
+//     two presses   -> the four directions trim the left stick
+//     three presses -> the four directions trim the right stick
+//
+// Up/down move that stick's vertical trim, left/right its horizontal one, one step
+// per press - the same step a physical trim switch makes. The centre press keeps
+// sending ENTER, so a trim mode never locks the user out of the UI.
+//
+// A step has to be a pulse rather than a single call: EdgeTX samples the trim
+// switches from its own timer, so a switch that goes down and up inside one tick()
+// is never seen - the same reason the synthetic keys are held in tick().
+constexpr auto kTrimPressWindow = std::chrono::milliseconds(800);
+constexpr auto kTrimPulseLength = std::chrono::milliseconds(60);
+// A trim mode is for a quick correction, not a mode to get stuck in: leave it after
+// this long without a 5-way press.
+constexpr auto kTrimModeIdle = std::chrono::seconds(3);
+
+std::mutex g_trimMutex;
+int g_trimMode = 0;   // 0 = off, 1 = left stick, 2 = right stick
+int g_trimPressCount = 0;
+std::chrono::steady_clock::time_point g_trimLastPress;
+std::chrono::steady_clock::time_point g_trimLastActivity;
+std::deque<uint8_t> g_trimQueued;
+std::deque<std::pair<uint8_t, std::chrono::steady_clock::time_point>> g_trimActive;
+
+const char* trim_mode_name(int mode) {
+    switch (mode) {
+        case 1: return "left stick";
+        case 2: return "right stick";
+        default: return "off";
+    }
+}
+
+// One press of the go-home button.
+void requestTrimModePress() {
+    std::lock_guard<std::mutex> lock(g_trimMutex);
+    const auto now = std::chrono::steady_clock::now();
+    if (g_trimPressCount > 0 && now - g_trimLastPress > kTrimPressWindow) {
+        g_trimPressCount = 0;   // a press this late starts a new count
+    }
+    g_trimPressCount++;
+    g_trimLastPress = now;
+    LOGI("joystick: go-home press %d", g_trimPressCount);
+}
+
+// A 5-way direction while a trim mode is active. Returns true when it was consumed,
+// which is what stops it from turning the encoder or paging instead.
+bool handleTrimDirection(int id) {
+    std::lock_guard<std::mutex> lock(g_trimMutex);
+    if (g_trimMode == 0) return false;
+
+    // The trim bits are numbered in the board's ADC order, which is
+    // LH, LV, RV, RH (radio/src/boards/hw_defs/tx16smk3.json) - so on the right stick
+    // the vertical axis comes before the horizontal one, not after.
+    static constexpr uint8_t kAxis[2][2] = {
+        // horizontal, vertical
+        {0, 1},  // left stick
+        {3, 2},  // right stick
+    };
+
+    const bool vertical = (id == 1 || id == 2);   // 1 = up, 2 = down
+    const bool positive = (id == 1 || id == 4);   // 4 = right
+    const int axis = kAxis[g_trimMode - 1][vertical ? 1 : 0];
+    const uint8_t bit = static_cast<uint8_t>(axis * 2 + (positive ? 1 : 0));
+    g_trimQueued.push_back(bit);
+    g_trimLastActivity = std::chrono::steady_clock::now();
+    LOGI("joystick: trim %s axis %d %s", trim_mode_name(g_trimMode), axis,
+         positive ? "+" : "-");
+    return true;
+}
+
 // The wheel reports relative steps that fall back to 0 after each detent, so they
 // are accumulated into a slider.
 //
@@ -1054,6 +1136,49 @@ void tick() {
         if (queued) simu::setSwitch(static_cast<uint8_t>(index), state);
     }
 
+    // Trim mode: settle on the mode once the go-home presses stop, then hold every
+    // queued trim step long enough for the firmware's own polling to see it.
+    {
+        std::lock_guard<std::mutex> lock(g_trimMutex);
+        const auto now = std::chrono::steady_clock::now();
+
+        if (g_trimPressCount > 0 && now - g_trimLastPress > kTrimPressWindow) {
+            int mode = 0;
+            switch (g_trimPressCount) {
+                case 2: mode = 1; break;
+                case 3: mode = 2; break;
+                default: break;   // one press cancels; four or more are ignored
+            }
+            g_trimPressCount = 0;
+            if (mode != g_trimMode) {
+                g_trimMode = mode;
+                g_trimLastActivity = now;
+                LOGI("joystick: 5-way trim mode -> %s", trim_mode_name(mode));
+            }
+        }
+
+        // Not used for a while: the mode is meant for a quick correction, so put the
+        // 5-way back to its normal job by itself.
+        if (g_trimMode != 0 && now - g_trimLastActivity > kTrimModeIdle) {
+            g_trimMode = 0;
+            LOGI("joystick: 5-way trim mode -> off (idle)");
+        }
+
+        while (!g_trimQueued.empty()) {
+            g_trimActive.emplace_back(g_trimQueued.front(), now + kTrimPulseLength);
+            g_trimQueued.pop_front();
+        }
+        for (auto it = g_trimActive.begin(); it != g_trimActive.end();) {
+            simu::setTrim(it->first, true);
+            if (now >= it->second) {
+                simu::setTrim(it->first, false);
+                it = g_trimActive.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
     // Rotary steps collected since the last frame, from the 5-way's up/down.
     int32_t steps;
     {
@@ -1085,6 +1210,10 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_edgetx_droidui_DjiMsdkBridge_nativeOnDjiButton(JNIEnv* env, jclass clazz, jint id) {
     (void)env;
     (void)clazz;
+
+    // While a trim mode is active the four directions trim the selected stick
+    // instead of turning the encoder and paging. The centre press is untouched.
+    if (id >= 1 && id <= 4 && handleTrimDirection(id)) return;
 
     uint8_t key = 0;
     switch (id) {
@@ -1129,6 +1258,15 @@ Java_com_edgetx_droidui_DjiMsdkBridge_nativeOnDjiButton(JNIEnv* env, jclass claz
 // This is the only way to get the sticks: the RC firmware never dispatches
 // their MotionEvents to Android, and this process may not open
 // /dev/input/event4 (root:input, mode 0660) to read them from the kernel.
+// The RC's go-home button, one call per press. It only changes what the 5-way
+// does, see the trim mode above.
+extern "C" JNIEXPORT void JNICALL
+Java_com_edgetx_droidui_DjiMsdkBridge_nativeOnDjiGoHome(JNIEnv* env, jclass clazz) {
+    (void)env;
+    (void)clazz;
+    requestTrimModePress();
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_edgetx_droidui_DjiMsdkBridge_nativeOnDjiStick(JNIEnv* env, jclass clazz, jint axis,
                                                        jint value) {

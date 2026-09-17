@@ -72,6 +72,12 @@ public final class DjiMsdkBridge {
     static native void nativeOnDjiButton(int buttonId);
 
     /**
+     * One press of the RC's go-home button. joystick.cpp counts them: one press puts
+     * the 5-way back to normal, two make it trim the left stick, three the right one.
+     */
+    static native void nativeOnDjiGoHome();
+
+    /**
      * Stick positions. Android never dispatches the RC's stick MotionEvents, and
      * /dev/input/event4 cannot be opened by an app, so these four SDK keys are the
      * only source. `axis` is 0 left-horizontal, 1 left-vertical, 2 right-horizontal,
@@ -231,16 +237,73 @@ public final class DjiMsdkBridge {
     // nor KeyRcButtonEventPro: the kernel key codes behind them are eaten by the
     // RC's own dpad service in SystemUI, and the pause button is not even in the
     // kernel input stream (the raw gpio-keys device stays silent for it). The
-    // SDK's plain Boolean button keys do work, so SF/SG/SH are driven from those.
+    // SDK's plain Boolean button keys do work, so SC/SD/SE/SG/SH are driven from those.
     // Indices are the board's switch table, see joystick.cpp requestSwitch().
     //
-    // Measured on the RC: pause and video fire, photo does not - KeyShutterButtonDown
-    // is the camera's shutter, which only reports once a camera/aircraft is
-    // connected. The wiring is there for when one is.
+    // Measured on the RC: all of them fire. The shutter is the odd one - one contact
+    // only, so it also drives a switch of its own, see listenShutter().
 
-    static final int SWITCH_F = 5;   // video button
-    static final int SWITCH_G = 6;   // photo button
-    static final int SWITCH_H = 7;   // pause button
+    static final int SWITCH_C = 2;   // video button
+    static final int SWITCH_D = 3;   // pause button
+    static final int SWITCH_E = 4;   // photo/shutter button, three positions
+    static final int SWITCH_G = 6;   // C1 button
+    static final int SWITCH_H = 7;   // C2 button
+    static final int SWITCH_I = 8;   // C3 button
+
+    /**
+     * The shutter button as a three-position switch (SE).
+     *
+     * The button has a single contact - on the RC it is BTN_TR on the joystick device,
+     * and the SDK reports it as one Boolean - so the two positions a camera shutter
+     * normally has, half press and full press, are not in the data at all. What is left
+     * is how long it was held, and that is what picks the outer state:
+     *
+     *     at boot               -> middle
+     *     pressed &lt; 300 ms   -> up
+     *     pressed &gt;= 300 ms  -> down
+     *
+     * The switch latches, so a channel fed from it holds the level until the next press.
+     *
+     * SE and not one of the free slots: this board declares SI and SJ as 2-position
+     * switches, and configuring one of those as 3POS makes the firmware reject the whole
+     * settings file.
+     */
+    private static final long SHUTTER_SHORT_PRESS_MS = 300;
+
+    private static void listenShutter() {
+        try {
+            final DJIKey<Boolean> key =
+                    KeyTools.createKey(DJIRemoteControllerKey.KeyShutterButtonDown);
+            KeyManager.getInstance().listen(key, OWNER,
+                    new CommonCallbacks.KeyListener<Boolean>() {
+                        private long pressedAt;
+
+                        @Override
+                        public void onValueChange(Boolean oldValue, Boolean newValue) {
+                            if (newValue != null && newValue) {
+                                pressedAt = System.currentTimeMillis();
+                                return;
+                            }
+
+                            if (oldValue == null || pressedAt == 0) {
+                                return;   // the initial snapshot, not a release
+                            }
+
+                            final long held = System.currentTimeMillis() - pressedAt;
+                            pressedAt = 0;
+                            final int position = held >= SHUTTER_SHORT_PRESS_MS ? 1 : -1;
+                            Log.i(TAG, "dji: photo held " + held + " ms -> switch E "
+                                    + (position > 0 ? "down" : "up"));
+                            nativeOnDjiSwitch(SWITCH_E, position);
+                        }
+                    });
+
+            // The middle position is where the switch sits until the first press.
+            nativeOnDjiSwitch(SWITCH_E, 0);
+        } catch (Throwable t) {
+            Log.w(TAG, "dji: shutter listen failed", t);
+        }
+    }
 
     private static void listenSwitchButton(DJIKeyInfo<Boolean> info, String name, int index) {
         try {
@@ -261,9 +324,41 @@ public final class DjiMsdkBridge {
     }
 
     private static void listenButtonKeys() {
-        listenSwitchButton(DJIRemoteControllerKey.KeyRecordButtonDown, "video", SWITCH_F);
-        listenSwitchButton(DJIRemoteControllerKey.KeyShutterButtonDown, "photo", SWITCH_G);
-        listenSwitchButton(DJIRemoteControllerKey.KeyPauseButtonDown, "pause", SWITCH_H);
+        listenSwitchButton(DJIRemoteControllerKey.KeyRecordButtonDown, "video", SWITCH_C);
+        listenShutter();
+        // The pause button is a press-only button like the takeoff one, and the model
+        // wants a latched level out of it (a channel that stays high until the next
+        // press), so it toggles SD instead of being high only while it is held.
+        listenToggleSwitch(SWITCH_D, "pause", DJIRemoteControllerKey.KeyPauseButtonDown);
+        // The RC's C1/C2/C3 buttons.
+        listenSwitchButton(DJIRemoteControllerKey.KeyCustomButton1Down, "C1", SWITCH_G);
+        listenSwitchButton(DJIRemoteControllerKey.KeyCustomButton2Down, "C2", SWITCH_H);
+        listenSwitchButton(DJIRemoteControllerKey.KeyCustomButton3Down, "C3", SWITCH_I);
+        listenGoHome();
+    }
+
+    /**
+     * The go-home button is not a switch of its own: pressing it one, two or three
+     * times tells the 5-way what to trim, so only the presses are forwarded.
+     */
+    private static void listenGoHome() {
+        try {
+            final DJIKey<Boolean> key =
+                    KeyTools.createKey(DJIRemoteControllerKey.KeyGoHomeButtonDown);
+            KeyManager.getInstance().listen(key, OWNER,
+                    new CommonCallbacks.KeyListener<Boolean>() {
+                        @Override
+                        public void onValueChange(Boolean oldValue, Boolean newValue) {
+                            if (newValue != null && newValue &&
+                                (oldValue == null || !oldValue)) {
+                                Log.i(TAG, "dji: go-home pressed");
+                                nativeOnDjiGoHome();
+                            }
+                        }
+                    });
+        } catch (Throwable t) {
+            Log.w(TAG, "dji: go-home listen failed", t);
+        }
     }
 
     static final int STICK_LEFT_H = 0;
@@ -276,9 +371,10 @@ public final class DjiMsdkBridge {
      * The RC's L1/L2/L3/R1/R2/R3 buttons are NOT here: they arrive as Android key
      * codes F1..F6 and are turned into EdgeTX switches in joystick.cpp.
      *
-     * The SDK's own boolean button keys (KeyRecordButtonDown, KeyShutterButtonDown,
-     * KeyCustomButton1Down(), ... KeyPauseButtonDown) were all listened to during
-     * development and never fired on this remote, so they are not wired up.
+     * The SDK's own boolean button keys are what the rest of the mappings above use
+     * (KeyRecordButtonDown, KeyShutterButtonDown, KeyCustomButton1...3Down,
+     * KeyPauseButtonDown): they all fire on this remote, unlike KeyRcButtonEventPro,
+     * which never does.
      */
 
     /** One log line per control, the first time it reports. */
@@ -321,9 +417,10 @@ public final class DjiMsdkBridge {
         }
     }
 
-    /** Indices in the board's switch table (tx16smk3.json): 0 = SA, 1 = SB, 9 = SJ. */
+    /** Indices in the board's switch table (tx16smk3.json): 0 = SA, 1 = SB, 7 = SH, 9 = SJ. */
     static final int SW_SA = 0;
     static final int SW_SB = 1;
+    static final int SW_SH = 7;
 
     /**
      * Free slot used to carry the aircraft's arm state into EdgeTX, where any screen,
@@ -350,20 +447,28 @@ public final class DjiMsdkBridge {
     }
 
     /**
-     * The takeoff button's two states as EdgeTX switch positions. The button powers up
-     * low with a red LED and that low state is SA down; the green LED is high, SA up -
-     * so the arrow points up whenever the LED is green.
+     * The two states a press-only button toggles between, as EdgeTX switch positions.
+     * The takeoff button powers up low with a red LED, and that low state is the
+     * switch's down position, so the arrow points up whenever the LED is green.
      */
-    private static final int TAKEOFF_LOW = 1;
-    private static final int TAKEOFF_HIGH = -1;
+    private static final int SWITCH_LOW = 1;
+    private static final int SWITCH_HIGH = -1;
 
     /**
-     * Latched state of the takeoff button as EdgeTX sees it. It tracks the hardware's
-     * own high/low because one SDK press pulse maps to exactly one toggle.
+     * Latched state of each button that only reports presses, as EdgeTX sees it: one
+     * SDK press pulse maps to exactly one toggle, so this has to track it here.
      */
-    private static boolean sTakeoffHigh;
+    private static final int SWITCH_COUNT = 10;   // SA..SJ
+    private static final boolean[] sToggleHigh = new boolean[SWITCH_COUNT];
 
-    /** A button reporting only its press, driving a two-position EdgeTX switch. */
+    /**
+     * A button reporting only its press, driving a two-position EdgeTX switch: the
+     * takeoff button (SA) and the pause button (SH) both work this way.
+     *
+     * The first callback is the initial snapshot rather than a press, and the SDK also
+     * reports the release half of the pulse, so only a press is acted on. The button
+     * starts out low, which is also how the switch should look at boot.
+     */
     private static void listenToggleSwitch(final int index, final String label,
                                            DJIKeyInfo<Boolean> info) {
         try {
@@ -372,25 +477,20 @@ public final class DjiMsdkBridge {
                     new CommonCallbacks.KeyListener<Boolean>() {
                         @Override
                         public void onValueChange(Boolean oldValue, Boolean newValue) {
-                            // The first callback is the initial snapshot, not a press,
-                            // and the SDK also reports the release half of the pulse.
                             if (oldValue == null || !Boolean.TRUE.equals(newValue)) {
                                 return;
                             }
                             final boolean high;
                             synchronized (DjiMsdkBridge.class) {
-                                sTakeoffHigh = !sTakeoffHigh;
-                                high = sTakeoffHigh;
+                                sToggleHigh[index] = !sToggleHigh[index];
+                                high = sToggleHigh[index];
                             }
                             Log.i(TAG, "dji: switch " + index + " (" + label + ") -> "
                                     + (high ? "high" : "low"));
                             dispatchToggle(index, high);
                         }
                     });
-            // Presses are all the SDK reports, so the latched level has to be assumed:
-            // the button starts out low (red LED), which is also how SA should look.
-            sTakeoffHigh = false;
-            dispatchToggle(index, false);
+            dispatchToggle(index, sToggleHigh[index]);
         } catch (Throwable t) {
             Log.w(TAG, "dji: " + label + " listen failed", t);
         }
@@ -398,7 +498,7 @@ public final class DjiMsdkBridge {
 
     private static void dispatchToggle(int index, boolean high) {
         try {
-            nativeOnDjiSwitch(index, high ? TAKEOFF_HIGH : TAKEOFF_LOW);
+            nativeOnDjiSwitch(index, high ? SWITCH_HIGH : SWITCH_LOW);
         } catch (Throwable t) {
             Log.w(TAG, "dji: switch " + index + " dispatch failed", t);
         }

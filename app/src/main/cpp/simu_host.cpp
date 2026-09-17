@@ -119,6 +119,7 @@ void setAnalogSource(bool external) {
 
 void setKey(uint8_t key, bool down) { simuSetKey(key, down); }
 void setSwitch(uint8_t index, int8_t state) { simuSetSwitch(index, state); }
+void setTrim(uint8_t trim, bool state) { simuSetTrim(trim, state); }
 void rotaryEncoderEvent(int32_t steps) { simuRotaryEncoderEvent(steps); }
 
 // VBAT's position in the board's ADC input list (radio/src/boards/hw_defs/

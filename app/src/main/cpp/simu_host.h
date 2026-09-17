@@ -54,6 +54,8 @@ void simuRotaryEncoderEvent(int32_t steps);
 
 void simuSetKey(uint8_t key, bool state);
 void simuSetSwitch(uint8_t swtch, int8_t state);
+void simuSetTrim(uint8_t trim, bool state);
+void simuSetTrim(uint8_t trim, bool state);
 
 // Implemented by the Android host layer inside the simulator library
 // (radio/src/targets/simu/android_host.cpp). They let the app feed real
@@ -178,6 +180,12 @@ void rotaryEncoderEvent(int32_t steps);
 
 // EdgeTX key index (see the EnumKeys note above); `down` = pressed.
 void setKey(uint8_t key, bool down);
+
+// Trim switch, exactly as readTrims() sees it: `bit` is the trim axis (0 = left
+// stick horizontal, 1 = left vertical, 2 = right horizontal, 3 = right vertical)
+// times two, plus one for the positive direction (so even = down/left, odd =
+// up/right). Used to trim a stick from the 5-way, see joystick.cpp.
+void setTrim(uint8_t bit, bool state);
 
 // Hardware switch position. `index` follows the board's switch table
 // (radio/src/boards/hw_defs/tx16smk3.json): 0 = SA, 1 = SB, 2 = SC, ... and
