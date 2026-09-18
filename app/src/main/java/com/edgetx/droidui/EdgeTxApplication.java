@@ -66,6 +66,11 @@ public class EdgeTxApplication extends Application {
         } catch (Throwable t) {
             Log.i(TAG, "dji: sdk bridge inactive (" + t.getClass().getSimpleName() + ")");
         }
+
+        // The RC's sticks and dials, read straight off the joystick's USB interface: the
+        // DJI SDK publishes them at 8-14 Hz while the device itself produces a new
+        // position every 2.5 ms. The SDK stays as the fallback, see RcRawJoystick.
+        RcRawJoystick.start(this);
     }
 
     /**

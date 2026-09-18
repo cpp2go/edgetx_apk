@@ -134,6 +134,11 @@ uint32_t edgetxAndroidAudioDroppedBytes();
 uint16_t getBatteryVoltage();
 bool usbChargerLed();
 
+// The firmware's own reading of an analog input (hal/adc_driver.cpp), 0..2048 - half of
+// what pushAnalog() takes. It is what the mixer actually sees, i.e. after the jitter
+// filter, which is what makes reading it back worth while (see joystick.cpp).
+uint16_t anaIn(uint8_t chan);
+
 // The firmware's own switch state (radio/src/hal/switch_driver.h):
 // switchState(3 * index + position) answers true for the position a switch is in, with
 // 0 = up, 1 = middle, 2 = down. Weak like the others, so an older library still loads.

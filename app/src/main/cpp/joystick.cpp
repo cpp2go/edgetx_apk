@@ -893,13 +893,17 @@ void log_key_repeat(int32_t keycode) {
 // device - it arrives as an 8 ms tap that lands when the button is released - while the
 // same hold on the gpio-keys device arrives intact (that one carries the shoulder keys).
 // EdgeTX's long press is what closes a page group (gui/colorlcd/libui/window.cpp:625) and
-// what stops a running Lua script (lua/interface.cpp:1228), and the remote has no button that
-// can deliver one - so two gestures stand in for it: the second click of a double click
-// (below), and holding the H button, which the DJI SDK does report with its real duration
-// (see nativeOnDjiGoHomeHeld). One click is passed through untouched, and two slow clicks are
-// still two short presses; a *quick* pair does not always reach us, because the remote takes
-// a rapid double press of its own return button for itself - which is why the H button is
-// the one to use in practice.
+// what stops a running Lua script (lua/interface.cpp:1228), and no Android-delivered button
+// on this remote can produce one - so two gestures stand in for it: the second click of a
+// double click (below), and holding the H button, which the DJI SDK does report with its
+// real duration (see nativeOnDjiGoHomeHeld). One click is passed through untouched, and two
+// slow clicks are still two short presses; a *quick* pair does not always reach us, because
+// the remote takes a rapid double press of its own return button for itself - which is why
+// the H button is the one to use in practice.
+//
+// Both gestures stay, but the raw joystick reader has since changed the premise: it reads
+// the button's own bit out of the reports, so a hold now arrives as a hold and EdgeTX's
+// long press fires by itself. The gestures are simply a second way to get there.
 constexpr auto kDoubleClickWindow = std::chrono::milliseconds(400);
 constexpr uint32_t kLongPressHoldMs = 450;   // EdgeTX's own threshold is ~320 ms
 
@@ -937,27 +941,13 @@ bool handle_exit_click(bool down) {
     return true;
 }
 
-bool handleKeyEvent(AInputEvent* event) {
-    const int32_t source = AInputEvent_getSource(event);
-
-    // Touch/rotary sources are not buttons; accept anything that is not the
-    // touchscreen so a controller reported as a keyboard still works.
-    if ((source & AINPUT_SOURCE_CLASS_MASK) == AINPUT_SOURCE_CLASS_POINTER) return false;
-    if ((source & AINPUT_SOURCE_TOUCHSCREEN) == AINPUT_SOURCE_TOUCHSCREEN) return false;
-
-    const int32_t action = AKeyEvent_getAction(event);
-    if (action != AKEY_EVENT_ACTION_DOWN && action != AKEY_EVENT_ACTION_UP) return false;
-    const int32_t keycode = AKeyEvent_getKeyCode(event);
-    // Android repeats DOWN while a button is held; EdgeTX does its own repeat and
-    // long-press handling, so only the initial press and the release reach the firmware.
-    // The repeat is reported once anyway, see log_key_repeat().
-    if (action == AKEY_EVENT_ACTION_DOWN && AKeyEvent_getRepeatCount(event) > 0) {
-        log_key_repeat(keycode);
-        return true;
-    }
-
-    const bool down = (action == AKEY_EVENT_ACTION_DOWN);
-
+// One button edge, whoever it came from: Android's input queue, or the raw joystick
+// reader (see RcRawJoystick.java). The second source exists because of the return button:
+// Android only ever sees RTN as a tap re-injected by the RC's own service, and that
+// service loses the joystick device the moment an app holds its USB interface. The bit in
+// the reports is the button itself, so RTN is fed from there now - with its real duration,
+// which is the first time a genuine long press of it can reach EdgeTX on this remote.
+bool handleKeyCode(int32_t keycode, bool down) {
     if (keycode == AKEYCODE_BUTTON_THUMBL && down) {
         g_thumbLAt = std::chrono::steady_clock::now();
         g_thumbLSeen = true;
@@ -985,6 +975,29 @@ bool handleKeyEvent(AInputEvent* event) {
 
     log_key_once(keycode);
     return true;
+}
+
+bool handleKeyEvent(AInputEvent* event) {
+    const int32_t source = AInputEvent_getSource(event);
+
+    // Touch/rotary sources are not buttons; accept anything that is not the
+    // touchscreen so a controller reported as a keyboard still works.
+    if ((source & AINPUT_SOURCE_CLASS_MASK) == AINPUT_SOURCE_CLASS_POINTER) return false;
+    if ((source & AINPUT_SOURCE_TOUCHSCREEN) == AINPUT_SOURCE_TOUCHSCREEN) return false;
+
+    const int32_t action = AKeyEvent_getAction(event);
+    if (action != AKEY_EVENT_ACTION_DOWN && action != AKEY_EVENT_ACTION_UP) return false;
+    const int32_t keycode = AKeyEvent_getKeyCode(event);
+    // Android repeats DOWN while a button is held; EdgeTX does its own repeat and
+    // long-press handling, so only the initial press and the release reach the firmware.
+    // The repeat is reported once anyway, see log_key_repeat().
+    if (action == AKEY_EVENT_ACTION_DOWN && AKeyEvent_getRepeatCount(event) > 0) {
+        log_key_repeat(keycode);
+        return true;
+    }
+
+    const bool down = (action == AKEY_EVENT_ACTION_DOWN);
+    return handleKeyCode(keycode, down);
 }
 
 // ---------------------------------------------------------------------------
@@ -1062,6 +1075,43 @@ std::mutex g_analogMutex;
 bool g_analogQueued[kMaxAnalogChannels] = {};
 uint16_t g_analogValue[kMaxAnalogChannels] = {};
 int32_t g_scrollWheelValue = 0;
+
+// ---- how much of the stick lag is the firmware's own filter -----------------
+//
+// The firmware smooths the main inputs with a 16-sample moving average (see
+// radio/src/hal/adc_driver.cpp: changes below 10 * ANALOG_MULTIPLIER are averaged, larger
+// ones pass straight through), so what the mixer sees can trail what the app pushed.
+// Once a second, and only while a stick is being moved, both are logged side by side:
+// the two differing is that filter catching up, and it is lag no app-side work can take
+// out (the same filter runs on a real radio).
+constexpr uint8_t kStickAxes = 4;
+
+std::chrono::steady_clock::time_point g_stickLogAt;
+bool g_stickMoved = false;
+uint16_t g_stickPushed[kStickAxes] = {};
+
+void log_sticks_if_moved() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - g_stickLogAt < std::chrono::seconds(1)) return;
+    if (!g_stickMoved) return;
+
+    g_stickLogAt = now;
+    g_stickMoved = false;
+
+    std::string pushed;
+    std::string firmware;
+    for (uint8_t axis = 0; axis < kStickAxes; axis++) {
+        if (axis) {
+            pushed += '/';
+            firmware += '/';
+        }
+        pushed += std::to_string(g_stickPushed[axis]);
+        // anaIn() is 0..2048, half of what the app pushes: doubled to compare.
+        firmware += std::to_string(anaIn(kStickChannels[axis]) * 2);
+    }
+    LOGI("joystick: sticks LH/LV/RH/RV pushed %s, firmware reads %s", pushed.c_str(),
+         firmware.c_str());
+}
 
 // ---- dials -> P1/P2 ---------------------------------------------------------
 //
@@ -1332,8 +1382,16 @@ void tick() {
         }
         if (queued) {
             push_analog(static_cast<uint8_t>(channel), value);
+            for (uint8_t axis = 0; axis < kStickAxes; axis++) {
+                if (kStickChannels[axis] == channel) {
+                    g_stickPushed[axis] = value;
+                    g_stickMoved = true;
+                }
+            }
         }
     }
+
+    log_sticks_if_moved();
 
     for (int index = 0; index < kSwitchCount; index++) {
         bool queued;
@@ -1489,6 +1547,18 @@ Java_com_edgetx_droidui_DjiMsdkBridge_nativeSetInputsReady(JNIEnv* env, jclass c
     (void)clazz;
     LOGI("joystick: RC controls reporting, the firmware may boot");
     setInputsReady(true);
+}
+
+// Called from RcRawJoystick.java for the buttons that only exist in the joystick's raw
+// reports - the return button (see handleKeyCode above). It goes through the same handler
+// as Android's key events, so the key map file and EdgeTX's own long-press timing apply
+// exactly as they do to a key the framework delivered.
+extern "C" JNIEXPORT void JNICALL
+Java_com_edgetx_droidui_RcRawJoystick_nativeOnRawKey(JNIEnv* env, jclass clazz, jint keycode,
+                                                     jboolean down) {
+    (void)env;
+    (void)clazz;
+    handleKeyCode(keycode, down != JNI_FALSE);
 }
 
 // Called from DjiMsdkBridge.java (DJI Mobile SDK) for RC buttons that Android's

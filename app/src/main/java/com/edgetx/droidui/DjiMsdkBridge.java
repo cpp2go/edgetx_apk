@@ -574,13 +574,8 @@ public final class DjiMsdkBridge {
                             if (newValue == null) {
                                 return;
                             }
-                            markStickSeen(axis);
                             announce("sticks");
-                            try {
-                                nativeOnDjiStick(axis, newValue);
-                            } catch (Throwable t) {
-                                Log.w(TAG, "dji: stick dispatch failed", t);
-                            }
+                            dispatchStick(axis, newValue);
                         }
                     });
         } catch (Throwable t) {
@@ -893,16 +888,41 @@ public final class DjiMsdkBridge {
 
     // --------------------------------------------------------------- polling --
     //
-    // The SDK hands out these values on change, and on this RC that push arrives at
-    // roughly 6-9 Hz per axis: measured on the device, 20-36 samples a second over
-    // the four axes, with gaps up to 370 ms between two of them. That is 100-200 ms
-    // of lag before the mixer sees a stick move, which is what makes the sticks feel
-    // remote-controlled rather than direct.
+    // The SDK hands the stick positions out on change, and what was measured on this RC
+    // is the whole story of how direct the sticks can feel:
     //
-    // KeyManager.getValue() reads the cache the SDK fills as the data arrives, so it
-    // is polled here instead. The listeners above stay as a fallback - a poll that
-    // returns the same value again pushes nothing.
-    private static final int POLL_INTERVAL_MS = 5;
+    //   raw kernel stick stream   70 Hz (14 ms) - but /dev/input/event4 is root:input, no
+    //                             hidraw exists, and the framework has no joystick mapper
+    //                             for the device, so no app ever sees those events
+    //   one stick axis via the SDK   8-14 new values a second, gaps mostly 130-280 ms
+    //   app -> firmware -> mixer -> RF   ~10 ms (CRSF frames at 400 kbaud, 200 a second)
+    //
+    // The SDK is what is left, and polling it harder makes it *worse*: with this loop at
+    // 5 ms (190 passes, ~1150 getValue() calls a second) the axes changed only 4-10 times
+    // a second, with gaps up to 600 ms; at 200 ms they change 8-14 times a second, with
+    // gaps mostly under 300 ms. KeyManager.getValue() reads the cache the pushes come from
+    // anyway, so all that traffic bought no freshness and cost the RC's own service the
+    // time it needed. The listeners above are the primary source; this loop is only the
+    // safety net for a push that never arrives.
+    private static final int POLL_INTERVAL_MS = 200;
+
+    /**
+     * How often the SDK really hands over a new stick position, and how long it goes quiet
+     * in between.
+     *
+     * <p>The value only changes while the stick moves, so this line says exactly what the
+     * sticks cost in latency - and it counts every value from both sources, so it stays
+     * honest whatever the poll interval is. Logged once a second, and only while a stick
+     * is being moved: an idle radio stays quiet.
+     */
+    private static final long STICK_RATE_LOG_MS = 1000;
+    private static final int STICK_AXES = 4;
+
+    private static final long[] sStickChanges = new long[STICK_AXES];
+    private static final long[] sStickLastChangeMs = new long[STICK_AXES];
+    private static final long[] sStickMaxGapMs = new long[STICK_AXES];
+    private static long sPolls;
+    private static long sRateWindowStartMs;
 
     private static void startPolling() {
         final Thread thread = new Thread(DjiMsdkBridge::pollLoop, "dji-poll");
@@ -926,7 +946,13 @@ public final class DjiMsdkBridge {
         final int[] last = new int[keys.length];
         final boolean[] seen = new boolean[keys.length];
 
+        sRateWindowStartMs = System.currentTimeMillis();
+
         while (true) {
+            sPolls++;
+
+            // The four sticks, then the two dials: both are absolute values that the app
+            // turns into analog inputs (the sticks are the axes, the dials are P1/P2).
             for (int i = 0; i < keys.length; i++) {
                 final Integer value;
                 try {
@@ -943,17 +969,14 @@ public final class DjiMsdkBridge {
                 }
                 seen[i] = true;
                 last[i] = raw;
-                try {
-                    if (i < 4) {
-                        markStickSeen(i);
-                        nativeOnDjiStick(i, raw);
-                    } else {
-                        nativeOnDjiDial(i - 4, raw);
-                    }
-                } catch (Throwable ignored) {
-                    // A missing native side must not kill the poller.
+                if (i < STICK_AXES) {
+                    dispatchStick(i, raw);
+                } else {
+                    dispatchDial(i - STICK_AXES, raw);
                 }
             }
+
+            logStickRate();
 
             try {
                 Thread.sleep(POLL_INTERVAL_MS);
@@ -962,6 +985,100 @@ public final class DjiMsdkBridge {
                 return;
             }
         }
+    }
+
+    /**
+     * One new stick position, from either source: the listener that fires when the SDK
+     * publishes it, or the safety-net poll. Every stick value the app ever sees goes
+     * through here, which is what makes the rate line count all of them.
+     *
+     * <p>While the raw USB reader is feeding the axes (see {@link RcRawJoystick}) this
+     * copy is not pushed: it reports the same numbers but up to 90 ms older, so putting it
+     * on top of a fresh one would only add jitter. It is still counted here, which is what
+     * keeps the rate line honest about what the SDK alone is doing.
+     */
+    private static void dispatchStick(int axis, int raw) {
+        noteStickChange(axis);
+        markStickSeen(axis);
+        RcRawJoystick.noteSdkStick(axis, raw);
+        if (RcRawJoystick.sticksOwned()) {
+            return;
+        }
+        try {
+            nativeOnDjiStick(axis, raw);
+        } catch (Throwable t) {
+            Log.w(TAG, "dji: stick dispatch failed", t);
+        }
+    }
+
+    /**
+     * One dial value, from either source. The dials are reported the same way the sticks
+     * are, so the raw USB reader takes them over on the same terms. The scroll wheel is
+     * NOT part of this: it is not in the joystick's reports at all.
+     */
+    private static void dispatchDial(int dial, int value) {
+        RcRawJoystick.noteSdkDial(dial, value);
+        if (RcRawJoystick.sticksOwned()) {
+            return;
+        }
+        try {
+            nativeOnDjiDial(dial, value);
+        } catch (Throwable t) {
+            Log.w(TAG, "dji: dial dispatch failed", t);
+        }
+    }
+
+    /** Records one new stick value, for the rate line below. */
+    private static void noteStickChange(int axis) {
+        final long now = System.currentTimeMillis();
+        sStickChanges[axis]++;
+        if (sStickLastChangeMs[axis] != 0) {
+            final long gap = now - sStickLastChangeMs[axis];
+            // A gap longer than a window is the stick having been at rest, not a slow
+            // report, so only gaps inside one burst are counted.
+            if (gap <= STICK_RATE_LOG_MS && gap > sStickMaxGapMs[axis]) {
+                sStickMaxGapMs[axis] = gap;
+            }
+        }
+        sStickLastChangeMs[axis] = now;
+    }
+
+    /**
+     * One line a second while the sticks are being moved: how often the SDK produced a
+     * new value per axis, the longest gap inside a burst, and the achieved poll rate.
+     * Nothing has moved means nothing is printed, so an idle radio stays quiet.
+     */
+    private static void logStickRate() {
+        final long now = System.currentTimeMillis();
+        final long window = now - sRateWindowStartMs;
+        if (window < STICK_RATE_LOG_MS) {
+            return;
+        }
+        sRateWindowStartMs = now;
+
+        final StringBuilder text = new StringBuilder();
+        for (int axis = 0; axis < STICK_AXES; axis++) {
+            if (sStickChanges[axis] > 0) {
+                if (text.length() > 0) {
+                    text.append(", ");
+                }
+                text.append("axis ").append(axis).append(' ')
+                        .append(sStickChanges[axis] * 1000 / window).append("/s")
+                        .append(" (max gap ").append(sStickMaxGapMs[axis]).append(" ms)");
+            }
+            sStickChanges[axis] = 0;
+            sStickMaxGapMs[axis] = 0;
+        }
+
+        if (text.length() > 0) {
+            Log.i(TAG, "dji: stick rate " + text + " | "
+                    + (sPolls * 1000 / window) + " polls/s");
+            // Side by side with what the raw USB reader has for the same axes: the two are
+            // the same numbers from the same hardware, so this is what catches a sign
+            // that does not match (see RcRawJoystick.AXIS_SIGN).
+            RcRawJoystick.logComparison();
+        }
+        sPolls = 0;
     }
 
     /**
@@ -986,11 +1103,7 @@ public final class DjiMsdkBridge {
                                 return;
                             }
                             announce("dial " + dial);
-                            try {
-                                nativeOnDjiDial(dial, newValue);
-                            } catch (Throwable t) {
-                                Log.w(TAG, "dji: dial dispatch failed", t);
-                            }
+                            dispatchDial(dial, newValue);
                         }
                     });
         } catch (Throwable t) {
