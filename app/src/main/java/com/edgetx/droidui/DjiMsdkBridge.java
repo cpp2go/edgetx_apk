@@ -471,7 +471,9 @@ public final class DjiMsdkBridge {
 
     /**
      * The go-home button is not a switch of its own: pressing it one, two or three
-     * times tells the 5-way what to trim, so only the presses are forwarded.
+     * times tells the 5-way what to trim, so only the presses are forwarded. Holding it,
+     * on the other hand, is the remote's stand-in for a long press of the return button -
+     * see {@link #HOLD_FOR_EXIT_MS}.
      */
     private static void listenGoHome() {
         try {
@@ -479,12 +481,37 @@ public final class DjiMsdkBridge {
                     KeyTools.createKey(DJIRemoteControllerKey.KeyGoHomeButtonDown);
             KeyManager.getInstance().listen(key, OWNER,
                     new CommonCallbacks.KeyListener<Boolean>() {
+                        private long pressedAt;
+
                         @Override
                         public void onValueChange(Boolean oldValue, Boolean newValue) {
                             if (newValue != null && newValue &&
                                 (oldValue == null || !oldValue)) {
+                                pressedAt = System.currentTimeMillis();
                                 Log.i(TAG, "dji: go-home pressed");
                                 nativeOnDjiGoHome();
+                                return;
+                            }
+
+                            if (oldValue == null || !Boolean.TRUE.equals(oldValue) ||
+                                pressedAt == 0) {
+                                return;
+                            }
+
+                            // This button does report its release, and with the real
+                            // duration: measured on the remote, a tap is 99-110 ms and a
+                            // hold 1160-2053 ms. That makes it the one input a long press
+                            // can be built from, because the return button itself arrives as
+                            // an 8 ms tap however long it is held.
+                            final long held = System.currentTimeMillis() - pressedAt;
+                            pressedAt = 0;
+                            Log.i(TAG, "dji: go-home released after " + held + " ms");
+                            if (held >= HOLD_FOR_EXIT_MS) {
+                                try {
+                                    nativeOnDjiGoHomeHeld();
+                                } catch (Throwable t) {
+                                    Log.w(TAG, "dji: could not send the long press", t);
+                                }
                             }
                         }
                     });
@@ -492,6 +519,16 @@ public final class DjiMsdkBridge {
             Log.w(TAG, "dji: go-home listen failed", t);
         }
     }
+
+    /**
+     * How long the H button has to be held to count as a long press of the return key.
+     * Above the 99-110 ms a tap takes and below the 1.1 s a deliberate hold takes, so the
+     * two cannot be confused; EdgeTX itself calls anything over ~320 ms a long press.
+     */
+    private static final long HOLD_FOR_EXIT_MS = 600;
+
+    /** The H button was held: joystick.cpp turns that into a long press of the return key. */
+    static native void nativeOnDjiGoHomeHeld();
 
     static final int STICK_LEFT_H = 0;
     static final int STICK_LEFT_V = 1;

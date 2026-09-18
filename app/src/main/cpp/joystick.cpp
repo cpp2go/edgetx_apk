@@ -842,6 +842,101 @@ void log_switch_key_once(int32_t keycode, uint8_t index, int8_t state) {
          key_name(keycode), switch_name(index), (int)state);
 }
 
+// How long each mapped button was held, plus the repeats Android sends while one is held.
+//
+// All this side has to do for a long press is keep the key down for as long as the button
+// is: EdgeTX turns a hold of about 320 ms into one of its own (radio/src/keys.cpp,
+// KEY_LONG_DELAY = 32 x 10 ms), which is what the menu's "long RTN" and a Lua script's
+// "force exit" hang off (gui/colorlcd/libui/window.cpp:625, lua/interface.cpp:1228). So
+// the two lines below are what tells the two possible failures apart: a hold that never
+// arrives from Android (the remote's own service may hand the button over as a plain tap -
+// then the duration here stays short no matter how long it is pressed) versus one that
+// arrives and is acted on.
+constexpr auto kLongPressMs = std::chrono::milliseconds(320);  // EdgeTX's KEY_LONG_DELAY
+constexpr uint8_t kMaxReportedKeys = 16;
+std::chrono::steady_clock::time_point g_keyDownAt[kMaxReportedKeys];
+bool g_keyIsDown[kMaxReportedKeys] = {};
+
+void report_key_hold(uint8_t key, bool down) {
+    if (key == 0 || key >= kMaxReportedKeys) return;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (down) {
+        g_keyDownAt[key] = now;
+        g_keyIsDown[key] = true;
+        LOGI("joystick: %s down", etkey_name(key));
+        return;
+    }
+    if (!g_keyIsDown[key]) return;
+    g_keyIsDown[key] = false;
+
+    const auto held =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - g_keyDownAt[key]);
+    LOGI("joystick: %s up after %d ms%s", etkey_name(key), static_cast<int>(held.count()),
+         held >= kLongPressMs ? " (EdgeTX sees a long press)" : "");
+}
+
+// Android repeats a DOWN while a key is held. The repeats are dropped - EdgeTX does its own
+// repeating and its own long-press timing - but the first one is worth a line: it is the
+// evidence that the button is being held as far as Android is concerned.
+void log_key_repeat(int32_t keycode) {
+    static int32_t logged = 0;
+    if (logged == keycode) return;
+    logged = keycode;
+    LOGI("joystick: %d (%s) is being held (android repeat)", keycode, key_name(keycode));
+}
+
+// The remote's return button, and the long press it cannot produce.
+//
+// A hold never reaches the app: the RC's own input stack hands KEY_BACK over as a tap,
+// whichever way it is pressed. Measured by writing a 900 ms press straight to the input
+// device - it arrives as an 8 ms tap that lands when the button is released - while the
+// same hold on the gpio-keys device arrives intact (that one carries the shoulder keys).
+// EdgeTX's long press is what closes a page group (gui/colorlcd/libui/window.cpp:625) and
+// what stops a running Lua script (lua/interface.cpp:1228), and the remote has no button that
+// can deliver one - so two gestures stand in for it: the second click of a double click
+// (below), and holding the H button, which the DJI SDK does report with its real duration
+// (see nativeOnDjiGoHomeHeld). One click is passed through untouched, and two slow clicks are
+// still two short presses; a *quick* pair does not always reach us, because the remote takes
+// a rapid double press of its own return button for itself - which is why the H button is
+// the one to use in practice.
+constexpr auto kDoubleClickWindow = std::chrono::milliseconds(400);
+constexpr uint32_t kLongPressHoldMs = 450;   // EdgeTX's own threshold is ~320 ms
+
+bool g_exitDownSwallowed = false;   // the press of the second click, not yet released
+bool g_exitTapSeen = false;         // the previous click ended within the window
+std::chrono::steady_clock::time_point g_exitTapAt;
+
+// Returns true when the click was dealt with here, which for the return key is always.
+bool handle_exit_click(bool down) {
+    const auto now = std::chrono::steady_clock::now();
+
+    if (down) {
+        if (g_exitTapSeen && now - g_exitTapAt <= kDoubleClickWindow) {
+            g_exitTapSeen = false;
+            g_exitDownSwallowed = true;
+            LOGI("joystick: RTN double click -> long press");
+            requestKey(kKeyExit, kLongPressHoldMs);
+            return true;
+        }
+        g_exitDownSwallowed = false;
+        report_key_hold(kKeyExit, true);
+        set_key(kKeyExit, true);
+        return true;
+    }
+
+    if (g_exitDownSwallowed) {
+        g_exitDownSwallowed = false;
+        return true;   // the press this release belongs to never reached the firmware
+    }
+
+    report_key_hold(kKeyExit, false);
+    set_key(kKeyExit, false);
+    g_exitTapSeen = true;
+    g_exitTapAt = now;
+    return true;
+}
+
 bool handleKeyEvent(AInputEvent* event) {
     const int32_t source = AInputEvent_getSource(event);
 
@@ -852,11 +947,15 @@ bool handleKeyEvent(AInputEvent* event) {
 
     const int32_t action = AKeyEvent_getAction(event);
     if (action != AKEY_EVENT_ACTION_DOWN && action != AKEY_EVENT_ACTION_UP) return false;
-    // Android repeats DOWN while a button is held; EdgeTX does its own repeat
-    // and long-press handling, so pass only the initial press and the release.
-    if (action == AKEY_EVENT_ACTION_DOWN && AKeyEvent_getRepeatCount(event) > 0) return true;
-
     const int32_t keycode = AKeyEvent_getKeyCode(event);
+    // Android repeats DOWN while a button is held; EdgeTX does its own repeat and
+    // long-press handling, so only the initial press and the release reach the firmware.
+    // The repeat is reported once anyway, see log_key_repeat().
+    if (action == AKEY_EVENT_ACTION_DOWN && AKeyEvent_getRepeatCount(event) > 0) {
+        log_key_repeat(keycode);
+        return true;
+    }
+
     const bool down = (action == AKEY_EVENT_ACTION_DOWN);
 
     if (keycode == AKEYCODE_BUTTON_THUMBL && down) {
@@ -867,6 +966,8 @@ bool handleKeyEvent(AInputEvent* event) {
     uint8_t key = 0;
     if (lookup_key(keycode, &key)) {
         log_mapped_key_once(keycode, key);
+        if (key == kKeyExit) return handle_exit_click(down);
+        report_key_hold(key, down);
         set_key(key, down);
         return true;
     }
@@ -899,18 +1000,21 @@ bool handleKeyEvent(AInputEvent* event) {
 //    transition in tick() keeps the two apart, and tick() runs on the link thread
 //    - see native_main.cpp, which keeps it running with no UI on screen.
 // ---------------------------------------------------------------------------
+constexpr auto kSynthHold = std::chrono::milliseconds(60);
+
 std::mutex g_synthMutex;
 bool g_synthQueued = false;
 uint8_t g_synthQueuedKey = 0;
+std::chrono::milliseconds g_synthQueuedHold = kSynthHold;
 bool g_synthHeld = false;
 uint8_t g_synthHeldKey = 0;
 std::chrono::steady_clock::time_point g_synthReleaseAt{};
-constexpr auto kSynthHold = std::chrono::milliseconds(60);
 
-void requestKey(uint8_t key) {
+void requestKey(uint8_t key, uint32_t holdMs) {
     std::lock_guard<std::mutex> lock(g_synthMutex);
     g_synthQueued = true;
     g_synthQueuedKey = key;
+    g_synthQueuedHold = std::chrono::milliseconds(holdMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -1191,6 +1295,7 @@ void tick() {
     uint8_t releasedKey = 0;
     bool press = false;
     uint8_t pressedKey = 0;
+    std::chrono::milliseconds hold = kSynthHold;
     {
         std::lock_guard<std::mutex> lock(g_synthMutex);
         const auto now = std::chrono::steady_clock::now();
@@ -1202,6 +1307,7 @@ void tick() {
         if (!g_synthHeld && g_synthQueued) {
             press = true;
             pressedKey = g_synthQueuedKey;
+            hold = g_synthQueuedHold;
             g_synthQueued = false;
         }
     }
@@ -1212,7 +1318,7 @@ void tick() {
         std::lock_guard<std::mutex> lock(g_synthMutex);
         g_synthHeld = true;
         g_synthHeldKey = pressedKey;
-        g_synthReleaseAt = std::chrono::steady_clock::now() + kSynthHold;
+        g_synthReleaseAt = std::chrono::steady_clock::now() + hold;
     }
 
     for (int channel = 0; channel < kMaxAnalogChannels; channel++) {
@@ -1451,6 +1557,22 @@ Java_com_edgetx_droidui_DjiMsdkBridge_nativeOnDjiGoHome(JNIEnv* env, jclass claz
     (void)env;
     (void)clazz;
     requestTrimModePress();
+}
+
+// Called from DjiMsdkBridge.java when the RC's H (go-home) button was *held*, not tapped.
+//
+// H is the stand-in for a long press of the return button, which no source can deliver: the
+// return button arrives as an 8 ms tap however long it is pressed (measured by writing a
+// 900 ms press to its input device; see the note on handle_exit_click), while the SDK reports
+// H's press and release with the real duration - 99-110 ms for a tap and 1160-2053 ms for a
+// hold, measured on the device. EdgeTX's long press is what closes a page group and what
+// stops a running Lua script (lua/interface.cpp:1228).
+extern "C" JNIEXPORT void JNICALL
+Java_com_edgetx_droidui_DjiMsdkBridge_nativeOnDjiGoHomeHeld(JNIEnv* env, jclass clazz) {
+    (void)env;
+    (void)clazz;
+    LOGI("joystick: H held -> long press RTN");
+    requestKey(kKeyExit, kLongPressHoldMs);
 }
 
 extern "C" JNIEXPORT void JNICALL

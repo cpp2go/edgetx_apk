@@ -38,11 +38,13 @@ bool handleKeyEvent(AInputEvent* event);
 // Queue a synthetic key press (used by the DJI SDK bridge, which cannot press a
 // key by itself - see joystick.cpp).
 //
-// tick() is what applies the queues to the firmware, and it has to keep being
-// called: the link thread (native_main.cpp) drives it, which is what makes the
-// queued input keep flowing after the UI is gone. The firmware samples key state
-// periodically, so a press cannot be a bare setKey(true)/setKey(false) pair.
-void requestKey(uint8_t key);
+// `holdMs` is how long the key stays down. The firmware samples key state from its
+// own thread, so a press that does not survive a few of its polls is never seen at
+// all - and anything shorter than about 320 ms is a *short* press to EdgeTX
+// (radio/src/keys.cpp, KEY_LONG_DELAY). The return key's double click passes a hold
+// long enough to count as a long press, because the remote's own input stack hands
+// that button over as a tap and a real hold never reaches us.
+void requestKey(uint8_t key, uint32_t holdMs = 60);
 void tick();
 
 // Queue a stick position from the DJI SDK (axis 0..3, see nativeOnDjiStick).
