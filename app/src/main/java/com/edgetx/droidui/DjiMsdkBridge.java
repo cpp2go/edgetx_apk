@@ -333,8 +333,8 @@ public final class DjiMsdkBridge {
     // F4..F6 (see kSwitchKeys in joystick.cpp) and KeyRcButtonEventPro never fires on this
     // remote, so they have no SDK route and stop with the window.
     //
-    // Measured on the RC: all of them fire. The shutter is the odd one - one contact
-    // only, so it also drives a switch of its own, see listenShutter().
+    // Measured on the RC: all of them fire. The shutter is the odd one - it reports a press
+    // but not its half press, so it drives a switch of its own, see listenShutter().
 
     static final int SWITCH_C = 2;   // video button
     static final int SWITCH_D = 3;   // pause button
@@ -345,24 +345,38 @@ public final class DjiMsdkBridge {
     static final int SWITCH_I = 8;   // R3 button
 
     /**
-     * The shutter button as a three-position switch (SE).
+     * The shutter button as a switch (SE).
      *
-     * The button has a single contact - on the RC it is BTN_TR on the joystick device,
-     * and the SDK reports it as one Boolean - so the two positions a camera shutter
-     * normally has, half press and full press, are not in the data at all. What is left
-     * is how long it was held, and that is what picks the outer state:
+     * The button's two stages cannot be told apart, because only one of them is reported at
+     * all: the remote's half press (the focus detent) is in none of the data - MSDK has no
+     * key for it, and the remote's input device carries no camera/focus key code either -
+     * while a press all the way down shows up as a single Boolean:
      *
-     *     at boot               -> middle
-     *     pressed &lt; 300 ms   -> up
-     *     pressed &gt;= 300 ms  -> down
+     *     KeyShutterButtonDown   false -> true
      *
-     * The switch latches, so a channel fed from it holds the level until the next press.
+     * (Measured on the RC: two half presses held for 2 s each produced no callback at all,
+     * two full presses produced exactly one each. KeyRCShutterButtonLongPress, the other
+     * shutter key MSDK offers, has never fired once here, so there is no hold time to go on
+     * either.)
+     *
+     * What is left is a single "the shutter was pressed" event, so every press steps SE to
+     * the other end: low <-> high. That way each press shows up as a change wherever SE was
+     * standing, which pressing to the end it already sits at would not. The middle position
+     * is where it sits until the first press.
      *
      * SE and not one of the free slots: this board declares SI and SJ as 2-position
      * switches, and configuring one of those as 3POS makes the firmware reject the whole
      * settings file.
      */
-    private static final long SHUTTER_SHORT_PRESS_MS = 300;
+    private static final int SHUTTER_LOW = 1;    // the down end
+    private static final int SHUTTER_HIGH = -1;  // the up end
+
+    private static void setShutterPosition(int position) {
+        sShutterPosition = position;
+        persistSwitch(PREF_PHOTO, position);
+        Log.i(TAG, "dji: shutter -> switch E " + (position > 0 ? "low" : "high"));
+        nativeOnDjiSwitch(SWITCH_E, position);
+    }
 
     private static void listenShutter() {
         try {
@@ -370,32 +384,19 @@ public final class DjiMsdkBridge {
                     KeyTools.createKey(DJIRemoteControllerKey.KeyShutterButtonDown);
             KeyManager.getInstance().listen(key, OWNER,
                     new CommonCallbacks.KeyListener<Boolean>() {
-                        private long pressedAt;
-
                         @Override
                         public void onValueChange(Boolean oldValue, Boolean newValue) {
-                            if (newValue != null && newValue) {
-                                pressedAt = System.currentTimeMillis();
-                                return;
+                            Log.i(TAG, "dji: shutter " + oldValue + " -> " + newValue);
+                            if (!Boolean.TRUE.equals(newValue)) {
+                                return;   // the initial snapshot, or the release half
                             }
-
-                            if (oldValue == null || pressedAt == 0) {
-                                return;   // the initial snapshot, not a release
-                            }
-
-                            final long held = System.currentTimeMillis() - pressedAt;
-                            pressedAt = 0;
-                            final int position = held >= SHUTTER_SHORT_PRESS_MS ? 1 : -1;
-                            sShutterPosition = position;
-                            persistSwitch(PREF_PHOTO, position);
-                            Log.i(TAG, "dji: photo held " + held + " ms -> switch E "
-                                    + (position > 0 ? "down" : "up"));
-                            nativeOnDjiSwitch(SWITCH_E, position);
+                            setShutterPosition(sShutterPosition > 0
+                                    ? SHUTTER_HIGH : SHUTTER_LOW);
                         }
                     });
 
-            // SE latches, so a restart brings back the position of the last press; the
-            // middle position is where it sits until the first one.
+            // SE latches, so a restart brings back the position of the last press; the middle
+            // position is where it sits until the first one.
             nativeOnDjiSwitch(SWITCH_E, sShutterPosition);
         } catch (Throwable t) {
             Log.w(TAG, "dji: shutter listen failed", t);
