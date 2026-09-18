@@ -54,6 +54,10 @@ final class RcModuleSerial {
     /** Baud used between "device attached" and the firmware telling us the real one. */
     private static final int DEFAULT_BAUD = 115200;
 
+    /** ETX_Encoding_8N1 / ETX_Encoding_8E2 - the two framings EdgeTX asks a module for. */
+    private static final int ENCODING_8N1 = 0;
+    private static final int ENCODING_8E2 = 1;
+
     private static final int WRITE_TIMEOUT_MS = 200;
     private static final int STATUS_LOG_INTERVAL_MS = 5000;
 
@@ -70,6 +74,9 @@ final class RcModuleSerial {
 
     /** Baud the firmware configured for the module port, 0 while it is closed. */
     static native int nativeWantedBaudrate();
+
+    /** Framing the firmware configured (ETX_Encoding_xx), 0 while the port is closed. */
+    static native int nativeWantedEncoding();
 
     /** True between the firmware opening and closing the module port. */
     static native boolean nativePortOpen();
@@ -95,6 +102,7 @@ final class RcModuleSerial {
     private static UsbDeviceConnection sConnection;
     private static SerialInputOutputManager sIoManager;
     private static volatile int sAppliedBaud = -1;
+    private static volatile int sAppliedEncoding = -1;
 
     private static long sLastOpenAttemptMs;
     private static boolean sLastFirmwarePortOpen;
@@ -278,6 +286,7 @@ final class RcModuleSerial {
         sPort = port;
         sConnection = connection;
         sAppliedBaud = DEFAULT_BAUD;
+        sAppliedEncoding = ENCODING_8N1;
         Log.i(TAG, "module: " + describe(device) + " open at " + DEFAULT_BAUD + " 8N1");
 
         sIoManager = new SerialInputOutputManager(port, sListener);
@@ -365,13 +374,14 @@ final class RcModuleSerial {
             sConnection = null;
         }
         sAppliedBaud = -1;
+        sAppliedEncoding = -1;
     }
 
     // -------------------------------------------------------------- monitor --
 
     /**
      * Keeps the port in step with the firmware: opens a device that appeared later, and
-     * applies whatever baud rate EdgeTX configured for the module.
+     * applies whatever baud rate and framing EdgeTX configured for the module.
      */
     private static void monitor() {
         try {
@@ -385,8 +395,9 @@ final class RcModuleSerial {
             }
 
             final int wanted = nativeWantedBaudrate();
-            if (wanted > 0 && wanted != sAppliedBaud) {
-                applyBaud(wanted);
+            final int encoding = nativeWantedEncoding();
+            if (wanted > 0 && (wanted != sAppliedBaud || encoding != sAppliedEncoding)) {
+                applyPortParams(wanted, encoding);
             }
 
             final boolean firmwareOpen = nativePortOpen();
@@ -408,19 +419,34 @@ final class RcModuleSerial {
         }
     }
 
-    private static void applyBaud(int baudrate) {
+    /**
+     * Applies what EdgeTX configured for the module. Only the framing the firmware asks
+     * for can be set - 8N1 for everything but SBUS, 8E2 for SBUS. The polarity cannot:
+     * a USB serial adapter puts out the signal it puts out, so a protocol EdgeTX drives
+     * inverted (MULTI, DSM2/DSMP, SBUS, AFHDS3) works only if the module takes the line
+     * as it comes; otherwise it needs an inverter on the wire.
+     */
+    private static void applyPortParams(int baudrate, int encoding) {
         final UsbSerialPort port = sPort;
         if (port == null) {
             return;
         }
+
+        final boolean eightE2 = encoding == ENCODING_8E2;
+        final String framing = eightE2 ? "8E2" : "8N1";
+        final int stopBits = eightE2 ? UsbSerialPort.STOPBITS_2 : UsbSerialPort.STOPBITS_1;
+        final int parity = eightE2 ? UsbSerialPort.PARITY_EVEN : UsbSerialPort.PARITY_NONE;
+
         try {
-            port.setParameters(baudrate, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE);
+            port.setParameters(baudrate, 8, stopBits, parity);
             sAppliedBaud = baudrate;
-            Log.i(TAG, "module: port set to " + baudrate + " 8N1");
+            sAppliedEncoding = encoding;
+            Log.i(TAG, "module: port set to " + baudrate + " " + framing);
         } catch (Throwable t) {
             // Record it anyway: retrying the same failing value every 500 ms helps nobody.
             sAppliedBaud = baudrate;
-            Log.w(TAG, "module: could not set " + baudrate + " baud", t);
+            sAppliedEncoding = encoding;
+            Log.w(TAG, "module: could not set " + baudrate + " " + framing, t);
         }
     }
 

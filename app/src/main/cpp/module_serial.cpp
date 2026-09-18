@@ -39,6 +39,7 @@ std::mutex s_txMutex;
 std::deque<uint8_t> s_txQueue;
 
 std::atomic<uint32_t> s_baudrate{0};
+std::atomic<uint8_t> s_encoding{0};
 std::atomic<bool> s_portOpen{false};
 std::atomic<uint32_t> s_txBytes{0};
 std::atomic<uint32_t> s_rxBytes{0};
@@ -48,6 +49,14 @@ std::atomic<uint32_t> s_droppedBytes{0};
 // alive without printing every frame.
 std::atomic<bool> s_loggedFirstTx{false};
 std::atomic<bool> s_loggedFirstRx{false};
+
+// ETX_Encoding_xx from the firmware's hal/serial_driver.h. Only two of the three
+// are byte-serial framings - PXX1 PWM is a soft-serial pulse encoding that never
+// reaches this bridge, so anything that is not 8E2 is 8N1.
+static const char* encodingName(uint8_t encoding)
+{
+    return encoding == 1 ? "8E2" : "8N1";
+}
 
 void sinkStart(uint8_t portNr, uint32_t baudrate, uint8_t encoding)
 {
@@ -59,11 +68,13 @@ void sinkStart(uint8_t portNr, uint32_t baudrate, uint8_t encoding)
     }
 
     s_baudrate.store(baudrate, std::memory_order_relaxed);
+    s_encoding.store(encoding, std::memory_order_relaxed);
     s_portOpen.store(true, std::memory_order_relaxed);
     s_loggedFirstTx.store(false, std::memory_order_relaxed);
     s_loggedFirstRx.store(false, std::memory_order_relaxed);
 
-    LOGI("module port opened: %u baud, encoding %u", baudrate, encoding);
+    LOGI("module port opened: %u baud, encoding %u (%s)", baudrate, encoding,
+         encodingName(encoding));
 }
 
 void sinkStop(uint8_t portNr)
@@ -72,6 +83,7 @@ void sinkStop(uint8_t portNr)
 
     s_portOpen.store(false, std::memory_order_relaxed);
     s_baudrate.store(0, std::memory_order_relaxed);
+    s_encoding.store(0, std::memory_order_relaxed);
 
     {
         std::lock_guard<std::mutex> lock(s_txMutex);
@@ -145,6 +157,13 @@ uint32_t wantedBaudrate()
                : 0;
 }
 
+uint8_t wantedEncoding()
+{
+    return s_portOpen.load(std::memory_order_relaxed)
+               ? s_encoding.load(std::memory_order_relaxed)
+               : 0;
+}
+
 bool portOpen()
 {
     return s_portOpen.load(std::memory_order_relaxed);
@@ -164,6 +183,12 @@ extern "C" JNIEXPORT jint JNICALL
 Java_com_edgetx_droidui_RcModuleSerial_nativeWantedBaudrate(JNIEnv*, jclass)
 {
     return static_cast<jint>(module_serial::wantedBaudrate());
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_edgetx_droidui_RcModuleSerial_nativeWantedEncoding(JNIEnv*, jclass)
+{
+    return static_cast<jint>(module_serial::wantedEncoding());
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
