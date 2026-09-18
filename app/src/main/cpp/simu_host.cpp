@@ -4,9 +4,11 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
+#include "joystick.h"
 #include "log.h"
 
 namespace simu {
@@ -30,12 +32,20 @@ void firmwareMain(const char* sdPath, const char* settingsPath) {
     // First run: let the firmware create radio.yml / model defaults.
     simuCreateDefaults();
 
+    // The RC's latching switches are still where they were left, and EdgeTX reads
+    // their positions while booting, so they go back before simuStart(). This has to
+    // be after simuInit(): that is what resets every switch to "up" (see
+    // joystick.cpp: restoreSwitches()).
+    joystick::restoreSwitches();
+
     LOGI("firmware: simuStart (sd=%s settings=%s)", sdPath, settingsPath);
     // Show the boot splash (it is EdgeTX's own startup screen and was missing
     // because of the flags below) together with the normal startup checks - the
-    // throttle/stick/switch warnings are expected at boot. Only the first-boot
-    // calibration wizard stays off: it just needs to be seen once and the settings
-    // file this port ships already carries a valid calibration.
+    // throttle/stick/switch warnings stay on, but the boot is held back until the
+    // RC's own controls report (see link_start()), so they no longer fire on sticks
+    // and switches that have simply not arrived yet. Only the first-boot calibration
+    // wizard stays off: it just needs to be seen once and the settings file this port
+    // ships already carries a valid calibration.
     simuSetSplashStartup();
     simuStart(false);  // blocks until the firmware shuts down
     LOGI("firmware: simuStart returned");
@@ -118,7 +128,14 @@ void setAnalogSource(bool external) {
 }
 
 void setKey(uint8_t key, bool down) { simuSetKey(key, down); }
-void setSwitch(uint8_t index, int8_t state) { simuSetSwitch(index, state); }
+void setSwitch(uint8_t index, int8_t state) {
+    simuSetSwitch(index, state);
+
+    // Hand it to the library as well: the boot resets every switch to "up" (twice - see
+    // the switch driver's boardInitSwitches()), and that is where the values the app has
+    // already sent get put back from.
+    if (edgetxAndroidSetSwitch != nullptr) edgetxAndroidSetSwitch(index, state);
+}
 void setTrim(uint8_t trim, bool state) { simuSetTrim(trim, state); }
 void rotaryEncoderEvent(int32_t steps) { simuRotaryEncoderEvent(steps); }
 
@@ -218,6 +235,28 @@ void logFirmwareBattery() {
          static_cast<unsigned>(batMin / 10), static_cast<unsigned>(batMin % 10),
          static_cast<unsigned>(batMax / 10), static_cast<unsigned>(batMax % 10),
          usbChargerLed() ? 1 : 0, static_cast<unsigned>(hostSeen));
+}
+
+void logFirmwareSwitches() {
+    // Read back through the firmware's own switch driver (radio/src/hal/switch_driver.h):
+    // switchState(3 * index + position) answers true for the position a switch is in, with
+    // 0 = up, 1 = middle, 2 = down. Weak, so an older simulator library still loads.
+    if (switchState == nullptr) return;
+
+    std::string line;
+    for (uint8_t i = 0; i < 10; i++) {   // SA..SJ, the board's switch table
+        const char* position = switchState(i * 3 + 0) ? "up"
+                             : switchState(i * 3 + 1) ? "mid"
+                             : switchState(i * 3 + 2) ? "down"
+                                                      : "?";
+        if (!line.empty()) line += ' ';
+        line += 'S';
+        line += static_cast<char>('A' + i);
+        line += '=';
+        line += position;
+    }
+
+    LOGI("switches: firmware sees %s", line.c_str());
 }
 
 }  // namespace simu

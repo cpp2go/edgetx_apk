@@ -87,6 +87,12 @@ std::thread g_linkThread;
 std::atomic<bool> g_linkStop{false};
 std::atomic<bool> g_linkRunning{false};
 
+// True while the service's start (nativeStartLink) is inside link_start(). The
+// activity's fallback start below must not queue up behind it: link_start() waits for
+// the RC's controls there, and the activity thread has a window and a render loop to
+// look after in the meantime.
+std::atomic<bool> g_linkStarting{false};
+
 // True while a foreground service is holding the process open for the link. When
 // it is clear, the firmware stops with the activity, i.e. the pre-service
 // behaviour is kept for the case where the service could not be started.
@@ -412,10 +418,37 @@ void link_thread_main() {
                 // reading can be logged next to what the RC reports.
                 simu::logFirmwareBattery();
             }
+
+            // Every heartbeat. Whether a switch the app pushed is really where the app put
+            // it is the one thing that cannot be seen any other way without moving it, and
+            // the boot resets them all once (see the switch driver's boardInitSwitches()).
+            simu::logFirmwareSwitches();
         }
 
         sleep_ms(kPollIntervalMs);  // the link thread's cadence, see the constant
     }
+}
+
+// How long the firmware's start waits for the RC's own controls (see link_start).
+constexpr uint32_t kInputsTimeoutMs = 3000;
+
+// Bounded wait for joystick::inputsReady(); returns how long it actually waited, in
+// milliseconds.
+uint32_t wait_for_rc_controls() {
+    using clock = std::chrono::steady_clock;
+    const auto start = clock::now();
+
+    while (!joystick::inputsReady()) {
+        const uint32_t waited = static_cast<uint32_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - start)
+                .count());
+        if (waited >= kInputsTimeoutMs) return waited;
+        sleep_ms(10);
+    }
+
+    return static_cast<uint32_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - start)
+            .count());
 }
 
 // Starts the firmware and its module bridge. Idempotent, and callable from either
@@ -423,6 +456,29 @@ void link_thread_main() {
 bool link_start(AAssetManager* assets, const char* filesDir, const char* externalFilesDir) {
     std::lock_guard<std::mutex> lock(g_linkMutex);
     if (g_linkRunning.load()) return true;
+
+    // Where the positions of the latching switches are kept between runs (see
+    // joystick.cpp). Loaded before the wait below, so DjiMsdkBridge can already ask
+    // what they were by the time it starts listening.
+    joystick::setStateDir(filesDir);
+
+    // The firmware is what runs EdgeTX's boot checks, and those sample the throttle
+    // and the switches once - whatever they see then is what the user is told about. A
+    // stick the DJI SDK has not reported on yet reads as centred (simuGetAnalog()
+    // returns 2048 for a channel nobody has written, see the simulator's
+    // android_host.cpp), which is what made the throttle warning appear although the
+    // stick was at the bottom. So the boot waits for the RC's controls first.
+    //
+    // Bounded, because nothing may ever arrive: no SDK in the build, a failed
+    // registration, or a remote that is not an RC Plus 2. Booting late beats not
+    // booting at all. Measured: the sticks report about 1.8 s after launch.
+    if (!joystick::inputsReady()) {
+        const uint32_t waited = wait_for_rc_controls();
+        if (joystick::inputsReady())
+            LOGI("link: RC controls ready after %u ms", waited);
+        else
+            LOGW("link: RC controls silent after %u ms, booting anyway", waited);
+    }
 
     // Where the firmware sees its SD card, and where the user can edit it. The
     // external directory is preferred - see prepare_sd_root().
@@ -655,7 +711,9 @@ extern "C" void android_main(struct android_app* app) {
         // Normally RcLinkService started the firmware already (it is started from
         // Application.onCreate). This is the fallback for when the service could not
         // be started at all: a UI without a service is better than a black screen.
-        if (!link_running() && app->activity != nullptr) {
+        // While the service's start is still inside link_start() - waiting for the
+        // RC's controls - this must not queue up behind it.
+        if (!link_running() && !g_linkStarting.load() && app->activity != nullptr) {
             link_start(app->activity->assetManager, app->activity->internalDataPath,
                        app->activity->externalDataPath);
         }
@@ -746,7 +804,9 @@ Java_com_edgetx_droidui_RcLinkService_nativeStartLink(JNIEnv* env, jclass, jstri
     AAssetManager* manager = assets != nullptr ? AAssetManager_fromJava(env, assets) : nullptr;
 
     g_keepAlive.store(true);
+    g_linkStarting.store(true);
     const bool ok = link_start(manager, dir, external);
+    g_linkStarting.store(false);
 
     if (dir != nullptr) {
         env->ReleaseStringUTFChars(filesDir, dir);

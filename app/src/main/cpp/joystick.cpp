@@ -4,6 +4,7 @@
 #include <jni.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -33,7 +34,13 @@ namespace {
 // (gui/navigation/common.cpp), which TX16SMK3 does not use. Its colour LCD GUI
 // reacts to seven keys:
 //
-//     EXIT  ENTER  PAGEUP  PAGEDN  MODEL  TELE  SYS
+//     RTN  ENTER  PAGEUP  PAGEDN  MODEL  TELE  SYS
+//
+// RTN is what the radio prints on that key; EdgeTX calls it EXIT internally
+// (boards/hw_defs/tx16smk3.json: KEY_EXIT, "label": "RTN"), and the Android key
+// behind the remote's return button is AKEYCODE_BACK. Both names are accepted in
+// the key map file, and RTN is the one used in the log - so what is pressed on the
+// remote and what the log says line up.
 //
 // UP and DOWN are not produced by anything: they are consumed only by the
 // monochrome UIs (gui/128x64, navigation_9x) and by Lua, so nothing in
@@ -129,11 +136,11 @@ struct KeyChoice {
 // here: the RcCustomButtonEvent listener never fires on this remote, so the
 // buttons are taken from the Android key codes the kernel reports for them.
 const KeyChoice kKeyMap[] = {
-    {AKEYCODE_BACK, kKeyExit},            // the remote's back button
+    {AKEYCODE_BACK, kKeyExit},            // the remote's RTN (return) button
     {AKEYCODE_BUTTON_THUMBL, kKeyEnter},  // 5-way centre press
-    {AKEYCODE_F4, kKeySys},               // R1 -> SYS  (radio setup)
-    {AKEYCODE_F5, kKeyModel},             // R2 -> MDL  (model setup)
-    {AKEYCODE_F6, kKeyTele},              // R3 -> TELE (telemetry)
+    {AKEYCODE_F1, kKeySys},               // L1 -> SYS  (radio setup)
+    {AKEYCODE_F2, kKeyModel},             // L2 -> MDL  (model setup)
+    {AKEYCODE_F3, kKeyTele},              // L3 -> TELE (telemetry)
 };
 
 // ------------------------------------------------------------------ state ----
@@ -224,7 +231,7 @@ const char* key_name(int32_t keycode) {
 // EdgeTX 键名，只在日志里用。
 const char* etkey_name(uint8_t key) {
     switch (key) {
-        case kKeyExit: return "EXIT";
+        case kKeyExit: return "RTN";
         case kKeyEnter: return "ENTER";
         case kKeyPageUp: return "PAGEUP";
         case kKeyPageDn: return "PAGEDN";
@@ -251,7 +258,9 @@ const char* etkey_name(uint8_t key) {
 //
 // The Android key name is the one logcat prints, e.g.
 //   joystick: button keycode 131 (F1) -> EdgeTX PAGEUP
-// EdgeTX keys: EXIT ENTER PAGEUP PAGEDN MODEL TELE SYS
+// EdgeTX keys: RTN ENTER PAGEUP PAGEDN MODEL TELE SYS
+// (RTN is the key the radio prints on its return button; EXIT is accepted as well,
+// both here and in the log, because that is EdgeTX's own name for it.)
 //
 // The app writes a template containing the built-in defaults on first run. To
 // change it, edit that file (or push a new one) and restart the app:
@@ -292,9 +301,10 @@ const NamedId kAndroidKeyNames[] = {
 };
 
 const NamedId kEtKeyNames[] = {
-    {"EXIT", kKeyExit},     {"ENTER", kKeyEnter}, {"PAGEUP", kKeyPageUp},
-    {"PAGEDN", kKeyPageDn}, {"UP", kKeyUp},       {"DOWN", kKeyDown},
-    {"MODEL", kKeyModel},   {"TELE", kKeyTele},   {"SYS", kKeySys},
+    {"RTN", kKeyExit},      {"EXIT", kKeyExit},  {"ENTER", kKeyEnter},
+    {"PAGEUP", kKeyPageUp}, {"PAGEDN", kKeyPageDn},
+    {"UP", kKeyUp},         {"DOWN", kKeyDown},
+    {"MODEL", kKeyModel},   {"TELE", kKeyTele},  {"SYS", kKeySys},
 };
 
 std::string trim(const std::string& s) {
@@ -341,8 +351,9 @@ void write_key_map_template(const std::string& path) {
     out << "# Which EdgeTX key each controller button drives.\n"
         << "# One \"<android key> = <EdgeTX key>\" per line, '#' starts a comment.\n"
         << "# The android key name is what logcat prints, e.g.\n"
-        << "#   joystick: button keycode 4 (BACK) -> EdgeTX EXIT\n"
-        << "# EdgeTX keys: EXIT ENTER PAGEUP PAGEDN MODEL TELE SYS\n"
+        << "#   joystick: button keycode 4 (BACK) -> EdgeTX RTN\n"
+        << "# EdgeTX keys: RTN ENTER PAGEUP PAGEDN MODEL TELE SYS\n"
+        << "# (RTN is what the radio prints on its return button; EXIT works too.)\n"
         << "# Edit this file, then restart the app.\n\n";
     for (const KeyChoice& c : kKeyMap) {
         const char* kn = android_keycode_name(c.keycode);
@@ -772,10 +783,24 @@ std::chrono::steady_clock::time_point g_thumbLAt{};
 bool g_thumbLSeen = false;
 constexpr auto kThumbLDedup = std::chrono::milliseconds(500);
 
-// The RC's L1/L2/L3 buttons arrive as plain Android key codes F1..F3 (measured -
-// the SDK's own boolean button keys are all silent on this remote). They are used
-// as the three positions of one switch, SF: pressed = that position, and it stays
-// there until another of the three is pressed (so the release is ignored).
+// The RC's R1/R2/R3 buttons arrive as plain Android key codes F4..F6 (measured - the SDK's
+// own boolean button keys are all silent for them) and each drives one momentary EdgeTX
+// switch: pressed = down, released = up. They are SG/SH/SI, the switches the RC's C1/C2/C3
+// buttons used to drive; C1/C2/C3 now pick the position of the 3-position switch SF
+// instead, and they can do that from the DJI SDK (see DjiMsdkBridge.listenPositionButton) -
+// which is also why SF is the switch that keeps being usable with the UI closed.
+//
+// The L1/L2/L3 buttons (F1..F3) are EdgeTX keys instead, see kKeyMap above.
+//
+// Android only delivers key events to the window that has focus, so these three - and
+// with them L1/L2/L3 (F1..F3) and the RC's RTN button (BACK) - stop arriving as soon as
+// the UI is gone (the app swiped away; RcLinkService keeps the *firmware* running, but
+// there is no window left to receive keys). Everything the DJI SDK reports keeps coming:
+// the sticks, the dials and the switches DjiMsdkBridge drives (SA/SD/SE/SF/SC/SJ).
+// There is no way around it from here - the kernel's input node is root:input 0660 and
+// the only permission that grants that group is signature-level - so a switch that has to
+// be usable with the UI closed has to come from the SDK. The positions the switches are
+// left in are kept, they simply cannot be moved while no window exists.
 //
 // The photo, video and pause buttons are NOT here: their kernel key codes never
 // reach an app (the RC's own dpad service consumes them, and pause is not in the
@@ -783,18 +808,20 @@ constexpr auto kThumbLDedup = std::chrono::milliseconds(500);
 // see DjiMsdkBridge.listenButtonKeys().
 //
 // A key code listed in joystick.keys wins, which is how any of these can be made
-// an EdgeTX key instead - R1/R2/R3 (F4..F6) are mapped that way above, so they
+// an EdgeTX key instead - L1/L2/L3 (F1..F3) are mapped that way above, so they
 // open the SYS/MODEL/TELE pages.
 struct SwitchKey {
     int32_t keycode;
     uint8_t index;
-    int8_t  state;   // the position this button selects: -1 up, 0 middle, 1 down
+    int8_t  state;   // the position the switch takes while the button is held
 };
 
+// Board switch table (tx16smk3.json): 6 = SG, 7 = SH, 8 = SI. All three are momentary, so
+// the release puts them back up.
 const SwitchKey kSwitchKeys[] = {
-    {AKEYCODE_F1, 5, -1},  // L1 -> SF up
-    {AKEYCODE_F2, 5,  0},  // L2 -> SF middle
-    {AKEYCODE_F3, 5,  1},  // L3 -> SF down
+    {AKEYCODE_F4, 6, 1},  // R1 -> SG down while held
+    {AKEYCODE_F5, 7, 1},  // R2 -> SH down while held
+    {AKEYCODE_F6, 8, 1},  // R3 -> SI down while held
 };
 
 std::vector<int32_t> g_loggedSwitchKeys;
@@ -844,14 +871,13 @@ bool handleKeyEvent(AInputEvent* event) {
         return true;
     }
 
-    // Not remapped, so fall back to the built-in role of these buttons.
+    // Not remapped, so fall back to the built-in role of these buttons. They are
+    // momentary switches: the switch follows the button, so both edges matter.
     for (const SwitchKey& entry : kSwitchKeys) {
         if (entry.keycode == keycode) {
-            // The switch latches, so only the press moves it.
-            if (down) {
-                log_switch_key_once(keycode, entry.index, entry.state);
-                requestSwitch(entry.index, entry.state);
-            }
+            const int8_t state = down ? entry.state : static_cast<int8_t>(-entry.state);
+            log_switch_key_once(keycode, entry.index, state);
+            requestSwitch(entry.index, state);
             return true;
         }
     }
@@ -1074,11 +1100,90 @@ void requestScrollWheel(int32_t steps) {
     g_analogQueued[kScrollWheelChannel] = true;
 }
 
+// ---- switch positions across restarts ---------------------------------------
+//
+// The RC's latching switches stay where the user put them while the app is not
+// looking: the takeoff button latches in the remote's own hardware, and the pause
+// and L1/L2/L3 buttons work the same way for whoever is pressing them. The DJI SDK
+// only ever reports a press, never the latched level, so the position has to be
+// remembered here - and remembered across a restart, because EdgeTX reads its switch
+// positions once while booting and warns about every one that is not where the model
+// expects it.
+//
+// Only the latch that this module is the only witness of is kept here:
+//
+//   5  SF  L1/L2/L3  (Android key codes F1..F3, see kSwitchKeys)
+//
+// SA (takeoff), SD (pause) and SE (photo) latch in exactly the same way, but they come
+// from DjiMsdkBridge.java, which keeps their positions itself: the SDK's registration is
+// what first makes them known, and Java can read its own store before that, whereas a
+// call into here would race with this file being loaded (link_start() does that, which
+// runs after Application.onCreate has already called the bridge).
+//
+// The momentary ones (SC/SG/SH from the buttons, SI from C3) are back where they
+// belong as soon as nothing is held, and SJ carries the aircraft's arm state, about
+// which only the aircraft can be authoritative.
+//
+// Caveat, and it cannot be fixed from here: the remote's latch moves even while the app
+// is dead, and a press made in that window is invisible. The restored position is
+// therefore the app's best guess, and the next press puts both sides back in step.
+constexpr uint8_t kPersistedSwitches[] = {5};
+
+bool is_latching_switch(int index) {
+    for (uint8_t persisted : kPersistedSwitches) {
+        if (persisted == index) return true;
+    }
+    return false;
+}
+
+const char* switch_position_name(int8_t state) {
+    if (state < 0) return "up";
+    if (state == 0) return "middle";
+    return "down";
+}
+
+std::mutex g_stateMutex;
+std::string g_statePath;                 // empty until setStateDir() has run
+int8_t g_stateValue[kSwitchCount] = {};  // last position seen, per switch
+bool g_stateKnown[kSwitchCount] = {};    // false = never seen, i.e. nothing saved
+
+// The whole table is rewritten on every change: it holds at most four lines, and a
+// rewrite cannot leave a half-applied one behind.
+void save_switch_state_locked() {
+    if (g_statePath.empty()) return;
+
+    std::ofstream out(g_statePath.c_str(), std::ios::trunc);
+    if (!out) {
+        LOGW("joystick: cannot write %s", g_statePath.c_str());
+        return;
+    }
+    out << "# Where the RC's latching switches were when the app last ran.\n"
+           "# <switch index> <position>; -1 up, 0 middle, 1 down. Rewritten whenever\n"
+           "# a switch moves - editing it while the app runs has no effect.\n";
+    for (int i = 0; i < kSwitchCount; i++) {
+        if (g_stateKnown[i]) out << i << " " << (int)g_stateValue[i] << "\n";
+    }
+}
+
 void requestSwitch(int index, int8_t state) {
     if (index < 0 || index >= kSwitchCount) return;
-    std::lock_guard<std::mutex> lock(g_switchMutex);
-    g_switchQueuedValue[index] = state;
-    g_switchQueued[index] = true;
+    {
+        std::lock_guard<std::mutex> lock(g_switchMutex);
+        g_switchQueuedValue[index] = state;
+        g_switchQueued[index] = true;
+    }
+
+    // The switch this module alone sees is remembered for the next run - see
+    // kPersistedSwitches.
+    if (!is_latching_switch(index)) return;
+
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    if (g_stateKnown[index] && g_stateValue[index] == state) return;
+    g_stateValue[index] = state;
+    g_stateKnown[index] = true;
+    LOGI("joystick: switch %s -> %s (kept for the next start)", switch_name(index),
+         switch_position_name(state));
+    save_switch_state_locked();
 }
 
 void tick() {
@@ -1197,6 +1302,87 @@ void tick() {
         }
         simu::rotaryEncoderEvent(steps);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Startup readiness - see joystick.h.
+// ---------------------------------------------------------------------------
+#if defined(EDGETX_MSDK)
+std::atomic<bool> g_inputsReady{false};
+
+void setInputsReady(bool ready) { g_inputsReady.store(ready); }
+bool inputsReady() { return g_inputsReady.load(); }
+#else
+// Nothing to wait for: without the SDK there is no source for the RC's controls.
+void setInputsReady(bool) {}
+bool inputsReady() { return true; }
+#endif
+
+// ---------------------------------------------------------------------------
+// Saved switch positions - see kPersistedSwitches further up.
+// ---------------------------------------------------------------------------
+
+void setStateDir(const char* dir) {
+    if (dir == nullptr || dir[0] == '\0') return;
+
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    const std::string path = std::string(dir) + "/joystick.switches";
+    if (g_statePath == path) return;
+    g_statePath = path;
+
+    std::ifstream in(path.c_str());
+    if (!in) {
+        LOGI("joystick: no saved switch positions in %s yet", path.c_str());
+        return;
+    }
+
+    int loaded = 0;
+    std::string line;
+    while (std::getline(in, line)) {
+        const size_t hash = line.find('#');
+        if (hash != std::string::npos) line.erase(hash);
+
+        int index = -1;
+        int state = 0;
+        if (std::sscanf(line.c_str(), "%d %d", &index, &state) != 2) continue;
+        if (!is_latching_switch(index)) continue;
+        if (state < -1) state = -1;
+        if (state > 1) state = 1;
+
+        g_stateValue[index] = static_cast<int8_t>(state);
+        g_stateKnown[index] = true;
+        ++loaded;
+    }
+    LOGI("joystick: %d saved switch position(s) from %s", loaded, path.c_str());
+}
+
+void restoreSwitches() {
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    for (int i = 0; i < kSwitchCount; i++) {
+        if (!g_stateKnown[i]) continue;
+        // Into the firmware *and* into the library's copy of it (see simu::setSwitch): the
+        // boot resets the switches after this runs, and the library puts its copy back.
+        simu::setSwitch(static_cast<uint8_t>(i), g_stateValue[i]);
+        LOGI("joystick: switch %s restored to %s", switch_name(static_cast<uint8_t>(i)),
+             switch_position_name(g_stateValue[i]));
+    }
+}
+
+int switchState(int index) {
+    if (index < 0 || index >= kSwitchCount) return 0;
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    return g_stateKnown[index] ? g_stateValue[index] : 0;
+}
+
+// Called from DjiMsdkBridge.java when the SDK is registered and the sticks are
+// reporting - or when it is clear that they never will be. This is what
+// link_start() waits for (see inputsReady() above).
+extern "C" JNIEXPORT void JNICALL
+Java_com_edgetx_droidui_DjiMsdkBridge_nativeSetInputsReady(JNIEnv* env, jclass clazz) {
+    (void)env;
+    (void)clazz;
+    LOGI("joystick: RC controls reporting, the firmware may boot");
+    setInputsReady(true);
 }
 
 // Called from DjiMsdkBridge.java (DJI Mobile SDK) for RC buttons that Android's

@@ -1,6 +1,9 @@
 package com.edgetx.droidui;
 
 import android.app.Application;
+import android.content.Context;
+import android.content.SharedPreferences;
+import android.os.SystemClock;
 import android.util.Log;
 
 import dji.sdk.keyvalue.key.DJIFlightControllerKey;
@@ -92,6 +95,12 @@ public final class DjiMsdkBridge {
     static native void nativeOnDjiSwitch(int index, int state);
 
     /**
+     * The RC's controls are reporting - or never will. joystick.cpp stops holding the
+     * firmware back and EdgeTX boots (see the readiness section below).
+     */
+    static native void nativeSetInputsReady();
+
+    /**
      * Absolute dial position. `dial` is 0 = left, 1 = right; the dials report the
      * same -660..660 range as the sticks.
      *
@@ -108,7 +117,81 @@ public final class DjiMsdkBridge {
      */
     static native void nativeOnDjiScrollWheel(int steps);
 
+    // ------------------------------------------------------ startup readiness --
+    //
+    // EdgeTX's boot checks read the throttle and the switches once and warn about what
+    // they find, so the firmware is not started until the RC's own controls are actually
+    // reporting - joystick::inputsReady() is what link_start() waits on. Without this
+    // the throttle still reads as centred while the SDK starts up, and the user gets
+    // "throttle not at idle" for a stick that is at the bottom.
+
+    /** True once joystick.cpp has been told it may let the firmware boot. */
+    private static boolean sInputsReady;
+    /** Set once listen() is done, i.e. the switch positions are in place. */
+    private static boolean sListeningDone;
+    /** The four stick axes, each counted the first time it reports. */
+    private static final boolean[] sStickSeen = new boolean[4];
+    private static int sSticksSeen;
+
+    /**
+     * The sticks are what the boot checks care about most - the throttle warning is
+     * decided from one of them, and a value that has not arrived yet reads as centre.
+     * Both the listeners and the poller come through here.
+     */
+    private static void markStickSeen(int axis) {
+        if (axis < 0 || axis >= sStickSeen.length) return;
+        synchronized (DjiMsdkBridge.class) {
+            if (!sStickSeen[axis]) {
+                sStickSeen[axis] = true;
+                sSticksSeen++;
+            }
+        }
+        checkInputsReady();
+    }
+
+    private static void markListeningDone() {
+        synchronized (DjiMsdkBridge.class) {
+            sListeningDone = true;
+        }
+        checkInputsReady();
+    }
+
+    /** Registration or listening failed: nothing is coming, so do not wait for it. */
+    private static void markInputsReady(String why) {
+        synchronized (DjiMsdkBridge.class) {
+            if (sInputsReady) return;
+        }
+        Log.i(TAG, "dji: " + why + " - nothing left to wait for, the firmware may boot");
+        releaseFirmwareStart();
+    }
+
+    private static void checkInputsReady() {
+        final int seen;
+        synchronized (DjiMsdkBridge.class) {
+            if (sInputsReady || !sListeningDone || sSticksSeen < sStickSeen.length) return;
+            seen = sSticksSeen;
+        }
+        Log.i(TAG, "dji: sticks reporting (" + seen + "/4), the firmware may boot");
+        releaseFirmwareStart();
+    }
+
+    private static void releaseFirmwareStart() {
+        synchronized (DjiMsdkBridge.class) {
+            if (sInputsReady) return;
+            sInputsReady = true;
+        }
+        try {
+            nativeSetInputsReady();
+        } catch (Throwable t) {
+            Log.w(TAG, "dji: could not release the firmware start", t);
+        }
+    }
+
     public static void init(Application app) {
+        // Before anything is dispatched: where the latching switches were left.
+        sPrefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        restoreLatchedSwitches();
+
         if (SDKManager.getInstance().isRegistered()) {
             listen();
             return;
@@ -121,6 +204,7 @@ public final class DjiMsdkBridge {
 
             @Override public void onRegisterFailure(IDJIError error) {
                 Log.w(TAG, "dji: register failed: " + error);
+                markInputsReady("registration failed");
             }
 
             @Override public void onProductDisconnect(int id) { }
@@ -181,9 +265,11 @@ public final class DjiMsdkBridge {
             Log.i(TAG, "dji: registered, product category "
                     + SDKManager.getInstance().getProductCategory());
             sListening = true;
+            markListeningDone();
             Log.i(TAG, "dji: listening for RC button events");
         } catch (Throwable t) {
             Log.w(TAG, "dji: listen failed", t);
+            markInputsReady("listening failed");
         }
     }
 
@@ -237,8 +323,15 @@ public final class DjiMsdkBridge {
     // nor KeyRcButtonEventPro: the kernel key codes behind them are eaten by the
     // RC's own dpad service in SystemUI, and the pause button is not even in the
     // kernel input stream (the raw gpio-keys device stays silent for it). The
-    // SDK's plain Boolean button keys do work, so SC/SD/SE/SG/SH are driven from those.
+    // SDK's plain Boolean button keys do work, so SC/SD/SE and SF are driven from those.
     // Indices are the board's switch table, see joystick.cpp requestSwitch().
+    //
+    // Driving them from the SDK rather than from Android key codes is what makes them
+    // keep working while the UI is gone (the app swiped away, RcLinkService still holding
+    // the firmware): key events only reach a window that has focus, the SDK's callbacks do
+    // not need one. SG/SH/SI are the exception - the R1/R2/R3 buttons are Android key codes
+    // F4..F6 (see kSwitchKeys in joystick.cpp) and KeyRcButtonEventPro never fires on this
+    // remote, so they have no SDK route and stop with the window.
     //
     // Measured on the RC: all of them fire. The shutter is the odd one - one contact
     // only, so it also drives a switch of its own, see listenShutter().
@@ -246,9 +339,10 @@ public final class DjiMsdkBridge {
     static final int SWITCH_C = 2;   // video button
     static final int SWITCH_D = 3;   // pause button
     static final int SWITCH_E = 4;   // photo/shutter button, three positions
-    static final int SWITCH_G = 6;   // C1 button
-    static final int SWITCH_H = 7;   // C2 button
-    static final int SWITCH_I = 8;   // C3 button
+    static final int SWITCH_F = 5;   // C1/C2/C3 pick its position (see listenButtonKeys)
+    static final int SWITCH_G = 6;   // R1 button - Android key code F4, see joystick.cpp
+    static final int SWITCH_H = 7;   // R2 button
+    static final int SWITCH_I = 8;   // R3 button
 
     /**
      * The shutter button as a three-position switch (SE).
@@ -292,14 +386,17 @@ public final class DjiMsdkBridge {
                             final long held = System.currentTimeMillis() - pressedAt;
                             pressedAt = 0;
                             final int position = held >= SHUTTER_SHORT_PRESS_MS ? 1 : -1;
+                            sShutterPosition = position;
+                            persistSwitch(PREF_PHOTO, position);
                             Log.i(TAG, "dji: photo held " + held + " ms -> switch E "
                                     + (position > 0 ? "down" : "up"));
                             nativeOnDjiSwitch(SWITCH_E, position);
                         }
                     });
 
-            // The middle position is where the switch sits until the first press.
-            nativeOnDjiSwitch(SWITCH_E, 0);
+            // SE latches, so a restart brings back the position of the last press; the
+            // middle position is where it sits until the first one.
+            nativeOnDjiSwitch(SWITCH_E, sShutterPosition);
         } catch (Throwable t) {
             Log.w(TAG, "dji: shutter listen failed", t);
         }
@@ -330,11 +427,46 @@ public final class DjiMsdkBridge {
         // wants a latched level out of it (a channel that stays high until the next
         // press), so it toggles SD instead of being high only while it is held.
         listenToggleSwitch(SWITCH_D, "pause", DJIRemoteControllerKey.KeyPauseButtonDown);
-        // The RC's C1/C2/C3 buttons.
-        listenSwitchButton(DJIRemoteControllerKey.KeyCustomButton1Down, "C1", SWITCH_G);
-        listenSwitchButton(DJIRemoteControllerKey.KeyCustomButton2Down, "C2", SWITCH_H);
-        listenSwitchButton(DJIRemoteControllerKey.KeyCustomButton3Down, "C3", SWITCH_I);
+        // C1/C2/C3 are the three positions of SF: up, middle, down. They used to be SG/SH/SI,
+        // which the RC's R1/R2/R3 buttons now drive from Android key codes - SF is the one
+        // that had to move onto the SDK, because only the SDK keeps reporting while the UI
+        // is closed (key events need a focused window).
+        listenPositionButton(DJIRemoteControllerKey.KeyCustomButton1Down, "C1", SWITCH_F, -1);
+        listenPositionButton(DJIRemoteControllerKey.KeyCustomButton2Down, "C2", SWITCH_F, 0);
+        listenPositionButton(DJIRemoteControllerKey.KeyCustomButton3Down, "C3", SWITCH_F, 1);
         listenGoHome();
+    }
+
+    /**
+     * A button that selects one position of a switch, which then stays there until another
+     * of its buttons is pressed - only the press half of the SDK's pulse matters.
+     *
+     * <p>This is what SF is: C1 up, C2 middle, C3 down. (L1/L2/L3 did this from Android
+     * key codes, where the release would have to be ignored the same way.)
+     */
+    private static void listenPositionButton(DJIKeyInfo<Boolean> info, String name, int index,
+                                             int position) {
+        try {
+            final DJIKey<Boolean> key = KeyTools.createKey(info);
+            KeyManager.getInstance().listen(key, OWNER,
+                    new CommonCallbacks.KeyListener<Boolean>() {
+                        @Override
+                        public void onValueChange(Boolean oldValue, Boolean newValue) {
+                            if (oldValue == null || !Boolean.TRUE.equals(newValue)) {
+                                return;   // the initial snapshot, or the release half
+                            }
+                            Log.i(TAG, "dji: " + name + " -> switch " + (char) ('A' + index)
+                                    + " position " + position);
+                            try {
+                                nativeOnDjiSwitch(index, position);
+                            } catch (Throwable t) {
+                                Log.w(TAG, "dji: switch " + index + " dispatch failed", t);
+                            }
+                        }
+                    });
+        } catch (Throwable t) {
+            Log.w(TAG, "dji: " + name + " listen failed", t);
+        }
     }
 
     /**
@@ -404,6 +536,7 @@ public final class DjiMsdkBridge {
                             if (newValue == null) {
                                 return;
                             }
+                            markStickSeen(axis);
                             announce("sticks");
                             try {
                                 nativeOnDjiStick(axis, newValue);
@@ -462,12 +595,97 @@ public final class DjiMsdkBridge {
     private static final boolean[] sToggleHigh = new boolean[SWITCH_COUNT];
 
     /**
+     * Position of the photo switch (SE) from the last press, which is also where a
+     * restart picks it up again (see {@link #restoreLatchedSwitches}).
+     */
+    private static int sShutterPosition = 0;
+
+    /** Where the latching switch positions are kept between runs. */
+    private static final String PREFS = "link";
+    private static final String PREF_TAKEOFF = "switchSA";
+    private static final String PREF_PAUSE = "switchSD";
+    private static final String PREF_PHOTO = "switchSE";
+    private static final String PREF_UPTIME = "switchUptime";
+
+    private static SharedPreferences sPrefs;
+
+    /**
+     * Picks up the positions the latching switches had when the app last ran.
+     *
+     * <p>The takeoff and pause buttons toggle a level that only this class knows about, and
+     * the photo button picks its position from how long it is held. The SDK reports presses
+     * for all three and never the latched level, while the remote's own latch keeps its
+     * position across the app being killed - so the positions are remembered here and handed
+     * back on the next start. See {@link #listenToggleSwitch} for the one case that cannot be
+     * got right.
+     *
+     * <p>Nothing is restored after a reboot of the remote itself: its latches go back to their
+     * power-on state (the takeoff button powers up low, with a red LED), and the uptime check
+     * below is what tells such a reboot apart from the app merely being restarted.
+     *
+     * <p>Stored here rather than in joystick.cpp, which keeps the one switch it alone sees
+     * (SF, the L1/L2/L3 buttons): this runs from Application.onCreate, early enough to beat
+     * the SDK's registration, whereas the native side only learns its directory once
+     * RcLinkService starts the link.
+     */
+    private static void restoreLatchedSwitches() {
+        final SharedPreferences prefs = sPrefs;
+        if (prefs == null) {
+            Log.w(TAG, "dji: no preferences, the switches start from their power-on state");
+            return;
+        }
+
+        // elapsedRealtime() only ever grows within one boot of the device, so a value below
+        // the one saved alongside the positions means the remote restarted since then.
+        if (SystemClock.elapsedRealtime() < prefs.getLong(PREF_UPTIME, 0)) {
+            Log.i(TAG, "dji: remote rebooted since the switches were saved, starting over");
+            return;
+        }
+
+        final int takeoff = prefs.getInt(PREF_TAKEOFF, 0);
+        if (takeoff != 0) sToggleHigh[SW_SA] = (takeoff == SWITCH_HIGH);
+
+        final int pause = prefs.getInt(PREF_PAUSE, 0);
+        if (pause != 0) sToggleHigh[SWITCH_D] = (pause == SWITCH_HIGH);
+
+        final int photo = prefs.getInt(PREF_PHOTO, 0);
+        if (photo != 0) sShutterPosition = photo;
+
+        Log.i(TAG, "dji: switches carried over - takeoff "
+                + (sToggleHigh[SW_SA] ? "high" : "low") + ", pause "
+                + (sToggleHigh[SWITCH_D] ? "high" : "low") + ", photo " + sShutterPosition);
+    }
+
+    /** Remembers one of the latching positions for the next run. */
+    private static void persistSwitch(String key, int position) {
+        final SharedPreferences prefs = sPrefs;
+        if (prefs == null) return;
+        prefs.edit()
+                .putInt(key, position)
+                .putLong(PREF_UPTIME, SystemClock.elapsedRealtime())
+                .apply();
+    }
+
+    /**
      * A button reporting only its press, driving a two-position EdgeTX switch: the
-     * takeoff button (SA) and the pause button (SH) both work this way.
+     * takeoff button (SA) and the pause button (SD) both work this way.
      *
      * The first callback is the initial snapshot rather than a press, and the SDK also
-     * reports the release half of the pulse, so only a press is acted on. The button
-     * starts out low, which is also how the switch should look at boot.
+     * reports the release half of the pulse, so only a press is acted on.
+     *
+     * <p>Both positions are remembered across a restart (see
+     * {@link #restoreLatchedSwitches}), with one caveat that cannot be designed away: a press
+     * <em>toggles</em> the remote's own latch and this level together, so the two only stay in
+     * step while they started in step. A press made while the app was dead - the remote's
+     * latch moving on its own - leaves them permanently inverted, and nothing here can tell:
+     * the SDK never reports the latched level (the initial snapshot logged below is what would
+     * settle that). Starting from "low" instead is wrong in the far more common case where the
+     * latch simply stayed where it was.
+     *
+     * <p>Whether the remote's latch can be read at all is still open, and the snapshot log
+     * line below is what would answer it: if the SDK reports the latched level in the first
+     * callback rather than a plain {@code false}, that value is the right starting point and
+     * the toggling stops being a guess.
      */
     private static void listenToggleSwitch(final int index, final String label,
                                            DJIKeyInfo<Boolean> info) {
@@ -477,7 +695,13 @@ public final class DjiMsdkBridge {
                     new CommonCallbacks.KeyListener<Boolean>() {
                         @Override
                         public void onValueChange(Boolean oldValue, Boolean newValue) {
-                            if (oldValue == null || !Boolean.TRUE.equals(newValue)) {
+                            if (oldValue == null) {
+                                // A snapshot, not a press: see the note above - this is the
+                                // measurement, not a decision.
+                                Log.i(TAG, "dji: " + label + " initial snapshot " + newValue);
+                                return;
+                            }
+                            if (!Boolean.TRUE.equals(newValue)) {
                                 return;
                             }
                             final boolean high;
@@ -497,6 +721,12 @@ public final class DjiMsdkBridge {
     }
 
     private static void dispatchToggle(int index, boolean high) {
+        if (index == SW_SA) {
+            persistSwitch(PREF_TAKEOFF, high ? SWITCH_HIGH : SWITCH_LOW);
+        } else if (index == SWITCH_D) {
+            persistSwitch(PREF_PAUSE, high ? SWITCH_HIGH : SWITCH_LOW);
+        }
+
         try {
             nativeOnDjiSwitch(index, high ? SWITCH_HIGH : SWITCH_LOW);
         } catch (Throwable t) {
@@ -677,6 +907,7 @@ public final class DjiMsdkBridge {
                 last[i] = raw;
                 try {
                     if (i < 4) {
+                        markStickSeen(i);
                         nativeOnDjiStick(i, raw);
                     } else {
                         nativeOnDjiDial(i - 4, raw);

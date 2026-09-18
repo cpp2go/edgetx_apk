@@ -62,6 +62,13 @@ android {
                 // EdgeTX-like target uses C++17. Keep exceptions/RTTI on for Lua.
                 cppFlags += listOf("-std=c++17", "-fexceptions", "-Wall")
                 arguments += listOf("-DANDROID_STL=c++_static")
+
+                // Says that this build has the DJI SDK in it: the firmware's start then
+                // waits for the SDK to report the RC's controls before EdgeTX boots, so
+                // its boot checks see real stick and switch positions (see
+                // joystick.cpp: inputsReady()). Without the SDK there is nothing to wait
+                // for and the gate is compiled out.
+                if (djiMsdkEnabled) cppFlags += "-DEDGETX_MSDK=ON"
             }
         }
 

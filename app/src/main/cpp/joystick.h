@@ -67,6 +67,31 @@ void requestScrollWheel(int32_t steps);
 
 // Queue a hardware switch position from the DJI SDK. `index` is 0 = SA, 1 = SB
 // (see nativeOnDjiSwitch); `state` is <0 up, 0 middle, >0 down.
+//
+// The board's switch table and who drives what: SA takeoff, SB flight mode,
+// SC video, SD pause, SE photo, SF C1/C2/C3, SG/SH/SI R1/R2/R3, SJ arm state.
 void requestSwitch(int index, int8_t state);
+
+// ---------------------------------------------------------------- startup ----
+//
+// Booting the firmware is what runs EdgeTX's boot checks, and those sample the
+// throttle and every switch once and warn about whatever they find. Until the
+// RC's own controls have reported, a stick reads as centred - so the host waits
+// for this before letting the firmware start (see native_main.cpp: link_start).
+//
+// Set from DjiMsdkBridge.java once the DJI SDK is registered and the sticks are
+// reporting, or once it is clear that they never will be. A build without the
+// SDK has nothing to wait for and is ready from the start.
+bool inputsReady();
+void setInputsReady(bool ready);
+
+// Where the positions of the latching switches are kept between runs
+// ("<dir>/joystick.switches"); see joystick.cpp.
+void setStateDir(const char* dir);
+
+// Puts the saved switch positions into the firmware. Called from the host between
+// simuInit() and simuStart(); they survive the boot's own switch reset because
+// simu::setSwitch() keeps a copy in the library (see its boardInitSwitches()).
+void restoreSwitches();
 
 }  // namespace joystick
