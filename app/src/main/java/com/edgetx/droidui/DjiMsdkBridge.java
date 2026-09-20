@@ -614,6 +614,35 @@ public final class DjiMsdkBridge {
     private static final boolean[] sToggleHigh = new boolean[SWITCH_COUNT];
 
     /**
+     * When each press-only button was last seen going down, or 0 while it is up.
+     *
+     * Both sources see the same press - the SDK callback and, for the video button, the
+     * joystick's raw reports - and the SDK delivers the same value twice (measured: every
+     * listener's initial snapshot arrives twice, and so does the press that follows it). One
+     * physical press has to be exactly one toggle, so a press that arrives while the button is
+     * already down is the other copy of it, not a second press.
+     */
+    private static final long[] sButtonDownAt = new long[SWITCH_COUNT];
+
+    /** A press still open after this long had its release missed: take the next one anyway. */
+    private static final long PRESS_STALE_MS = 1000;
+
+    /** One press or one release of a press-only button; true only for a press that is news. */
+    private static boolean noteButtonState(int index, boolean down) {
+        if (!down) {
+            sButtonDownAt[index] = 0;
+            return false;
+        }
+
+        final long now = SystemClock.uptimeMillis();
+        final long since = sButtonDownAt[index];
+        if (since != 0 && now - since < PRESS_STALE_MS) return false;
+
+        sButtonDownAt[index] = now;
+        return true;
+    }
+
+    /**
      * Position of the photo switch (SE) from the last press, which is also where a
      * restart picks it up again (see {@link #restoreLatchedSwitches}).
      */
@@ -725,7 +754,10 @@ public final class DjiMsdkBridge {
                                 Log.i(TAG, "dji: " + label + " initial snapshot " + newValue);
                                 return;
                             }
+                            // The release is not a toggle, but it is what lets the next press
+                            // through - see noteButtonState().
                             if (!Boolean.TRUE.equals(newValue)) {
+                                noteButtonState(index, false);
                                 return;
                             }
                             // The joystick's raw USB reports carry this same button (see
@@ -733,6 +765,11 @@ public final class DjiMsdkBridge {
                             // would be the second press of it, and a second press is a second
                             // toggle.
                             if (rawBacked && RcRawJoystick.ownsInputs()) {
+                                return;
+                            }
+                            if (!noteButtonState(index, true)) {
+                                Log.i(TAG, "dji: " + label
+                                        + " press ignored, the button is already down");
                                 return;
                             }
                             toggleSwitch(index, label);
@@ -1189,10 +1226,14 @@ public final class DjiMsdkBridge {
         dispatch(buttonId);
     }
 
-    /** The record button as EdgeTX switch SC: the same thing {@code listenButtonKeys} drives. */
+    /**
+     * The record button as EdgeTX switch SC: the same thing {@code listenButtonKeys} drives, and
+     * the same press - noteButtonState() is what keeps the two from both counting it.
+     */
     static void onRawRecordButton(boolean down) {
         try {
-            if (down) toggleSwitch(SWITCH_C, "video");
+            if (!noteButtonState(SWITCH_C, down)) return;
+            toggleSwitch(SWITCH_C, "video");
         } catch (Throwable t) {
             Log.w(TAG, "dji: record button dispatch failed", t);
         }
