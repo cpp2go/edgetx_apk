@@ -27,6 +27,9 @@ import android.util.Log;
 public class EdgeTxApplication extends Application {
     private static final String TAG = "EdgeTXUI";
 
+    /** The process {@link UsbAttachActivity} runs in, and which must stay empty. */
+    private static final String USB_ATTACH_PROCESS = ":usbattach";
+
     @Override
     protected void attachBaseContext(Context base) {
         super.attachBaseContext(base);
@@ -44,6 +47,16 @@ public class EdgeTxApplication extends Application {
     @Override
     public void onCreate() {
         super.onCreate();
+
+        // Started because a USB device was attached (see UsbAttachActivity and the
+        // device filter in the manifest): that is how Android recognises this app as
+        // the joystick's own app, and it is worth a throwaway process - but not the
+        // firmware, the SDK or an RF module coming up because a joystick appeared.
+        if (inUsbAttachProcess()) {
+            Log.i(TAG, "usb: attach-only process, nothing to start here");
+            return;
+        }
+
         askForSdCardAccess();
         RcBattery.start(this);
         // The squelch, beeps and voice prompts are the firmware's own audio; this only
@@ -71,6 +84,14 @@ public class EdgeTxApplication extends Application {
         // DJI SDK publishes them at 8-14 Hz while the device itself produces a new
         // position every 2.5 ms. The SDK stays as the fallback, see RcRawJoystick.
         RcRawJoystick.start(this);
+    }
+
+    /** True in the process that exists only to carry the USB device filter. */
+    private static boolean inUsbAttachProcess() {
+        // API 28 has the process name; the RC is Android 11, and an older device that
+        // still installs this app simply starts normally.
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+                && USB_ATTACH_PROCESS.equals(Application.getProcessName());
     }
 
     /**

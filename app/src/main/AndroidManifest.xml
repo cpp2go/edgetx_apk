@@ -70,6 +70,29 @@
             </intent-filter>
         </activity>
 
+        <!-- Carries res/xml/usb_device_filter.xml, which is what makes Android treat this
+             app as the RC joystick's own app so the USB permission dialog offers "use for
+             this device by default" and stops asking again after every boot.
+
+             The device is internal and present from boot, so the system may start this at
+             any time: it shows nothing, does nothing, and its own process is left empty
+             on purpose (see UsbAttachActivity and EdgeTxApplication). -->
+        <activity
+            android:name=".UsbAttachActivity"
+            android:process=":usbattach"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/usb_device_filter" />
+        </activity>
+
         <!-- Outlives the activity on purpose: `stopWithTask=false` means removing
              the task from recents does not stop it, so the firmware keeps feeding
              the RF module. Started from EdgeTxApplication.

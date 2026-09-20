@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The RC's internal joystick - "DJI Virtual Joystick", 2ca3:1501, the one device this app
+  is allowed to be the owner of.
+
+  Declaring it is what puts the "use for this device by default" tick into Android's USB
+  permission dialog. Without a declaration the dialog has no tick, and the grant it hands
+  out does not survive a reboot, so the app had to ask again after every one (see
+  RcRawJoystick, which is the reason the app wants the device at all).
+-->
+<resources>
+    <usb-device vendor-id="11427" product-id="5377" />
+</resources>
