@@ -316,6 +316,173 @@ std::string prepare_sd_root(const char* filesDir, const char* externalFilesDir) 
     return sd;
 }
 
+// ------------------------------------------------------- switch types --------
+//
+// Three of the switches this port drives do not match what the board's own default
+// radio.yml declares:
+//
+//   SI  the R3 button (see joystick.cpp: kSwitchKeys)          the board leaves it unset
+//   SJ  the aircraft's arm state                               the board leaves it unset
+//   SE  the shutter button (DjiMsdkBridge.setShutterPosition)  the board calls it
+//       three-position, while the button only has two ends: every press steps it to the
+//       other one, and no middle position is ever reported
+//
+// A switch with no type is missing from the Hardware page and cannot be used as a mixer
+// source, and a three-position switch whose middle never happens is a middle position
+// waiting to be picked. All three are two-ended controls, so 2POS is what they get.
+//
+// The host cannot set the type through the firmware. The firmware reads radio.yml in
+// its own boot (storageReadAll() in edgetx.cpp) and only ever writes its settings from
+// its own thread, so by the time the host can call anything the radio is already
+// running on what it loaded. The file is therefore put right before the firmware reads
+// it - and only where the type is still the board default, i.e. for as long as the user
+// has not picked one in the Hardware page. Nothing else in the file is touched.
+struct SwitchTypeDefault {
+    const char* name;
+    const char* board;  // the type the board's own default radio.yml carries
+    const char* type;   // what the control behind it actually is
+};
+
+constexpr SwitchTypeDefault kSwitchTypeDefaults[] = {
+    {"SI", "NONE", "2POS"},
+    {"SJ", "NONE", "2POS"},
+    {"SE", "3POS", "2POS"},
+};
+
+std::string trim(const std::string& text) {
+    const size_t begin = text.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos) return std::string();
+    const size_t end = text.find_last_not_of(" \t\r\n");
+    return text.substr(begin, end - begin + 1);
+}
+
+// The whole file, or an empty string when it cannot be read.
+std::string read_text_file(const std::string& path) {
+    FILE* in = std::fopen(path.c_str(), "rb");
+    if (in == nullptr) return std::string();
+
+    std::string text;
+    char buf[4096];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), in)) > 0) text.append(buf, n);
+    std::fclose(in);
+    return text;
+}
+
+// Written through a temporary file: the firmware treats a radio.yml it cannot parse as
+// "no settings yet" and rewrites it, so a half-written one must never be visible.
+bool write_text_file(const std::string& path, const std::string& text) {
+    const std::string tmp = path + ".tmp";
+
+    FILE* out = std::fopen(tmp.c_str(), "wb");
+    if (out == nullptr) return false;
+    const bool written =
+        text.empty() || std::fwrite(text.data(), 1, text.size(), out) == text.size();
+    std::fclose(out);
+
+    if (!written || std::rename(tmp.c_str(), path.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+// Applies kSwitchTypeDefaults to RADIO/radio.yml where the file still carries the
+// board's own type for that switch, and reports how many were changed. A missing file
+// is not a failure: on a card the firmware has never written to there is nothing to fix
+// yet, and the next start - by which time the firmware has created it - does it.
+unsigned set_default_switch_types(const std::string& sdRoot) {
+    const std::string path = sdRoot + "/RADIO/radio.yml";
+
+    if (!file_has_content(path)) {
+        LOGI("sdcard: no RADIO/radio.yml yet, the firmware creates it on this boot");
+        return 0;
+    }
+
+    const std::string text = read_text_file(path);
+    if (text.empty()) return 0;
+
+    const bool crlf = text.find("\r\n") != std::string::npos;
+    const bool endsWithNewline = text.back() == '\n';
+
+    std::vector<std::string> lines;
+    for (size_t start = 0; start < text.size();) {
+        size_t end = text.find('\n', start);
+        if (end == std::string::npos) end = text.size();
+        lines.push_back(text.substr(start, end - start));  // a '\r' stays on
+        start = end + 1;
+    }
+
+    // One "<switch name>:" record per switch, each with its own "type:" line - see
+    // struct_switchDef in the firmware's yaml_datastructs_tx16smk3.cpp. Only records
+    // that are still untouched are rewritten; a switch the user gave a type keeps it.
+    bool inSwitchConfig = false;
+    std::string current;
+    unsigned changed = 0;
+    size_t editedFlag = lines.size();  // the file's "manuallyEdited:" line, if it has one
+
+    for (size_t i = 0; i < lines.size(); ++i) {
+        std::string& line = lines[i];
+        const std::string trimmed = trim(line);
+
+        // The section headers sit in column 0, which is also what closes the block.
+        if (!line.empty() && line[0] != ' ' && line[0] != '\t') {
+            if (trimmed.rfind("manuallyEdited:", 0) == 0) editedFlag = i;
+            inSwitchConfig = trimmed == "switchConfig:";
+            current.clear();
+            continue;
+        }
+        if (!inSwitchConfig) continue;
+
+        if (trimmed.size() > 1 && trimmed.back() == ':' &&
+            trimmed.find_first_of(" \t") == std::string::npos) {
+            current = trimmed.substr(0, trimmed.size() - 1);
+            continue;
+        }
+
+        for (const SwitchTypeDefault& def : kSwitchTypeDefaults) {
+            if (current != def.name) continue;
+            if (trimmed != std::string("type: ") + def.board) continue;
+
+            line = line.substr(0, line.find_first_not_of(" \t")) + "type: " + def.type +
+                   (crlf ? "\r" : "");
+            LOGI("sdcard: switch %s: type %s -> %s in RADIO/radio.yml", def.name, def.board,
+                 def.type);
+            ++changed;
+        }
+    }
+
+    if (changed == 0) return 0;
+
+    // The type alone is not enough: this is a hand-edited file now, and the firmware only
+    // trusts a radio.yml whose checksum matches its own serialisation of the settings (see
+    // ChecksumResult in sdcard_yaml.cpp). A file that fails that check is written off -
+    // "File is corrupted, attempting alternative file", plus a rewrite from the board
+    // defaults, which is exactly what undid this edit before - unless the file says it was
+    // edited by hand. That path keeps what it read and saves it back, which is also what
+    // puts a matching checksum in the file again.
+    const std::string edited = std::string("manuallyEdited: 1") + (crlf ? "\r" : "");
+    if (editedFlag < lines.size())
+        lines[editedFlag] = edited;
+    else
+        lines.insert(lines.begin(), edited);
+    LOGI("sdcard: RADIO/radio.yml marked as hand-edited (the firmware checks its checksum)");
+
+    std::string out;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        out += lines[i];
+        if (i + 1 < lines.size() || endsWithNewline) out += "\n";
+    }
+
+    if (!write_text_file(path, out)) {
+        LOGE("sdcard: cannot write %s", path.c_str());
+        return 0;
+    }
+
+    LOGI("sdcard: RADIO/radio.yml: %u switch type(s) filled in", changed);
+    return changed;
+}
+
 // Recompute how the LCD frame maps onto the window (aspect-fit + centred).
 void update_transform(int32_t winW, int32_t winH) {
     const int32_t sx = (winW * kFp) / g_lcdW;
@@ -493,6 +660,9 @@ bool link_start(AAssetManager* assets, const char* filesDir, const char* externa
     if (assets != nullptr) {
         seed_assets(assets, sd);
     }
+
+    // Before the firmware loads its settings - see set_default_switch_types().
+    set_default_switch_types(sd);
 
     const simu::LcdInfo lcd = simu::lcdInfo();
     {

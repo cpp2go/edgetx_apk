@@ -403,38 +403,17 @@ public final class DjiMsdkBridge {
         }
     }
 
-    private static void listenSwitchButton(DJIKeyInfo<Boolean> info, String name, int index,
-                                           boolean rawBacked) {
-        try {
-            final DJIKey<Boolean> key = KeyTools.createKey(info);
-            KeyManager.getInstance().listen(key, OWNER,
-                    new CommonCallbacks.KeyListener<Boolean>() {
-                        @Override
-                        public void onValueChange(Boolean oldValue, Boolean newValue) {
-                            final boolean down = newValue != null && newValue;
-                            Log.i(TAG, "dji: " + name + (down ? " pressed" : " released")
-                                    + " -> EdgeTX switch " + (char) ('A' + index));
-                            // The joystick's raw reports carry this same button (see
-                            // RcRawJoystick): while they are feeding the firmware, this copy
-                            // would be the second press of it.
-                            if (rawBacked && RcRawJoystick.ownsInputs()) {
-                                return;
-                            }
-                            nativeOnDjiSwitch(index, down ? 1 : -1);
-                        }
-                    });
-        } catch (Throwable t) {
-            Log.w(TAG, "dji: " + name + " listen failed", t);
-        }
-    }
-
     private static void listenButtonKeys() {
-        listenSwitchButton(DJIRemoteControllerKey.KeyRecordButtonDown, "video", SWITCH_C, true);
+        // The video button latches, like the takeoff button (SA) and the pause button (SD):
+        // one press and it stays where it went. Held down it reports a press, nothing more -
+        // the SDK has no latched level for it, and the button itself is momentary - so
+        // without the toggle there is no level for a model to assign.
+        listenToggleSwitch(SWITCH_C, "video", DJIRemoteControllerKey.KeyRecordButtonDown, true);
         listenShutter();
         // The pause button is a press-only button like the takeoff one, and the model
         // wants a latched level out of it (a channel that stays high until the next
         // press), so it toggles SD instead of being high only while it is held.
-        listenToggleSwitch(SWITCH_D, "pause", DJIRemoteControllerKey.KeyPauseButtonDown);
+        listenToggleSwitch(SWITCH_D, "pause", DJIRemoteControllerKey.KeyPauseButtonDown, false);
         // C1/C2/C3 are the three positions of SF: up, middle, down. They used to be SG/SH/SI,
         // which the RC's R1/R2/R3 buttons now drive from Android key codes - SF is the one
         // that had to move onto the SDK, because only the SDK keeps reporting while the UI
@@ -615,7 +594,7 @@ public final class DjiMsdkBridge {
      * does not have that switch and the key never fires on it.
      */
     private static void listenSwitches() {
-        listenToggleSwitch(SW_SA, "takeoff", DJIRemoteControllerKey.KeyRCAuthLedButtonDown);
+        listenToggleSwitch(SW_SA, "takeoff", DJIRemoteControllerKey.KeyRCAuthLedButtonDown, false);
         listenEnumSwitch(SW_SB, DJIRemoteControllerKey.KeyFlightModeSwitchState);
     }
 
@@ -643,6 +622,7 @@ public final class DjiMsdkBridge {
     /** Where the latching switch positions are kept between runs. */
     private static final String PREFS = "link";
     private static final String PREF_TAKEOFF = "switchSA";
+    private static final String PREF_VIDEO = "switchSC";
     private static final String PREF_PAUSE = "switchSD";
     private static final String PREF_PHOTO = "switchSE";
     private static final String PREF_UPTIME = "switchUptime";
@@ -685,6 +665,9 @@ public final class DjiMsdkBridge {
         final int takeoff = prefs.getInt(PREF_TAKEOFF, 0);
         if (takeoff != 0) sToggleHigh[SW_SA] = (takeoff == SWITCH_HIGH);
 
+        final int video = prefs.getInt(PREF_VIDEO, 0);
+        if (video != 0) sToggleHigh[SWITCH_C] = (video == SWITCH_HIGH);
+
         final int pause = prefs.getInt(PREF_PAUSE, 0);
         if (pause != 0) sToggleHigh[SWITCH_D] = (pause == SWITCH_HIGH);
 
@@ -692,7 +675,8 @@ public final class DjiMsdkBridge {
         if (photo != 0) sShutterPosition = photo;
 
         Log.i(TAG, "dji: switches carried over - takeoff "
-                + (sToggleHigh[SW_SA] ? "high" : "low") + ", pause "
+                + (sToggleHigh[SW_SA] ? "high" : "low") + ", video "
+                + (sToggleHigh[SWITCH_C] ? "high" : "low") + ", pause "
                 + (sToggleHigh[SWITCH_D] ? "high" : "low") + ", photo " + sShutterPosition);
     }
 
@@ -708,7 +692,7 @@ public final class DjiMsdkBridge {
 
     /**
      * A button reporting only its press, driving a two-position EdgeTX switch: the
-     * takeoff button (SA) and the pause button (SD) both work this way.
+     * takeoff button (SA), the video button (SC) and the pause button (SD) all work this way.
      *
      * The first callback is the initial snapshot rather than a press, and the SDK also
      * reports the release half of the pulse, so only a press is acted on.
@@ -728,7 +712,7 @@ public final class DjiMsdkBridge {
      * the toggling stops being a guess.
      */
     private static void listenToggleSwitch(final int index, final String label,
-                                           DJIKeyInfo<Boolean> info) {
+                                           DJIKeyInfo<Boolean> info, boolean rawBacked) {
         try {
             final DJIKey<Boolean> key = KeyTools.createKey(info);
             KeyManager.getInstance().listen(key, OWNER,
@@ -744,14 +728,14 @@ public final class DjiMsdkBridge {
                             if (!Boolean.TRUE.equals(newValue)) {
                                 return;
                             }
-                            final boolean high;
-                            synchronized (DjiMsdkBridge.class) {
-                                sToggleHigh[index] = !sToggleHigh[index];
-                                high = sToggleHigh[index];
+                            // The joystick's raw USB reports carry this same button (see
+                            // RcRawJoystick): while they are feeding the firmware, this copy
+                            // would be the second press of it, and a second press is a second
+                            // toggle.
+                            if (rawBacked && RcRawJoystick.ownsInputs()) {
+                                return;
                             }
-                            Log.i(TAG, "dji: switch " + index + " (" + label + ") -> "
-                                    + (high ? "high" : "low"));
-                            dispatchToggle(index, high);
+                            toggleSwitch(index, label);
                         }
                     });
             dispatchToggle(index, sToggleHigh[index]);
@@ -760,9 +744,26 @@ public final class DjiMsdkBridge {
         }
     }
 
+    /**
+     * One press of a press-only button: the latched level flips and goes out. Shared by the
+     * SDK callback and by the joystick's raw reports, which see the same button.
+     */
+    private static void toggleSwitch(final int index, final String label) {
+        final boolean high;
+        synchronized (DjiMsdkBridge.class) {
+            sToggleHigh[index] = !sToggleHigh[index];
+            high = sToggleHigh[index];
+        }
+        Log.i(TAG, "dji: switch " + index + " (" + label + ") -> "
+                + (high ? "high" : "low"));
+        dispatchToggle(index, high);
+    }
+
     private static void dispatchToggle(int index, boolean high) {
         if (index == SW_SA) {
             persistSwitch(PREF_TAKEOFF, high ? SWITCH_HIGH : SWITCH_LOW);
+        } else if (index == SWITCH_C) {
+            persistSwitch(PREF_VIDEO, high ? SWITCH_HIGH : SWITCH_LOW);
         } else if (index == SWITCH_D) {
             persistSwitch(PREF_PAUSE, high ? SWITCH_HIGH : SWITCH_LOW);
         }
@@ -1191,7 +1192,7 @@ public final class DjiMsdkBridge {
     /** The record button as EdgeTX switch SC: the same thing {@code listenButtonKeys} drives. */
     static void onRawRecordButton(boolean down) {
         try {
-            nativeOnDjiSwitch(SWITCH_C, down ? 1 : -1);
+            if (down) toggleSwitch(SWITCH_C, "video");
         } catch (Throwable t) {
             Log.w(TAG, "dji: record button dispatch failed", t);
         }
