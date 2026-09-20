@@ -94,6 +94,24 @@ android {
         }
     }
 
+    androidResources {
+        // aapt2's own ignore-assets list, by name. Three data sets the SDK ships and
+        // this app never reads: the no-fly-zone databases (flysafe/, 11.8 MB), the
+        // geoid height tables (geoid_data/, 3.3 MB) and the SDK's ac.zip (4.7 MB).
+        // None of them is touched during init, registerApp() or by the Key-Value API -
+        // verified on the RC by removing them and watching the SDK come up and every
+        // input arrive. assets/ProductCapability/ is deliberately kept: it is 80 KB
+        // and the SDK does read it to find out what the connected product supports.
+        ignoreAssetsPatterns += listOf("flysafe", "geoid_data", "ac.zip")
+
+        // The SDK's resource table is 18 MB, most of it the same strings in ~80
+        // languages for a UI this app never shows. Keep the two that could ever be
+        // seen (the SDK's own messages fall back to the default locale anyway) and
+        // drop the rest; EdgeTX's own translations are not Android resources at all,
+        // they live on the simulated SD card (sdcard/LANG).
+        localeFilters += listOf("en", "zh")
+    }
+
     packaging {
         jniLibs {
             // The DJI SDK contributes ~300 MB of shared objects for a single ABI.
@@ -146,6 +164,30 @@ android {
                 // is never loaded either.
                 "**/libwpmz_jni.so",
                 "**/libDJIWaypointV2Core-CSDK.so",
+                // The same argument reaches these three: nothing in the init path needs
+                // them, and one of each pair is already excluded above, so they could
+                // not load even if something asked for them.
+                "**/libdjiwpv2-CSDK.so",     // needs libDJIWaypointV2Core-CSDK.so (gone)
+                "**/libDJIOpus.so",          // needs libopuspilot + all of ffmpeg (gone)
+                "**/libavutil.so",           // the last ffmpeg leftover, only libDJIOpus used it
+                // Payload and obstacle-mapping stack: libPPAL (payload pal) on top of
+                // octomap, 8.4 MB of the APK for a payload manager this app never talks
+                // to. Nothing in the APK links against any of the four.
+                "**/libPPAL.so",
+                "**/libppal-jni.so",
+                "**/liboctomap.so",
+                "**/liboctomath.so",
+                // Nothing smaller is worth taking out. Everything else that no library
+                // links against is loaded by the SDK itself, by name, while it
+                // initialises - tried one batch here and the first missing name stops
+                // init dead:
+                //   System.loadLibrary("constants") -> libconstants.so
+                //   ...                     "waes"  -> libwaes.so
+                //   ...                     "xcrash"-> libxcrash.so
+                //   ...                     "hash"  -> libhash.so
+                // So they all stay; between them they are well under 1 MB anyway.
+                // libdataclx.so and libSdkyclx_clx.so stay as well: MSDK 5.10+ needs the
+                // class relocator installed before any SDK class is touched.
             )
         }
     }
