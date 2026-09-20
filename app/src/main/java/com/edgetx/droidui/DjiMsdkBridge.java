@@ -403,7 +403,8 @@ public final class DjiMsdkBridge {
         }
     }
 
-    private static void listenSwitchButton(DJIKeyInfo<Boolean> info, String name, int index) {
+    private static void listenSwitchButton(DJIKeyInfo<Boolean> info, String name, int index,
+                                           boolean rawBacked) {
         try {
             final DJIKey<Boolean> key = KeyTools.createKey(info);
             KeyManager.getInstance().listen(key, OWNER,
@@ -413,6 +414,12 @@ public final class DjiMsdkBridge {
                             final boolean down = newValue != null && newValue;
                             Log.i(TAG, "dji: " + name + (down ? " pressed" : " released")
                                     + " -> EdgeTX switch " + (char) ('A' + index));
+                            // The joystick's raw reports carry this same button (see
+                            // RcRawJoystick): while they are feeding the firmware, this copy
+                            // would be the second press of it.
+                            if (rawBacked && RcRawJoystick.ownsInputs()) {
+                                return;
+                            }
                             nativeOnDjiSwitch(index, down ? 1 : -1);
                         }
                     });
@@ -422,7 +429,7 @@ public final class DjiMsdkBridge {
     }
 
     private static void listenButtonKeys() {
-        listenSwitchButton(DJIRemoteControllerKey.KeyRecordButtonDown, "video", SWITCH_C);
+        listenSwitchButton(DJIRemoteControllerKey.KeyRecordButtonDown, "video", SWITCH_C, true);
         listenShutter();
         // The pause button is a press-only button like the takeoff one, and the model
         // wants a latched level out of it (a channel that stays high until the next
@@ -1001,7 +1008,7 @@ public final class DjiMsdkBridge {
         noteStickChange(axis);
         markStickSeen(axis);
         RcRawJoystick.noteSdkStick(axis, raw);
-        if (RcRawJoystick.sticksOwned()) {
+        if (RcRawJoystick.ownsInputs()) {
             return;
         }
         try {
@@ -1018,7 +1025,7 @@ public final class DjiMsdkBridge {
      */
     private static void dispatchDial(int dial, int value) {
         RcRawJoystick.noteSdkDial(dial, value);
-        if (RcRawJoystick.sticksOwned()) {
+        if (RcRawJoystick.ownsInputs()) {
             return;
         }
         try {
@@ -1140,6 +1147,11 @@ public final class DjiMsdkBridge {
         if (status == null) {
             return;
         }
+        // The raw reports carry the same five directions (byte 17), see RcRawJoystick: while
+        // they are feeding the firmware, this copy would be a second press of every one.
+        if (RcRawJoystick.ownsInputs()) {
+            return;
+        }
         edge(0, status.getUpwards(), BTN_UP);
         edge(1, status.getDownwards(), BTN_DOWN);
         edge(2, status.getLeftwards(), BTN_LEFT);
@@ -1162,6 +1174,26 @@ public final class DjiMsdkBridge {
             nativeOnDjiButton(buttonId);
         } catch (Throwable t) {
             Log.w(TAG, "dji: native button dispatch failed", t);
+        }
+    }
+
+    /**
+     * The 5-way and the record button are also in the joystick's raw USB reports, and
+     * {@link RcRawJoystick} feeds them through these two while it is running. They land in
+     * exactly the places the SDK's own callbacks use, so the trim mode, the key map and the
+     * 5-way's centring rules apply unchanged - and on a remote whose SDK data never arrives
+     * they are then the only source for these two controls at all.
+     */
+    static void onRawFiveWay(int buttonId) {
+        dispatch(buttonId);
+    }
+
+    /** The record button as EdgeTX switch SC: the same thing {@code listenButtonKeys} drives. */
+    static void onRawRecordButton(boolean down) {
+        try {
+            nativeOnDjiSwitch(SWITCH_C, down ? 1 : -1);
+        } catch (Throwable t) {
+            Log.w(TAG, "dji: record button dispatch failed", t);
         }
     }
 

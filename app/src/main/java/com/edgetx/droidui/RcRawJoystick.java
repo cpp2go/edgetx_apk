@@ -56,17 +56,22 @@ import java.util.concurrent.TimeoutException;
  *          4  left horizontal   6  left vertical
  *          8  right horizontal 10  right vertical
  *         12  left dial        14  right dial
- *  16-17 buttons, one bit each: 16 bit 1 = RTN, 17 bits 0..4 = the 5-way
- *        (up, down, left, right, centre - confirmed by pressing each in turn)
+ *  16-17 buttons, one bit each: 16 bit 1 = RTN, 16 bit 2 = the record button,
+ *        17 bits 0..4 = the 5-way (up, down, left, right, centre - confirmed by
+ *        pressing each in turn). Nothing else on the RC is in these reports: the
+ *        takeoff, flight mode, pause, shutter, C1..C3, go-home and scroll wheel
+ *        buttons were all pressed while this reader held the interface and not one
+ *        byte moved, so those still come from the SDK.
  * </pre>
  *
  * <p><b>How it is used.</b> The six axes are pushed into exactly the entry points the SDK
- * uses ({@link DjiMsdkBridge#nativeOnDjiStick}, {@link DjiMsdkBridge#nativeOnDjiDial}), so
- * nothing downstream changes. The SDK keeps running and stays the fallback: as long as
- * this reader is feeding the axes ({@link #sticksOwned()}) the SDK's stick and dial values
- * are counted for the rate line but not pushed, and if this reader ever stops - the device
- * taken away, the app moved to the background and killed - the SDK takes the axes back
- * without a restart.
+ * uses ({@link DjiMsdkBridge#nativeOnDjiStick}, {@link DjiMsdkBridge#nativeOnDjiDial}), and
+ * so are the buttons the reports carry, so nothing downstream changes. The SDK keeps
+ * running and stays the fallback: as long as this reader is feeding the firmware
+ * ({@link #ownsInputs()}) the SDK's copies of the same inputs are ignored, and if this
+ * reader ever stops - the device taken away, the app moved to the background and killed -
+ * the SDK takes them back without a restart. Everything the reports do not carry is
+ * unaffected either way.
  *
  * <p>Verbose logging (one line per change in a frame, plus the SDK-versus-raw comparison)
  * is enabled only while the trigger file {@code hid_probe} exists next to the app's
@@ -102,11 +107,21 @@ final class RcRawJoystick {
      */
     private static final int[] AXIS_SIGN = {1, 1, 1, 1, 1, 1};
 
-    /** 5-way bits in byte 17, low bit first. RTN is byte 16 bit 1. */
+    /** What the 5-way's five directions are called: byte 17, low bit first. */
     private static final String[] FIVE_WAY_NAMES = {"up", "down", "left", "right", "centre"};
 
-    /** The return button's bit, in byte 16. */
+    /** Those five bits, in the same order. */
+    private static final int[] FIVE_WAY_BITS = {0x01, 0x02, 0x04, 0x08, 0x10};
+
+    /** And what joystick.cpp calls them - the ids the SDK's own 5-way reports. */
+    private static final int[] FIVE_WAY_IDS = {
+            DjiMsdkBridge.BTN_UP, DjiMsdkBridge.BTN_DOWN, DjiMsdkBridge.BTN_LEFT,
+            DjiMsdkBridge.BTN_RIGHT, DjiMsdkBridge.BTN_PRESS,
+    };
+
+    /** Byte 16 carries two buttons: bit 1 is the return button, bit 2 the record button. */
     private static final int RTN_BIT = 0x02;
+    private static final int RECORD_BIT = 0x04;
 
     /**
      * If the device stops delivering for this long the reader gives the interface back
@@ -131,9 +146,10 @@ final class RcRawJoystick {
     /** Last SDK value per axis, for the verbose comparison line. */
     private static final int[] sSdkValue = new int[AXIS_COUNT];
 
-    /** The return button's state, so only its edges are sent on. */
-    private static boolean sRtnKnown;
-    private static boolean sRtnDown;
+    /** The two button bytes as last seen, so only real edges are sent on. */
+    private static boolean sButtonsKnown;
+    private static int sButtonFirst;
+    private static int sButtonSecond;
 
     static {
         for (int index = 0; index < AXIS_COUNT; index++) {
@@ -204,10 +220,12 @@ final class RcRawJoystick {
     }
 
     /**
-     * Whether the axes are currently coming from here. While they are, the SDK's own stick
-     * and dial values are worth counting but not worth pushing: they are up to 90 ms older.
+     * Whether this reader is feeding the firmware at the moment - the sticks, the dials, the
+     * 5-way and the record button. While it is, the SDK's own copies of those are only
+     * older, and for the 5-way they would be a second press of the same button; everything
+     * the reports do not carry still comes from the SDK.
      */
-    static boolean sticksOwned() {
+    static boolean ownsInputs() {
         return sOwned;
     }
 
@@ -353,7 +371,6 @@ final class RcRawJoystick {
 
                 if (sVerbose) {
                     logFrame(logs, frame, length, lastReportMs - start);
-                    logButtons(frame, length);
                 }
 
                 if (lastReportMs - windowStart >= STATUS_MS) {
@@ -406,7 +423,8 @@ final class RcRawJoystick {
 
         if (!sOwned) {
             sOwned = true;
-            Log.i(TAG, "raw joystick: the sticks and dials now come from the raw reports");
+            Log.i(TAG, "raw joystick: the sticks, dials and buttons now come from the "
+                    + "raw reports");
         }
     }
 
@@ -419,24 +437,71 @@ final class RcRawJoystick {
      * this reader holds the interface. The 5-way is unaffected.
      */
     private static void pushButtons(byte[] data, int length) {
-        if (length <= BUTTON_FIRST) {
+        if (length <= BUTTON_LAST) {
             return;
         }
-        final boolean rtn = (data[BUTTON_FIRST] & RTN_BIT) != 0;
-        if (sRtnKnown && rtn == sRtnDown) {
+        final int first = data[BUTTON_FIRST] & 0xFF;
+        final int second = data[BUTTON_LAST] & 0xFF;
+        if (sButtonsKnown && first == sButtonFirst && second == sButtonSecond) {
             return;
         }
-        sRtnKnown = true;
-        sRtnDown = rtn;
+        final int wasFirst = sButtonFirst;
+        final int wasSecond = sButtonSecond;
+        sButtonsKnown = true;
+        sButtonFirst = first;
+        sButtonSecond = second;
+
         if (sVerbose) {
-            Log.i(TAG, "raw joystick: RTN " + (rtn ? "down" : "up"));
+            Log.i(TAG, "raw joystick: buttons " + hex2(first) + ' ' + hex2(second)
+                    + namedButtons(first, second));
         }
-        try {
-            nativeOnRawKey(KeyEvent.KEYCODE_BACK, rtn);
-        } catch (Throwable t) {
-            // Worth a line: it means the button is dead, not that something is uninteresting.
-            Log.w(TAG, "raw joystick: RTN could not be delivered", t);
+
+        if (((wasFirst ^ first) & RTN_BIT) != 0) {
+            try {
+                nativeOnRawKey(KeyEvent.KEYCODE_BACK, (first & RTN_BIT) != 0);
+            } catch (Throwable t) {
+                // Worth a line: it means the button is dead, not that nothing is interesting.
+                Log.w(TAG, "raw joystick: RTN could not be delivered", t);
+            }
         }
+
+        if (((wasFirst ^ first) & RECORD_BIT) != 0) {
+            try {
+                DjiMsdkBridge.onRawRecordButton((first & RECORD_BIT) != 0);
+            } catch (Throwable t) {
+                Log.w(TAG, "raw joystick: the record button could not be delivered", t);
+            }
+        }
+
+        for (int bit = 0; bit < FIVE_WAY_BITS.length; bit++) {
+            // A direction is a level, as it is in the SDK: only the press is passed on, and
+            // only its rising edge.
+            if ((second & FIVE_WAY_BITS[bit]) != 0 && (wasSecond & FIVE_WAY_BITS[bit]) == 0) {
+                try {
+                    DjiMsdkBridge.onRawFiveWay(FIVE_WAY_IDS[bit]);
+                } catch (Throwable t) {
+                    Log.w(TAG, "raw joystick: 5-way " + FIVE_WAY_NAMES[bit]
+                            + " could not be delivered", t);
+                }
+            }
+        }
+    }
+
+    /** The buttons a frame carries, named - for the verbose log only. */
+    private static String namedButtons(int first, int second) {
+        final StringBuilder text = new StringBuilder();
+        if ((first & RTN_BIT) != 0) {
+            text.append("RTN ");
+        }
+        if ((first & RECORD_BIT) != 0) {
+            text.append("record ");
+        }
+        for (int bit = 0; bit < FIVE_WAY_BITS.length; bit++) {
+            if ((second & FIVE_WAY_BITS[bit]) != 0) {
+                text.append(FIVE_WAY_NAMES[bit]).append(' ');
+            }
+        }
+        return text.length() == 0 ? " (none)" : " (" + text.toString().trim() + ')';
     }
 
     /** Writes one line per change in a frame, with what moved. */
@@ -452,40 +517,6 @@ final class RcRawJoystick {
         }
         log.accept(data, length, elapsedMs);
     }
-
-    /** Byte 16 bit 1 is RTN, byte 17 bits 0-4 are the 5-way. */
-    private static void logButtons(byte[] data, int length) {
-        if (length <= BUTTON_LAST) {
-            return;
-        }
-        final int rtn = data[BUTTON_FIRST] & 0xFF;
-        final int fiveWay = data[BUTTON_LAST] & 0xFF;
-        if (fiveWay == sLastFiveWay && rtn == sLastRtn && sButtonsSeen) {
-            return;
-        }
-        sButtonsSeen = true;
-        sLastRtn = rtn;
-        sLastFiveWay = fiveWay;
-
-        final StringBuilder text = new StringBuilder();
-        if ((rtn & RTN_BIT) != 0) {
-            text.append("RTN");
-        }
-        for (int bit = 0; bit < FIVE_WAY_NAMES.length; bit++) {
-            if ((fiveWay & (1 << bit)) != 0) {
-                if (text.length() > 0) {
-                    text.append(' ');
-                }
-                text.append(FIVE_WAY_NAMES[bit]);
-            }
-        }
-        Log.i(TAG, "raw joystick: buttons " + hex2(rtn) + ' ' + hex2(fiveWay) + " ("
-                + (text.length() == 0 ? "none" : text) + ") | " + describeAxes());
-    }
-
-    private static int sLastRtn = -1;
-    private static int sLastFiveWay = -1;
-    private static boolean sButtonsSeen;
 
     /** The six axes as SDK-style numbers, for the log lines. */
     private static String describeAxes() {
