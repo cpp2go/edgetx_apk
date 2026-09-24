@@ -53,12 +53,23 @@
          without it the card stays in the app's own directory (see prepare_sd_root). -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
+    <!-- Android 10 has no "All files access" at all (MANAGE_EXTERNAL_STORAGE starts at
+         API 30), and the RC Pro is Android 10: there the same card is written with the
+         legacy permission instead, which is why it is declared for API 29 and below only.
+         requestLegacyExternalStorage on the application is the other half: an app
+         targeting 30+ is otherwise put into scoped storage on Android 10 as well, and
+         "/storage/emulated/0/EdgeTX" would not be writable even with this permission. -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29" />
+
     <application
         android:name=".EdgeTxApplication"
         android:label="EdgeTX"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher"
         android:allowBackup="false"
+        android:requestLegacyExternalStorage="true"
         android:supportsRtl="false">
 
         <!-- DJI Mobile SDK App Key. Empty unless dji.appKey is set in
@@ -67,8 +78,12 @@
             android:name="com.dji.sdk.API_KEY"
             android:value="${djiAppKey}" />
 
+        <!-- EdgeTxActivity is NativeActivity with onCreate added: it asks for
+             WRITE_EXTERNAL_STORAGE on Android 10, where there is no "All files access" and the
+             card would otherwise land where no file manager can reach it. The native app runs
+             from NativeActivity exactly as before, which is what the meta-data below needs. -->
         <activity
-            android:name="android.app.NativeActivity"
+            android:name=".EdgeTxActivity"
             android:exported="true"
             android:launchMode="singleTask"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize|uiMode|density"
