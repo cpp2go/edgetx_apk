@@ -323,6 +323,9 @@ public final class DjiMsdkBridge {
         probe("scrollWheel", DJIRemoteControllerKey.KeyScrollWheel);
         probe("flightMode", DJIRemoteControllerKey.KeyFlightModeSwitchState);
         probe("softSwitchMode", DJIRemoteControllerKey.KeySoftSwitchMode);
+        probe("flightModeString", DJIFlightControllerKey.KeyFlightModeString);
+        probe("fcSwitchMode", DJIFlightControllerKey.KeyFCRemoteControllerSwitchMode);
+        probe("fcFlightMode", DJIFlightControllerKey.KeyFCFlightMode);
         probe("transform", DJIRemoteControllerKey.KeyRCTransformationSwitchState);
         probe("uavLock", DJIRemoteControllerKey.KeyUavLockStatus);
         probe("machineMode", DJIRemoteControllerKey.KeyRcMachineMode);
@@ -335,6 +338,9 @@ public final class DjiMsdkBridge {
         reportSupport("appWorkStage", DJIRemoteControllerKey.KeyRcAppWorkStage);
         reportSupport("customBtnFunction", DJIRemoteControllerKey.KeyCustomBtnFunction);
         reportSupport("machineMode", DJIRemoteControllerKey.KeyRcMachineMode);
+        reportSupport("flightModeString", DJIFlightControllerKey.KeyFlightModeString);
+        reportSupport("fcSwitchMode", DJIFlightControllerKey.KeyFCRemoteControllerSwitchMode);
+        reportSupport("fcFlightMode", DJIFlightControllerKey.KeyFCFlightMode);
     }
 
     /**
@@ -776,6 +782,61 @@ public final class DjiMsdkBridge {
         // the set (flight-mode key included) was null. Two keys, one switch, and
         // applySwitchPosition() drops a repeat, so neither can move SB twice.
         listenEnumSwitch(SW_SB, "softSwitchMode", DJIRemoteControllerKey.KeySoftSwitchMode);
+        // And a third time as a string. Same switch, same three positions, published under yet
+        // another name - which matters because the SDK's silences are not the same for every
+        // key: whichever of the three answers first is the one that moves SB, and
+        // applyPosition() drops the copies of the ones that follow.
+        listenFlightModeString();
+    }
+
+    /**
+     * The flight-mode switch as {@code DJIFlightControllerKey.KeyFlightModeString} reports it.
+     *
+     * <p>It sits on the flight-controller side, so it may well stay quiet without an aircraft -
+     * but it is the string form of the same C/N/S switch, and the SDK's silences are not the same
+     * for every key, so it is worth listening to regardless.
+     *
+     * <p>Every value is logged, because the strings are the SDK's and not documented anywhere this
+     * was written from - the mapping below is the reading that fits the switch's own labels (C, N,
+     * S) and the names of the two enumerations beside it: TRIPOD / POSITION / SPORT on the remote,
+     * CINEMATIC / GPS_NORMAL / GPS_SPORT and GPS / SPORT / ATTITUDE behind it. A value that is not
+     * recognised moves nothing and says so, so a wrong reading cannot move the switch at all.
+     */
+    private static void listenFlightModeString() {
+        try {
+            final DJIKey<String> key =
+                    KeyTools.createKey(DJIFlightControllerKey.KeyFlightModeString);
+            KeyManager.getInstance().listen(key, OWNER,
+                    new CommonCallbacks.KeyListener<String>() {
+                        @Override
+                        public void onValueChange(String oldValue, String newValue) {
+                            noteKeyValue("flightModeString", newValue);
+                            Log.i(TAG, "dji: flightModeString " + oldValue + " -> " + newValue);
+                            final Integer position = positionFromFlightModeString(newValue);
+                            if (position == null) {
+                                Log.i(TAG, "dji: flightModeString value not recognised, ignored");
+                                return;
+                            }
+                            applyPosition(SW_SB, position);
+                        }
+                    });
+        } catch (Throwable t) {
+            Log.w(TAG, "dji: flightModeString listen failed", t);
+        }
+    }
+
+    /** C (top), N (middle) or S (bottom) out of whatever the SDK calls them. */
+    private static Integer positionFromFlightModeString(String value) {
+        if (value == null) {
+            return null;
+        }
+        final String text = value.trim().toUpperCase(java.util.Locale.US);
+        // The top of the switch is EdgeTX's down, the same way round as the other two keys.
+        if (text.contains("CINE") || text.contains("TRIPOD") || text.equals("C")) return 1;
+        if (text.contains("NORMAL") || text.contains("POSITION") || text.contains("GPS")
+                || text.equals("N")) return 0;
+        if (text.contains("SPORT") || text.contains("ATTITUDE") || text.equals("S")) return -1;
+        return null;
     }
 
     /**
@@ -1071,11 +1132,19 @@ public final class DjiMsdkBridge {
      */
     private static void applySwitchPosition(final int index, Object value) {
         final Integer state = switchPosition(value);
-        if (state == null || state == sLastSwitchPosition[index]) {
-            return;               // UNKNOWN, a key that went silent, or nothing new
+        if (state == null) {
+            return;               // UNKNOWN, or a key that went silent
+        }
+        applyPosition(index, state);
+    }
+
+    /** One position, already decoded, from any of the keys that carry this switch. */
+    private static void applyPosition(final int index, final int state) {
+        if (state == sLastSwitchPosition[index]) {
+            return;               // nothing new: a second key reporting the same position
         }
         sLastSwitchPosition[index] = state;
-        Log.i(TAG, "dji: switch " + index + " <- " + value);
+        Log.i(TAG, "dji: switch " + index + " -> " + (state > 0 ? "down" : state < 0 ? "up" : "mid"));
         try {
             nativeOnDjiSwitch(index, state);
         } catch (Throwable t) {
