@@ -84,6 +84,11 @@ public class EdgeTxApplication extends Application {
         // DJI SDK publishes them at 8-14 Hz while the device itself produces a new
         // position every 2.5 ms. The SDK stays as the fallback, see RcRawJoystick.
         RcRawJoystick.start(this);
+
+        // The buttons the remote's own handler logs, which on the RC Pro is the reliable
+        // source for the pause, landing and custom buttons. Inert without READ_LOGS, see
+        // RcDpadLog - the SDK paths then behave exactly as they did before.
+        RcDpadLog.start();
     }
 
     /** True in the process that exists only to carry the USB device filter. */

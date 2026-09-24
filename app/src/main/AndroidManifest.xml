@@ -12,6 +12,21 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!-- RcDpadLog: the remote's own key handler writes every button it handles to logcat,
+         and on the RC Pro that is the only reliable source for the pause, landing, C1 and
+         C2 buttons (the DJI SDK sets its whole key set to null in waves and loses presses
+         made during one).
+
+         READ_LOGS is signature-level, so it is NOT granted by the installer: the app runs
+         fine without it, and only those buttons are missing. To turn it on, once per remote:
+
+             adb shell pm grant com.edgetx.droidui android.permission.READ_LOGS
+
+         Without the declaration above that grant fails with "has not requested permission",
+         which is why the permission is always in the manifest even though nothing else needs
+         it. Nothing is read from the log except the lines RcDpadLog parses. -->
+    <uses-permission android:name="android.permission.READ_LOGS" />
+
     <!-- The RF module is attached to the RC's USB port as a USB serial
          device (see RcModuleSerial.java). Not required: the app is fully usable
          without a module, it just has no transmitter behind it. -->

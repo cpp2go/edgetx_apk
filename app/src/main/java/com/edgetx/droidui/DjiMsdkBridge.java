@@ -3,6 +3,7 @@ package com.edgetx.droidui;
 import android.app.Application;
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.os.Build;
 import android.os.SystemClock;
 import android.util.Log;
 
@@ -17,12 +18,15 @@ import dji.sdk.keyvalue.value.remotecontroller.RcCustomButtonEvent;
 import dji.sdk.keyvalue.value.remotecontroller.RcCustomButtonHardwareStatus;
 import dji.sdk.keyvalue.value.remotecontroller.RCFlightModeSwitch;
 import dji.sdk.keyvalue.value.remotecontroller.RCTransformationSwitchState;
+import dji.sdk.keyvalue.value.remotecontroller.RcSoftSwitchMode;
 import dji.v5.common.callback.CommonCallbacks;
 import dji.v5.common.error.IDJIError;
 import dji.v5.common.register.DJISDKInitEvent;
 import dji.v5.manager.KeyManager;
 import dji.v5.manager.SDKManager;
 import dji.v5.manager.interfaces.SDKManagerCallback;
+
+import java.io.File;
 
 /**
  * Reads remote-controller buttons through the DJI Mobile SDK.
@@ -49,6 +53,20 @@ public final class DjiMsdkBridge {
     private static final Object OWNER = new Object();
     private static DJIKey<RcCustomButtonEvent> sButtonKey;
     private static boolean sListening;
+
+    /**
+     * Which SDK key a remote's buttons answer on is not documented and not the same on
+     * different remotes: the RC Plus 2 fires the plain Boolean keys while several of them
+     * never arrive from an RC Pro at all. With the trigger file {@link #PROBE_TRIGGER} next
+     * to the app's external files every button key the SDK has is listened to and logged, so
+     * a new remote can be identified by pressing one control at a time and reading which key
+     * answered. Nothing else changes while it is off, and no probe listener is installed.
+     */
+    private static final String PROBE_TRIGGER = "hid_probe";
+    private static volatile boolean sProbe;
+
+    /** A separate owner, so a probed key can also be one the normal code listens to. */
+    private static final Object PROBE_OWNER = new Object();
 
     static {
         // libedgetx_ui.so is normally loaded by NativeActivity, which registers it
@@ -192,6 +210,13 @@ public final class DjiMsdkBridge {
         sPrefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         restoreLatchedSwitches();
 
+        // Verbose input diagnostics, decided once at start (see PROBE_TRIGGER).
+        try {
+            sProbe = new File(app.getExternalFilesDir(null), PROBE_TRIGGER).isFile();
+        } catch (Throwable t) {
+            sProbe = false;
+        }
+
         if (SDKManager.getInstance().isRegistered()) {
             listen();
             return;
@@ -262,6 +287,7 @@ public final class DjiMsdkBridge {
             listenArmState();
             listenBattery();
             listenDials();
+            if (sProbe) probeKeys();
             Log.i(TAG, "dji: registered, product category "
                     + SDKManager.getInstance().getProductCategory());
             sListening = true;
@@ -270,6 +296,77 @@ public final class DjiMsdkBridge {
         } catch (Throwable t) {
             Log.w(TAG, "dji: listen failed", t);
             markInputsReady("listening failed");
+        }
+    }
+
+    /**
+     * Every button key the SDK has, logged as it changes. Only ever installed while the
+     * trigger file exists - see {@link #PROBE_TRIGGER}. The names are the key names with the
+     * {@code Key...Down} noise removed, because a name like {@code goHome} that never fires
+     * while the physical button works is exactly the answer this probe is after.
+     */
+    private static void probeKeys() {
+        Log.i(TAG, "dji: key probe on, listening to every button key the SDK has");
+        probe("record", DJIRemoteControllerKey.KeyRecordButtonDown);
+        probe("shutter", DJIRemoteControllerKey.KeyShutterButtonDown);
+        probe("shutterLongPress", DJIRemoteControllerKey.KeyRCShutterButtonLongPress);
+        probe("authLed", DJIRemoteControllerKey.KeyRCAuthLedButtonDown);
+        probe("pause", DJIRemoteControllerKey.KeyPauseButtonDown);
+        probe("goHome", DJIRemoteControllerKey.KeyGoHomeButtonDown);
+        probe("C1", DJIRemoteControllerKey.KeyCustomButton1Down);
+        probe("C2", DJIRemoteControllerKey.KeyCustomButton2Down);
+        probe("C3", DJIRemoteControllerKey.KeyCustomButton3Down);
+        probe("C4", DJIRemoteControllerKey.KeyRCCustomButton4Down);
+        probe("rcSwitch", DJIRemoteControllerKey.KeyRCSwitchButtonDown);
+        probe("playback", DJIRemoteControllerKey.KeyRCPlaybackButtonDown);
+        probe("rightWheel", DJIRemoteControllerKey.KeyRCRightWheelButtonDown);
+        probe("scrollWheel", DJIRemoteControllerKey.KeyScrollWheel);
+        probe("flightMode", DJIRemoteControllerKey.KeyFlightModeSwitchState);
+        probe("softSwitchMode", DJIRemoteControllerKey.KeySoftSwitchMode);
+        probe("transform", DJIRemoteControllerKey.KeyRCTransformationSwitchState);
+        probe("uavLock", DJIRemoteControllerKey.KeyUavLockStatus);
+        probe("machineMode", DJIRemoteControllerKey.KeyRcMachineMode);
+        reportSupport("flightMode", DJIRemoteControllerKey.KeyFlightModeSwitchState);
+        reportSupport("softSwitchMode", DJIRemoteControllerKey.KeySoftSwitchMode);
+        reportSupport("transform", DJIRemoteControllerKey.KeyRCTransformationSwitchState);
+        reportSupport("hardwareState", DJIRemoteControllerKey.KeyRcHardwareState);
+        reportSupport("buttonEventPro", DJIRemoteControllerKey.KeyRcButtonEventPro);
+        reportSupport("checkStatus", DJIRemoteControllerKey.KeyRcCheckStatus);
+        reportSupport("appWorkStage", DJIRemoteControllerKey.KeyRcAppWorkStage);
+        reportSupport("customBtnFunction", DJIRemoteControllerKey.KeyCustomBtnFunction);
+        reportSupport("machineMode", DJIRemoteControllerKey.KeyRcMachineMode);
+    }
+
+    /**
+     * Whether the SDK has a handler for a key on this remote at all.
+     *
+     * <p>Worth asking because "the key never calls back" has two very different causes: the remote
+     * does not publish it, or the SDK has nothing behind the name here. This is the same question
+     * the direct getValue() answers with REQUEST_HANDLER_NOT_FOUND for the flight-mode switch.
+     */
+    private static <T> void reportSupport(final String name, DJIKeyInfo<T> info) {
+        try {
+            final boolean supported = KeyManager.getInstance().isKeySupported(createKeyOf(info));
+            Log.i(TAG, "dji: key " + name + (supported ? " is supported" : " is NOT supported")
+                    + " on this remote");
+        } catch (Throwable t) {
+            Log.w(TAG, "dji: could not ask about " + name, t);
+        }
+    }
+
+    /** One probed key: every callback, initial snapshot included. */
+    private static <T> void probe(String name, DJIKeyInfo<T> info) {
+        try {
+            KeyManager.getInstance().listen(KeyTools.createKey(info), PROBE_OWNER,
+                    new CommonCallbacks.KeyListener<T>() {
+                        @Override
+                        public void onValueChange(T oldValue, T newValue) {
+                            Log.i(TAG, "dji: probe " + name + " " + oldValue + " -> "
+                                    + newValue);
+                        }
+                    });
+        } catch (Throwable t) {
+            Log.w(TAG, "dji: probe " + name + " could not listen", t);
         }
     }
 
@@ -307,8 +404,24 @@ public final class DjiMsdkBridge {
                             if (newValue == null) {
                                 return;
                             }
-                            Log.i(TAG, "dji: rc hardware 5-way "
-                                    + describe(newValue.getFiveDimensionPressStatus()));
+                            // A level, pushed every few hundred milliseconds even when
+                            // nothing is held, so only a change is worth a line. The C1..C4
+                            // flags ride along because on some remotes they are the only
+                            // place a custom button shows up at all.
+                            final String state =
+                                    describe(newValue.getFiveDimensionPressStatus())
+                                    + " c1=" + newValue.getIsC1Click()
+                                    + " c2=" + newValue.getIsC2Click()
+                                    + " c3=" + newValue.getIsC3Click()
+                                    + " c4=" + newValue.getIsC4Click();
+                            synchronized (DjiMsdkBridge.class) {
+                                if (state.equals(sLastHardwareState) && !sProbe) {
+                                    dispatchFiveDimension(newValue.getFiveDimensionPressStatus());
+                                    return;
+                                }
+                                sLastHardwareState = state;
+                            }
+                            Log.i(TAG, "dji: rc hardware " + state);
                             dispatchFiveDimension(newValue.getFiveDimensionPressStatus());
                         }
                     });
@@ -336,9 +449,9 @@ public final class DjiMsdkBridge {
     // Measured on the RC: all of them fire. The shutter is the odd one - it reports a press
     // but not its half press, so it drives a switch of its own, see listenShutter().
 
-    static final int SWITCH_C = 2;   // video button
-    static final int SWITCH_D = 3;   // pause button
-    static final int SWITCH_E = 4;   // photo/shutter button, three positions
+    static final int SWITCH_C = 2;   // video on the RC Plus 2, pause on the RC Pro (see SLOT_*)
+    static final int SWITCH_D = 3;   // pause on the RC Plus 2, video on the RC Pro
+    static final int SWITCH_E = 4;   // photo on the RC Plus 2, round button on the RC Pro (SLOT_*)
     static final int SWITCH_F = 5;   // C1/C2/C3 pick its position (see listenButtonKeys)
     static final int SWITCH_G = 6;   // R1 button - Android key code F4, see joystick.cpp
     static final int SWITCH_H = 7;   // R2 button
@@ -375,8 +488,30 @@ public final class DjiMsdkBridge {
         sShutterPosition = position;
         persistSwitch(PREF_PHOTO, position);
         Log.i(TAG, "dji: shutter -> switch E " + (position > 0 ? "low" : "high"));
-        nativeOnDjiSwitch(SWITCH_E, position);
+        nativeOnDjiSwitch(SLOT_PHOTO, position);
     }
+
+    /**
+     * One edge of the photo button, from either of the two sources that carry it.
+     *
+     * <p>Both do: the SDK's {@code KeyShutterButtonDown} and the joystick's raw report (byte
+     * 16, bit 0x08). Which one arrives - and in what order - depends on the remote and on the
+     * press itself: on the RC Pro the report is the reliable one and the SDK key fires only
+     * now and then, while on the RC Plus 2 it is the other way round. A press that both
+     * deliver would otherwise step SE twice and leave it where it started, which is exactly
+     * how it looked before this existed (measured: "shutter -> low" 46 ms before "shutter ->
+     * high" on one press out of four). One physical press is one step, so the second copy is
+     * dropped - the rule the record and pause buttons already use, see noteButtonState().
+     */
+    private static void shutterEdge(boolean down) {
+        if (!noteButtonState(SLOT_PHOTO, down)) {
+            return;
+        }
+        setShutterPosition(sShutterPosition > 0 ? SHUTTER_HIGH : SHUTTER_LOW);
+    }
+
+    /** Last RC hardware state written to the log, so an unchanged level is not logged. */
+    private static String sLastHardwareState;
 
     private static void listenShutter() {
         try {
@@ -387,17 +522,16 @@ public final class DjiMsdkBridge {
                         @Override
                         public void onValueChange(Boolean oldValue, Boolean newValue) {
                             Log.i(TAG, "dji: shutter " + oldValue + " -> " + newValue);
-                            if (!Boolean.TRUE.equals(newValue)) {
-                                return;   // the initial snapshot, or the release half
+                            if (oldValue == null) {
+                                return;   // the SDK's initial snapshot, not a release
                             }
-                            setShutterPosition(sShutterPosition > 0
-                                    ? SHUTTER_HIGH : SHUTTER_LOW);
+                            shutterEdge(Boolean.TRUE.equals(newValue));
                         }
                     });
 
             // SE latches, so a restart brings back the position of the last press; the middle
             // position is where it sits until the first one.
-            nativeOnDjiSwitch(SWITCH_E, sShutterPosition);
+            nativeOnDjiSwitch(SLOT_PHOTO, sShutterPosition);
         } catch (Throwable t) {
             Log.w(TAG, "dji: shutter listen failed", t);
         }
@@ -408,19 +542,34 @@ public final class DjiMsdkBridge {
         // one press and it stays where it went. Held down it reports a press, nothing more -
         // the SDK has no latched level for it, and the button itself is momentary - so
         // without the toggle there is no level for a model to assign.
-        listenToggleSwitch(SWITCH_C, "video", DJIRemoteControllerKey.KeyRecordButtonDown, true);
+        listenToggleSwitch(SLOT_VIDEO, "video", DJIRemoteControllerKey.KeyRecordButtonDown, true,
+                false);
         listenShutter();
         // The pause button is a press-only button like the takeoff one, and the model
         // wants a latched level out of it (a channel that stays high until the next
         // press), so it toggles SD instead of being high only while it is held.
-        listenToggleSwitch(SWITCH_D, "pause", DJIRemoteControllerKey.KeyPauseButtonDown, false);
+        listenToggleSwitch(SLOT_PAUSE, "pause", DJIRemoteControllerKey.KeyPauseButtonDown, false,
+                true);
         // C1/C2/C3 are the three positions of SF: up, middle, down. They used to be SG/SH/SI,
         // which the RC's R1/R2/R3 buttons now drive from Android key codes - SF is the one
         // that had to move onto the SDK, because only the SDK keeps reporting while the UI
         // is closed (key events need a focused window).
-        listenPositionButton(DJIRemoteControllerKey.KeyCustomButton1Down, "C1", SWITCH_F, -1);
-        listenPositionButton(DJIRemoteControllerKey.KeyCustomButton2Down, "C2", SWITCH_F, 0);
-        listenPositionButton(DJIRemoteControllerKey.KeyCustomButton3Down, "C3", SWITCH_F, 1);
+        //
+        // The RC Pro has no L1..R3 keys at all, so SG and SH are free there and its C1/C2 get
+        // one switch each instead of two thirds of a position picker. Its C3 is deliberately
+        // left without a slot: the only time it ever fired, it did so in the same millisecond
+        // as the return button's raw bit, so whatever it is, a slot for it would move whenever
+        // the return key is pressed.
+        if (isRcPro()) {
+            listenToggleSwitch(SW_SG, "C1", DJIRemoteControllerKey.KeyCustomButton1Down, false,
+                    true);
+            listenToggleSwitch(SW_SH, "C2", DJIRemoteControllerKey.KeyCustomButton2Down, false,
+                    true);
+        } else {
+            listenPositionButton(DJIRemoteControllerKey.KeyCustomButton1Down, "C1", SWITCH_F, -1);
+            listenPositionButton(DJIRemoteControllerKey.KeyCustomButton2Down, "C2", SWITCH_F, 0);
+            listenPositionButton(DJIRemoteControllerKey.KeyCustomButton3Down, "C3", SWITCH_F, 1);
+        }
         listenGoHome();
     }
 
@@ -575,6 +724,31 @@ public final class DjiMsdkBridge {
     static final int SW_SH = 7;
 
     /**
+     * SG and SH on the RC Pro, which has no L1..R3 keys at all (no F1..F6 key codes on that
+     * device) and therefore leaves both free. On the RC Plus 2 they are driven from Android
+     * key codes, see kSwitchKeys in joystick.cpp, and nothing here touches them.
+     */
+    static final int SW_SG = 6;
+
+    /** SI - free on the RC Pro as well, and where its C4 button goes. */
+    static final int SW_SI = 8;
+
+    /**
+     * Which slot each of these four controls drives.
+     *
+     * <p>The RC Plus 2 keeps the layout it was verified with. On the RC Pro the user swapped both
+     * pairs at the end of the 2026-09-25 session, to match the order the buttons sit in on that
+     * remote: video on SD and pause on SC, the round button on SF and C3 on SI.
+     */
+    private static final int SLOT_VIDEO = isRcPro() ? SWITCH_D : SWITCH_C;
+    private static final int SLOT_PAUSE = isRcPro() ? SWITCH_C : SWITCH_D;
+    private static final int SLOT_ROUND = isRcPro() ? SWITCH_E : SW_SI;
+    private static final int SLOT_C3 = isRcPro() ? SW_SI : SWITCH_F;
+
+    /** Where the photo button lands - the other half of the round-button swap above. */
+    private static final int SLOT_PHOTO = isRcPro() ? SWITCH_F : SWITCH_E;
+
+    /**
      * Free slot used to carry the aircraft's arm state into EdgeTX, where any screen,
      * logical switch or special function can pick it up. On this board SJ is a real
      * 2POS position that nothing else drives.
@@ -594,8 +768,14 @@ public final class DjiMsdkBridge {
      * does not have that switch and the key never fires on it.
      */
     private static void listenSwitches() {
-        listenToggleSwitch(SW_SA, "takeoff", DJIRemoteControllerKey.KeyRCAuthLedButtonDown, false);
-        listenEnumSwitch(SW_SB, DJIRemoteControllerKey.KeyFlightModeSwitchState);
+        listenToggleSwitch(SW_SA, "takeoff", DJIRemoteControllerKey.KeyRCAuthLedButtonDown, false,
+                false);
+        listenEnumSwitch(SW_SB, "flightMode", DJIRemoteControllerKey.KeyFlightModeSwitchState);
+        // The same switch again, under the name the remote publishes more willingly: measured on
+        // the RC Pro, KeySoftSwitchMode kept arriving through a wave in which every other key of
+        // the set (flight-mode key included) was null. Two keys, one switch, and
+        // applySwitchPosition() drops a repeat, so neither can move SB twice.
+        listenEnumSwitch(SW_SB, "softSwitchMode", DJIRemoteControllerKey.KeySoftSwitchMode);
     }
 
     /**
@@ -695,18 +875,18 @@ public final class DjiMsdkBridge {
         if (takeoff != 0) sToggleHigh[SW_SA] = (takeoff == SWITCH_HIGH);
 
         final int video = prefs.getInt(PREF_VIDEO, 0);
-        if (video != 0) sToggleHigh[SWITCH_C] = (video == SWITCH_HIGH);
+        if (video != 0) sToggleHigh[SLOT_VIDEO] = (video == SWITCH_HIGH);
 
         final int pause = prefs.getInt(PREF_PAUSE, 0);
-        if (pause != 0) sToggleHigh[SWITCH_D] = (pause == SWITCH_HIGH);
+        if (pause != 0) sToggleHigh[SLOT_PAUSE] = (pause == SWITCH_HIGH);
 
         final int photo = prefs.getInt(PREF_PHOTO, 0);
         if (photo != 0) sShutterPosition = photo;
 
         Log.i(TAG, "dji: switches carried over - takeoff "
                 + (sToggleHigh[SW_SA] ? "high" : "low") + ", video "
-                + (sToggleHigh[SWITCH_C] ? "high" : "low") + ", pause "
-                + (sToggleHigh[SWITCH_D] ? "high" : "low") + ", photo " + sShutterPosition);
+                + (sToggleHigh[SLOT_VIDEO] ? "high" : "low") + ", pause "
+                + (sToggleHigh[SLOT_PAUSE] ? "high" : "low") + ", photo " + sShutterPosition);
     }
 
     /** Remembers one of the latching positions for the next run. */
@@ -741,13 +921,15 @@ public final class DjiMsdkBridge {
      * the toggling stops being a guess.
      */
     private static void listenToggleSwitch(final int index, final String label,
-                                           DJIKeyInfo<Boolean> info, boolean rawBacked) {
+                                           DJIKeyInfo<Boolean> info, boolean rawBacked,
+                                           boolean logBacked) {
         try {
             final DJIKey<Boolean> key = KeyTools.createKey(info);
-            KeyManager.getInstance().listen(key, OWNER,
+            final CommonCallbacks.KeyListener<Boolean> listener =
                     new CommonCallbacks.KeyListener<Boolean>() {
                         @Override
                         public void onValueChange(Boolean oldValue, Boolean newValue) {
+                            noteKeyValue(label, newValue);
                             if (oldValue == null) {
                                 // A snapshot, not a press: see the note above - this is the
                                 // measurement, not a decision.
@@ -767,6 +949,12 @@ public final class DjiMsdkBridge {
                             if (rawBacked && RcRawJoystick.ownsInputs()) {
                                 return;
                             }
+                            // Same for the remote's own button log (see RcDpadLog): while it is
+                            // being read this button is already coming from there, and the SDK's
+                            // copy arriving a few milliseconds later is that same press.
+                            if (logBacked && RcDpadLog.active()) {
+                                return;
+                            }
                             if (!noteButtonState(index, true)) {
                                 Log.i(TAG, "dji: " + label
                                         + " press ignored, the button is already down");
@@ -774,7 +962,8 @@ public final class DjiMsdkBridge {
                             }
                             toggleSwitch(index, label);
                         }
-                    });
+                    };
+            KeyManager.getInstance().listen(key, OWNER, listener);
             dispatchToggle(index, sToggleHigh[index]);
         } catch (Throwable t) {
             Log.w(TAG, "dji: " + label + " listen failed", t);
@@ -799,9 +988,9 @@ public final class DjiMsdkBridge {
     private static void dispatchToggle(int index, boolean high) {
         if (index == SW_SA) {
             persistSwitch(PREF_TAKEOFF, high ? SWITCH_HIGH : SWITCH_LOW);
-        } else if (index == SWITCH_C) {
+        } else if (index == SLOT_VIDEO) {
             persistSwitch(PREF_VIDEO, high ? SWITCH_HIGH : SWITCH_LOW);
-        } else if (index == SWITCH_D) {
+        } else if (index == SLOT_PAUSE) {
             persistSwitch(PREF_PAUSE, high ? SWITCH_HIGH : SWITCH_LOW);
         }
 
@@ -874,46 +1063,157 @@ public final class DjiMsdkBridge {
         }
     }
 
-    private static <T> void listenEnumSwitch(final int index, DJIKeyInfo<T> info) {
+    /**
+     * One switch position, from either source: the SDK's listener, or the poll that reads the
+     * same key while the listener is quiet (see {@link #pollLoop}). Only a change is logged and
+     * dispatched, so the SDK re-delivering a value it already sent costs nothing - and a value
+     * that has not changed cannot move the switch twice.
+     */
+    private static void applySwitchPosition(final int index, Object value) {
+        final Integer state = switchPosition(value);
+        if (state == null || state == sLastSwitchPosition[index]) {
+            return;               // UNKNOWN, a key that went silent, or nothing new
+        }
+        sLastSwitchPosition[index] = state;
+        Log.i(TAG, "dji: switch " + index + " <- " + value);
+        try {
+            nativeOnDjiSwitch(index, state);
+        } catch (Throwable t) {
+            Log.w(TAG, "dji: switch dispatch failed", t);
+        }
+    }
+
+    /** Last position applied per switch, so a repeat is not a second move. */
+    private static final int[] sLastSwitchPosition = new int[SWITCH_COUNT];
+
+    static {
+        for (int i = 0; i < sLastSwitchPosition.length; i++) {
+            sLastSwitchPosition[i] = Integer.MIN_VALUE;   // nothing applied yet
+        }
+    }
+
+    private static <T> void listenEnumSwitch(final int index, final String name,
+                                             DJIKeyInfo<T> info) {
         try {
             final DJIKey<T> key = KeyTools.createKey(info);
-            KeyManager.getInstance().listen(key, OWNER,
+            final CommonCallbacks.KeyListener<T> listener =
                     new CommonCallbacks.KeyListener<T>() {
                         @Override
                         public void onValueChange(T oldValue, T newValue) {
-                            final Integer state = switchPosition(newValue);
-                            if (state == null) {
-                                return;
-                            }
-                            Log.i(TAG, "dji: switch " + index + " <- " + newValue);
-                            try {
-                                nativeOnDjiSwitch(index, state);
-                            } catch (Throwable t) {
-                                Log.w(TAG, "dji: switch dispatch failed", t);
-                            }
+                            noteKeyValue(name, newValue);
+                            applySwitchPosition(index, newValue);
                         }
-                    });
+                    };
+            KeyManager.getInstance().listen(key, OWNER, listener);
         } catch (Throwable t) {
             Log.w(TAG, "dji: switch listen failed for " + index, t);
         }
     }
 
+    // ---- what the SDK's silences look like from here ---------------------------
+    //
+    // The SDK sets every key of this remote to null in waves and re-delivers them when it gets
+    // round to it. Measured on the RC Pro: waves of 20-60 s in which controls can be moved with
+    // nothing arriving at all, which is what "sometimes it does nothing" is.
+    //
+    // Nothing an app does shortens one; both of these were tried against a wave of 63 s -
+    //   * cancelling the subscription and re-issuing it every 10 s: no effect;
+    //   * asking for the value directly (the asynchronous getValue, a real request, unlike the
+    //     synchronous one the sticks poll, which only reads the cache): the SDK answers
+    //     REQUEST_HANDLER_NOT_FOUND for REMOTECONTROLLER.FlightModeSwitchState, so there is no
+    //     handler to ask.
+    // The remote re-publishes its whole key set when it has anything to report - measured, any
+    // button press brought all of it back within 200 ms, the flight-mode switch's current
+    // position included, while moving the switch alone does not, because a switch is not an
+    // event and the SDK has already dropped its cache.
+    //
+    // What is left is to notice it happen: the position arrives when the channel comes back, so
+    // the switch catches up by itself. This records how long each key was quiet for, which is
+    // what makes the behaviour visible in a log.
+
+    private static final java.util.Map<String, Long> SILENT_SINCE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** One value from a watched key: null means the SDK has taken it away, for now. */
+    private static void noteKeyValue(String name, Object value) {
+        final Long since = SILENT_SINCE.get(name);
+        if (value == null) {
+            if (since == null) {
+                SILENT_SINCE.put(name, System.currentTimeMillis());
+                if (sProbe) Log.i(TAG, "dji: " + name + " went silent");
+            }
+            return;
+        }
+        if (since != null) {
+            SILENT_SINCE.remove(name);
+            if (sProbe) {
+                Log.i(TAG, "dji: " + name + " is back after "
+                        + (System.currentTimeMillis() - since) + " ms");
+            }
+        }
+    }
+
+    /**
+     * Which enumeration each physical position of the three-position switch reports, top
+     * first, and the EdgeTX position each of those drives.
+     *
+     * <p>The numbering has nothing to do with the physical order, and the two remotes do not
+     * even agree with each other: measured by moving the switch and reading the log, the RC
+     * Plus 2 reports SWITCH_TWO at the top and SWITCH_ONE in the middle, the RC Pro the other
+     * way round. One table for both leaves the switch rotated by a whole position on one of
+     * them - the middle position then lands on an end and the switch appears dead.
+     *
+     * <p>The sign is EdgeTX's, not the remote's: the switch is labelled high/middle/low and
+     * its high end is EdgeTX's down position, so the top is +1 rather than -1.
+     */
+    private static final RCFlightModeSwitch[] FLIGHT_MODE_TOP_FIRST = flightModeTopFirst();
+    private static final int[] POSITION_TOP_FIRST = {1, 0, -1};
+
+    private static RCFlightModeSwitch[] flightModeTopFirst() {
+        if (isRcPro()) {
+            return new RCFlightModeSwitch[]{
+                    RCFlightModeSwitch.SWITCH_ONE, RCFlightModeSwitch.SWITCH_TWO,
+                    RCFlightModeSwitch.SWITCH_THREE};
+        }
+        return new RCFlightModeSwitch[]{
+                RCFlightModeSwitch.SWITCH_TWO, RCFlightModeSwitch.SWITCH_ONE,
+                RCFlightModeSwitch.SWITCH_THREE};
+    }
+
+    /**
+     * The remote this build is running on, where it makes a difference. Only the two that
+     * have been measured are named; anything else gets the layout the app started with, so a
+     * new remote is added by measuring it, not by guessing here.
+     */
+    private static boolean isRcPro() {
+        return "rm510".equals(Build.DEVICE);
+    }
+
     /** Maps the SDK's switch enumerations onto EdgeTX's -1 / 0 / 1 positions. */
     private static Integer switchPosition(Object value) {
         if (value instanceof RCFlightModeSwitch) {
-            switch ((RCFlightModeSwitch) value) {
-                // Measured on the RC Plus 2 - the SDK's numbering has nothing to do
-                // with the physical order of the switch:
-                //     switch at the top    -> SWITCH_TWO
-                //     switch in the middle -> SWITCH_ONE
-                //     switch at the bottom -> SWITCH_THREE
-                //
-                // The two ends are the other way round in EdgeTX on purpose: the switch
-                // is labelled high/middle/low, and its high position is EdgeTX's down,
-                // so the sign is flipped here rather than left to every model to undo.
-                case SWITCH_TWO: return 1;
-                case SWITCH_ONE: return 0;
-                case SWITCH_THREE: return -1;
+            final RCFlightModeSwitch position = (RCFlightModeSwitch) value;
+            for (int index = 0; index < FLIGHT_MODE_TOP_FIRST.length; index++) {
+                if (FLIGHT_MODE_TOP_FIRST[index] == position) {
+                    return POSITION_TOP_FIRST[index];
+                }
+            }
+            return null;              // UNKNOWN
+        }
+        if (value instanceof RcSoftSwitchMode) {
+            // The same physical switch as RCFlightModeSwitch above, published under a second key
+            // - and this is the one that answers while the other is silent (measured on the RC
+            // Pro, where KeySoftSwitchMode was the only key of the whole set that kept
+            // reporting through a wave). The names are the remote's own, top to bottom:
+            //     TRIPOD  = C   -> EdgeTX down, the same way round as the other key
+            //     POSITION = N  -> middle
+            //     SPORT   = S   -> EdgeTX up
+            // Both keys feed SB and applySwitchPosition() drops a position that is already set,
+            // so whichever of the two arrives first is the one that counts.
+            switch ((RcSoftSwitchMode) value) {
+                case TRIPOD: return 1;
+                case POSITION: return 0;
+                case SPORT: return -1;
                 default: return null;              // UNKNOWN
             }
         }
@@ -991,6 +1291,21 @@ public final class DjiMsdkBridge {
         final int[] last = new int[keys.length];
         final boolean[] seen = new boolean[keys.length];
 
+        // The remote's three-position switch is read here as well, and for a reason the sticks do
+        // not have: the SDK sets every key of this remote to null in waves ("<key> -> null" in
+        // the log) and re-delivers them whenever it feels like it - measured on the RC Pro, one
+        // wave lasted 44 s, and a switch moved in that time never arrived at all. That is what
+        // "the switches only work sometimes" is. A level read here goes through the same entry
+        // point a published one does (applySwitchPosition), which is what keeps one movement
+        // from being applied twice.
+        //
+        // The buttons are deliberately *not* polled: the ones the SDK drops are the ones the
+        // remote's own log carries (see RcDpadLog), and a third source for a press-only button
+        // would give a second toggle for it.
+        final DJIKey<RCFlightModeSwitch> flightModeKey =
+                createKeyOf(DJIRemoteControllerKey.KeyFlightModeSwitchState);
+        RCFlightModeSwitch lastFlightMode = null;
+
         sRateWindowStartMs = System.currentTimeMillis();
 
         while (true) {
@@ -1023,6 +1338,18 @@ public final class DjiMsdkBridge {
 
             logStickRate();
 
+            // The switch and the buttons: same idea, but a level rather than an axis, so it
+            // goes straight into the code the listeners use.
+            try {
+                final RCFlightModeSwitch mode = manager.getValue(flightModeKey);
+                if (mode != null && !mode.equals(lastFlightMode)) {
+                    lastFlightMode = mode;
+                    if (sProbe) Log.i(TAG, "dji: poll flightMode = " + mode);
+                    applySwitchPosition(SW_SB, mode);
+                }
+            } catch (Throwable t) {
+                // A key with no handler yet: the listener will say so, once.
+            }
             try {
                 Thread.sleep(POLL_INTERVAL_MS);
             } catch (InterruptedException e) {
@@ -1030,6 +1357,12 @@ public final class DjiMsdkBridge {
                 return;
             }
         }
+    }
+
+    /** The poll works on keys whose value type it does not care about. */
+    @SuppressWarnings("unchecked")
+    private static <T> DJIKey<T> createKeyOf(DJIKeyInfo<T> info) {
+        return KeyTools.createKey(info);
     }
 
     /**
@@ -1232,10 +1565,112 @@ public final class DjiMsdkBridge {
      */
     static void onRawRecordButton(boolean down) {
         try {
-            if (!noteButtonState(SWITCH_C, down)) return;
-            toggleSwitch(SWITCH_C, "video");
+            if (!noteButtonState(SLOT_VIDEO, down)) return;
+            toggleSwitch(SLOT_VIDEO, "video");
         } catch (Throwable t) {
             Log.w(TAG, "dji: record button dispatch failed", t);
+        }
+    }
+
+    /**
+     * The photo button as the joystick's raw reports see it - byte 16 bit 3.
+     *
+     * <p>On the RC Pro the shutter is in those reports and nowhere else: its
+     * {@code KeyShutterButtonDown} never fires, so {@link #listenShutter} gets nothing there
+     * and the button was dead. Stepping SE is the same work that callback does, so the two
+     * remotes end up in one place - and on the RC Plus 2, which never sets this bit, nothing
+     * changes at all.
+     */
+    static void onRawShutter(boolean down) {
+        try {
+            shutterEdge(down);
+        } catch (Throwable t) {
+            Log.w(TAG, "dji: shutter from the raw report failed", t);
+        }
+    }
+
+    /**
+     * The round button beside the screen: byte 16 bit 0x01 of the joystick report, which is the
+     * only place the SDK does not also carry it. It drives SI.
+     *
+     * <p>It drives SE on the RC Plus 2 and SF on the RC Pro - the other half of the photo button's
+     * slot, which the user swapped at the end of the 2026-09-25 session.
+     *
+     * <p>It reaches the app twice, which is what this button taught us: the joystick report
+     * calls it bit 0x01, and the remote's own log calls it {@code ACTION_KEY_C4}. With the bit
+     * on SA and C4 on SI, one press moved both switches (the user's report). SI is the slot it
+     * keeps, and the log's copy is dropped while this one is feeding the firmware - see
+     * onDpadPress(). That way the button also works on a remote where READ_LOGS was never
+     * granted, and never counts one press as two.
+     */
+    static void onRawRoundButton(boolean down) {
+        try {
+            if (!noteButtonState(SLOT_ROUND, down)) return;
+            toggleSwitch(SLOT_ROUND, "round button");
+        } catch (Throwable t) {
+            Log.w(TAG, "dji: the round button could not be delivered", t);
+        }
+    }
+
+    /**
+     * One press or release of a button the remote reported in its own log - see RcDpadLog for
+     * why that log is the reliable source for these and not the SDK.
+     *
+     * <p>All of them are press-only buttons, and each press toggles its switch. The 5-way, the
+     * shutter and the record button are not handled here on purpose: they are in the joystick's
+     * raw USB reports, and a press would then land twice.
+     */
+    static void onDpadPress(final String name) {
+        // On the RC Plus 2 the SDK and Android key codes already deliver all of this, and its
+        // C1..C3 pick SF's position rather than having a switch each - so nothing here may move
+        // a switch on that remote. The pause button is the exception: SD is the slot either way.
+        if (!isRcPro() && !"PAUSE".equals(name)) {
+            return;
+        }
+        final int index;
+        final String label;
+        switch (name) {
+            case "PAUSE":  index = SLOT_PAUSE; label = "pause"; break;
+            // The remote's own landing / return-to-home button, which the SDK never reports on
+            // this device. It shares SA with the round button, which stood in for it while it
+            // had no source of its own; either button moving that switch is the point of the slot.
+            case "GOHOME": index = SW_SA;    label = "landing"; break;
+            case "C1":     index = SW_SG;    label = "C1"; break;
+            case "C2":     index = SW_SH;    label = "C2"; break;
+            case "C3":     index = SLOT_C3;  label = "C3"; break;
+            case "C4":
+                // The round button beside the screen, under the name the remote's log uses for
+                // it - the same press the joystick report delivers as byte 16 bit 0x01. While
+                // that reader is feeding the switch, this is the older copy of it.
+                if (RcRawJoystick.ownsInputs()) return;
+                index = SLOT_ROUND;
+                label = "round button";
+                break;
+            case "UP": case "DOWN": case "LEFT": case "RIGHT": case "MIDDLE":
+            case "SHUTTER": case "FOCUS": case "RECORD":
+                return;
+            default:
+                // Something this app has never seen: worth one line, so a new control can be
+                // identified from the log rather than guessed at.
+                announceDpad(name);
+                return;
+        }
+        // Straight to the switch, with no press latch: noteButtonState() exists to keep a button
+        // whose press and release are both reported from counting twice, and this source reports
+        // one line per press and no release at all (see RcDpadLog). Latched, the second tap of a
+        // double tap would be swallowed.
+        toggleSwitch(index, label);
+    }
+
+    /** One log line the first time each unknown action turns up. */
+    private static final java.util.Set<String> sDpadSeen = new java.util.HashSet<>();
+
+    private static void announceDpad(String name) {
+        synchronized (DjiMsdkBridge.class) {
+            if (sDpadSeen.add(name)) {
+                Log.i(TAG, "dji: the remote logged an unknown button '" + name
+                        + "' - it has no EdgeTX mapping yet");
+            }
         }
     }
 

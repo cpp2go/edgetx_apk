@@ -56,12 +56,14 @@ import java.util.concurrent.TimeoutException;
  *          4  left horizontal   6  left vertical
  *          8  right horizontal 10  right vertical
  *         12  left dial        14  right dial
- *  16-17 buttons, one bit each: 16 bit 1 = RTN, 16 bit 2 = the record button,
+ *  16-17 buttons, one bit each: 16 bit 1 (0x02) = RTN, 16 bit 2 (0x04) = the record button,
  *        17 bits 0..4 = the 5-way (up, down, left, right, centre - confirmed by
- *        pressing each in turn). Nothing else on the RC is in these reports: the
- *        takeoff, flight mode, pause, shutter, C1..C3, go-home and scroll wheel
- *        buttons were all pressed while this reader held the interface and not one
- *        byte moved, so those still come from the SDK.
+ *        pressing each in turn). The RC Pro sets two more bits in byte 16 - 0x08 (photo)
+ *        and 0x01 (the round button) - which the RC Plus 2 never does, and both of those
+ *        are in these reports instead of in the SDK, see pushButtons(). Of the rest, the
+ *        takeoff, flight mode, pause, C1..C3, go-home and scroll wheel were all pressed
+ *        while this reader held the interface and not one byte moved, so those still come
+ *        from the SDK.
  * </pre>
  *
  * <p><b>How it is used.</b> The six axes are pushed into exactly the entry points the SDK
@@ -119,9 +121,19 @@ final class RcRawJoystick {
             DjiMsdkBridge.BTN_RIGHT, DjiMsdkBridge.BTN_PRESS,
     };
 
-    /** Byte 16 carries two buttons: bit 1 is the return button, bit 2 the record button. */
+    /**
+     * Byte 16 carries the buttons, one bit each: 0x02 is the return button, 0x04 the record
+     * button, and the RC Pro adds two more - 0x08 (photo) and 0x01 (the round button beside
+     * the screen). The RC Plus 2 never sets those last two, so decoding them costs it nothing.
+     * Both of the RC Pro's are in this report *instead* of in the SDK - its shutter never
+     * arrives as {@code KeyShutterButtonDown} and its round button is in no SDK data at all -
+     * which is why they were dead before: see {@link DjiMsdkBridge#onRawShutter} and
+     * joystick.cpp's nativeOnRawButton.
+     */
     private static final int RTN_BIT = 0x02;
     private static final int RECORD_BIT = 0x04;
+    private static final int SHUTTER_BIT = 0x08;
+    private static final int ROUND_BIT = 0x01;
 
     /**
      * If the device stops delivering for this long the reader gives the interface back
@@ -473,6 +485,24 @@ final class RcRawJoystick {
             }
         }
 
+        if (((wasFirst ^ first) & SHUTTER_BIT) != 0) {
+            try {
+                DjiMsdkBridge.onRawShutter((first & SHUTTER_BIT) != 0);
+            } catch (Throwable t) {
+                Log.w(TAG, "raw joystick: the photo button could not be delivered", t);
+            }
+        }
+
+        // The bit that means different things on different remotes is placed by
+        // DjiMsdkBridge, which is where the switch slots and the per-remote split live.
+        if (((wasFirst ^ first) & ROUND_BIT) != 0) {
+            try {
+                DjiMsdkBridge.onRawRoundButton((first & ROUND_BIT) != 0);
+            } catch (Throwable t) {
+                Log.w(TAG, "raw joystick: button 0x01 could not be delivered", t);
+            }
+        }
+
         for (int bit = 0; bit < FIVE_WAY_BITS.length; bit++) {
             // A direction is a level, as it is in the SDK: only the press is passed on, and
             // only its rising edge.
@@ -495,6 +525,12 @@ final class RcRawJoystick {
         }
         if ((first & RECORD_BIT) != 0) {
             text.append("record ");
+        }
+        if ((first & SHUTTER_BIT) != 0) {
+            text.append("photo ");
+        }
+        if ((first & ROUND_BIT) != 0) {
+            text.append("round ");
         }
         for (int bit = 0; bit < FIVE_WAY_BITS.length; bit++) {
             if ((second & FIVE_WAY_BITS[bit]) != 0) {

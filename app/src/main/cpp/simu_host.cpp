@@ -203,6 +203,16 @@ bool firmwareRunning() {
 }
 
 void requestFullRefresh() {
+    // The firmware's lcdRequestFullRefresh() walks LVGL, which only exists once the
+    // firmware has started. Called before that it invalidates a null screen and takes
+    // the process down - measured on the RC Pro: SIGSEGV inside lv_obj_invalidate,
+    // from a window attach that ran while the firmware was not up yet. The firmware's
+    // own flag is the gate rather than the link's, because simuStart() sets it last:
+    // "link down" in the log only means the app is not sure, this means it is not up.
+    if (!firmwareRunning()) {
+        LOGW("link: full refresh skipped, the firmware has not started");
+        return;
+    }
     LOGI("link: full refresh request (firmware symbol %s)",
          lcdRequestFullRefresh != nullptr ? "resolved" : "MISSING");
     if (lcdRequestFullRefresh != nullptr) {

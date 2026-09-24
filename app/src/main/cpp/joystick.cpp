@@ -1056,9 +1056,13 @@ constexpr int32_t kDjiStickRange = 660;
 
 // Switches we drive, indexed by the board's switch table
 // (radio/src/boards/hw_defs/tx16smk3.json): 0 = SA .. 9 = SJ.
-//   0    takeoff button                 (DJI SDK, press toggles high/low)
+//   0    takeoff button                 (DJI SDK; on the RC Pro the landing button, from the
+//                                        remote's own log)
 //   1    flight-mode switch             (DJI SDK, three-position)
-//   2-7  L1/L2/L3/R1/R2/R3              (Android key codes, see kSwitchKeys)
+//   2-4  video, pause, photo            (DJI SDK / raw report; which slot is which depends on
+//                                        the remote, see SLOT_* in DjiMsdkBridge)
+//   5-8  C1, C2, C3, C4/round button    (DJI SDK; on the RC Pro SF/SG/SH/SI, see SLOT_*)
+//   2-7  L1/L2/L3/R1/R2/R3              (RC Plus 2 only, Android key codes, see kSwitchKeys)
 //   9    aircraft arm state             (DJI SDK KeyAreMotorsOn; SJ is unused otherwise)
 constexpr int kSwitchCount = 10;
 
@@ -1553,6 +1557,24 @@ Java_com_edgetx_droidui_DjiMsdkBridge_nativeSetInputsReady(JNIEnv* env, jclass c
 // reports - the return button (see handleKeyCode above). It goes through the same handler
 // as Android's key events, so the key map file and EdgeTX's own long-press timing apply
 // exactly as they do to a key the framework delivered.
+// ---- the buttons only the joystick's own reports carry ----------------------
+//
+// Byte 16 of the report is buttons, one bit each, and what a bit *is* depends on the
+// remote. Measured on both:
+//
+//     bit     RC Plus 2 (rc701)     RC Pro (rm510)
+//     0x01    -                     the round button beside the screen
+//     0x02    return                return
+//     0x04    record                record
+//     0x08    -                     photo
+//
+// All four are placed in DjiMsdkBridge rather than here, because that is where the switch
+// slots, the per-remote split and the press de-duplication already live: 0x02 goes through
+// handleKeyCode() as Android's RETURN key (so the key map and EdgeTX's long-press timing
+// apply to it), 0x04 becomes switch SC and 0x08 switch SE - the same entry points the SDK's
+// own callbacks use, see onRawRecordButton / onRawShutter / onRawRoundButton. The last two
+// matter because the SDK has nothing for them on the RC Pro: its KeyShutterButtonDown never
+// fires there and its round button is in no SDK key at all.
 extern "C" JNIEXPORT void JNICALL
 Java_com_edgetx_droidui_RcRawJoystick_nativeOnRawKey(JNIEnv* env, jclass clazz, jint keycode,
                                                      jboolean down) {
