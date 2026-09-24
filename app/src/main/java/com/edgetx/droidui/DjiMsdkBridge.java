@@ -464,7 +464,8 @@ public final class DjiMsdkBridge {
     static final int SWITCH_I = 8;   // R3 button
 
     /**
-     * The shutter button as a switch (SE).
+     * The shutter button as a switch (SLOT_PHOTO - SE on one remote, SF on the other, see
+     * the slot constants below).
      *
      * The button's two stages cannot be told apart, because only one of them is reported at
      * all: the remote's half press (the focus detent) is in none of the data - MSDK has no
@@ -478,14 +479,14 @@ public final class DjiMsdkBridge {
      * shutter key MSDK offers, has never fired once here, so there is no hold time to go on
      * either.)
      *
-     * What is left is a single "the shutter was pressed" event, so every press steps SE to
-     * the other end: low <-> high. That way each press shows up as a change wherever SE was
-     * standing, which pressing to the end it already sits at would not. The middle position
-     * is where it sits until the first press.
+     * What is left is a single "the shutter was pressed" event, so every press steps that
+     * switch to the other end: low <-> high. That way each press shows up as a change wherever
+     * it was standing, which pressing to the end it already sits at would not. The middle
+     * position is where it sits until the first press.
      *
-     * SE and not one of the free slots: this board declares SI and SJ as 2-position
-     * switches, and configuring one of those as 3POS makes the firmware reject the whole
-     * settings file.
+     * A 3-position slot and not one of the free ones: this board declares SI and SJ as
+     * 2-position switches, and configuring one of those as 3POS makes the firmware reject the
+     * whole settings file.
      */
     private static final int SHUTTER_LOW = 1;    // the down end
     private static final int SHUTTER_HIGH = -1;  // the up end
@@ -493,7 +494,11 @@ public final class DjiMsdkBridge {
     private static void setShutterPosition(int position) {
         sShutterPosition = position;
         persistSwitch(PREF_PHOTO, position);
-        Log.i(TAG, "dji: shutter -> switch E " + (position > 0 ? "low" : "high"));
+        // The letter is derived, not written out: this line used to say "switch E" whatever
+        // the remote, which reads as a wrong mapping in the log while the switch it drives is
+        // a different one.
+        Log.i(TAG, "dji: shutter -> switch " + (char) ('A' + SLOT_PHOTO) + " "
+                + (position > 0 ? "low" : "high"));
         nativeOnDjiSwitch(SLOT_PHOTO, position);
     }
 
@@ -504,10 +509,11 @@ public final class DjiMsdkBridge {
      * 16, bit 0x08). Which one arrives - and in what order - depends on the remote and on the
      * press itself: on the RC Pro the report is the reliable one and the SDK key fires only
      * now and then, while on the RC Plus 2 it is the other way round. A press that both
-     * deliver would otherwise step SE twice and leave it where it started, which is exactly
-     * how it looked before this existed (measured: "shutter -> low" 46 ms before "shutter ->
-     * high" on one press out of four). One physical press is one step, so the second copy is
-     * dropped - the rule the record and pause buttons already use, see noteButtonState().
+     * deliver would otherwise step that switch twice and leave it where it started, which is
+     * exactly how it looked before this existed (measured: "shutter -> low" 46 ms before
+     * "shutter -> high" on one press out of four). One physical press is one step, so the
+     * second copy is dropped - the rule the record and pause buttons already use, see
+     * noteButtonState().
      */
     private static void shutterEdge(boolean down) {
         if (!noteButtonState(SLOT_PHOTO, down)) {
@@ -535,8 +541,8 @@ public final class DjiMsdkBridge {
                         }
                     });
 
-            // SE latches, so a restart brings back the position of the last press; the middle
-            // position is where it sits until the first one.
+            // This slot latches, so a restart brings back the position of the last press; the
+            // middle position is where it sits until the first one.
             nativeOnDjiSwitch(SLOT_PHOTO, sShutterPosition);
         } catch (Throwable t) {
             Log.w(TAG, "dji: shutter listen failed", t);
@@ -1185,8 +1191,20 @@ public final class DjiMsdkBridge {
     // round to it. Measured on the RC Pro: waves of 20-60 s in which controls can be moved with
     // nothing arriving at all, which is what "sometimes it does nothing" is.
     //
-    // Nothing an app does shortens one; both of these were tried against a wave of 63 s -
-    //   * cancelling the subscription and re-issuing it every 10 s: no effect;
+    // The cause is the DJI app (dji.go.v5) running in the background: it subscribes to the same
+    // remote through the same SDK, and while it is there the pushes arrive late or not at all.
+    // Measured on the RC Pro, one app instance, one switch:
+    //   * with dji.go.v5 force-stopped: four positions in 13 s, every value distinct, and not a
+    //     single "went silent" line in the log;
+    //   * with it started again: the flight-mode key, C1, C2, video and pause all went null
+    //     within seconds.
+    // That is also why a remote reboot used to look like the cure - after one, the DJI app has
+    // not started yet.
+    //
+    // Nothing an app does shortens a wave; all of these were tried against one:
+    //   * cancelling the subscription and re-issuing it every 10 s, and again every 4 s once the
+    //     above was known: not one extra value arrives, and a fresh listen does not even
+    //     re-deliver the cached value;
     //   * asking for the value directly (the asynchronous getValue, a real request, unlike the
     //     synchronous one the sticks poll, which only reads the cache): the SDK answers
     //     REQUEST_HANDLER_NOT_FOUND for REMOTECONTROLLER.FlightModeSwitchState, so there is no
@@ -1198,7 +1216,8 @@ public final class DjiMsdkBridge {
     //
     // What is left is to notice it happen: the position arrives when the channel comes back, so
     // the switch catches up by itself. This records how long each key was quiet for, which is
-    // what makes the behaviour visible in a log.
+    // what makes the behaviour visible in a log - and the line for the switch says what the
+    // remedy is, since that is not something this app can do.
 
     private static final java.util.Map<String, Long> SILENT_SINCE =
             new java.util.concurrent.ConcurrentHashMap<>();
@@ -1210,6 +1229,12 @@ public final class DjiMsdkBridge {
             if (since == null) {
                 SILENT_SINCE.put(name, System.currentTimeMillis());
                 if (sProbe) Log.i(TAG, "dji: " + name + " went silent");
+                if ("flightMode".equals(name)) {
+                    // Once per wave, and only for the switch a model is likely to use: what to
+                    // do about it is the whole remedy, see the note above this method.
+                    Log.i(TAG, "dji: the flight-mode switch has stopped being reported - "
+                            + "the DJI app running in the background is what does this");
+                }
             }
             return;
         }
