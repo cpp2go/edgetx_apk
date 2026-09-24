@@ -618,10 +618,21 @@ public final class DjiMsdkBridge {
     }
 
     /**
-     * The go-home button is not a switch of its own: pressing it one, two or three
-     * times tells the 5-way what to trim, so only the presses are forwarded. Holding it,
-     * on the other hand, is the remote's stand-in for a long press of the return button -
-     * see {@link #HOLD_FOR_EXIT_MS}.
+     * The go-home button, which is two different things on the two remotes.
+     *
+     * <p>On the RC Plus 2 it is the H button, which is not a switch of its own: pressing it one,
+     * two or three times tells the 5-way what to trim, so only the presses are forwarded. Holding
+     * it, on the other hand, is that remote's stand-in for a long press of the return button - see
+     * {@link #HOLD_FOR_EXIT_MS}.
+     *
+     * <p>On the RC Pro it is the landing button, and it is a switch: the user drives SA with it,
+     * so neither of the two above applies. Both are left off there on purpose - the trim count
+     * would put the 5-way into a trim mode after two presses of a switch the user toggles
+     * freely, and a slightly slow press of it would close the page (or kill a running Lua
+     * script) as a "long press of the return key". The long press is not needed on that remote
+     * either: its return button really is in the joystick's raw reports (see RcRawJoystick), so
+     * holding it gives EdgeTX a genuine long press rather than the 8 ms tap the RC Plus 2's
+     * input stack flattens it to.
      */
     private static void listenGoHome() {
         try {
@@ -637,6 +648,21 @@ public final class DjiMsdkBridge {
                                 (oldValue == null || !oldValue)) {
                                 pressedAt = System.currentTimeMillis();
                                 Log.i(TAG, "dji: go-home pressed");
+                                // On the RC Pro this button IS the landing switch, and the SDK
+                                // is the only copy of it that does not need READ_LOGS: the
+                                // remote's own log reports the same press as ACTION_KEY_GOHOME
+                                // (see onDpadPress), and that copy is the one that keeps
+                                // arriving through an SDK wave - so it wins while it is being
+                                // read. Driving both would move SA twice per press, which is
+                                // why the two are exclusive instead of independent back-ups:
+                                // a reinstall takes READ_LOGS away (it is granted by hand) and
+                                // this branch is what stops that from costing the switch.
+                                if (isRcPro()) {
+                                    if (!RcDpadLog.active()) {
+                                        toggleSwitch(SW_SA, "landing");
+                                    }
+                                    return;
+                                }
                                 nativeOnDjiGoHome();
                                 return;
                             }
@@ -654,6 +680,9 @@ public final class DjiMsdkBridge {
                             final long held = System.currentTimeMillis() - pressedAt;
                             pressedAt = 0;
                             Log.i(TAG, "dji: go-home released after " + held + " ms");
+                            if (isRcPro()) {
+                                return;   // the landing button has a job of its own there, see above
+                            }
                             if (held >= HOLD_FOR_EXIT_MS) {
                                 try {
                                     nativeOnDjiGoHomeHeld();
@@ -669,9 +698,12 @@ public final class DjiMsdkBridge {
     }
 
     /**
-     * How long the H button has to be held to count as a long press of the return key.
-     * Above the 99-110 ms a tap takes and below the 1.1 s a deliberate hold takes, so the
+     * How long the RC Plus 2's H button has to be held to count as a long press of the return
+     * key. Above the 99-110 ms a tap takes and below the 1.1 s a deliberate hold takes, so the
      * two cannot be confused; EdgeTX itself calls anything over ~320 ms a long press.
+     *
+     * <p>Not used on the RC Pro, where this button is the landing switch instead - see
+     * {@link #listenGoHome}.
      */
     private static final long HOLD_FOR_EXIT_MS = 600;
 
@@ -1725,9 +1757,11 @@ public final class DjiMsdkBridge {
         final String label;
         switch (name) {
             case "PAUSE":  index = SLOT_PAUSE; label = "pause"; break;
-            // The remote's own landing / return-to-home button, which the SDK never reports on
-            // this device. It shares SA with the round button, which stood in for it while it
-            // had no source of its own; either button moving that switch is the point of the slot.
+            // The remote's own landing / return-to-home button. It is the better source for SA
+            // than the SDK's KeyGoHomeButtonDown - this log is what keeps arriving while the
+            // SDK's keys are silent (see listenGoHome, which uses the SDK copy only while this
+            // log is not being read) - and it is the only source left on a remote where the
+            // takeoff button does not exist.
             case "GOHOME": index = SW_SA;    label = "landing"; break;
             case "C1":     index = SW_SG;    label = "C1"; break;
             case "C2":     index = SW_SH;    label = "C2"; break;
