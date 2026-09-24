@@ -88,7 +88,7 @@ public class EdgeTxApplication extends Application {
         // The buttons the remote's own handler logs, which on the RC Pro is the reliable
         // source for the pause, landing and custom buttons. Inert without READ_LOGS, see
         // RcDpadLog - the SDK paths then behave exactly as they did before.
-        RcDpadLog.start();
+        RcDpadLog.start(this);
     }
 
     /** True in the process that exists only to carry the USB device filter. */

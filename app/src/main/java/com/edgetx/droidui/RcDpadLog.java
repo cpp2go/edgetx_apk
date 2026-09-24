@@ -1,10 +1,15 @@
 package com.edgetx.droidui;
 
+import android.Manifest;
+import android.content.Context;
+import android.content.pm.PackageManager;
 import android.util.Log;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 
@@ -47,13 +52,26 @@ final class RcDpadLog {
     /** The line that carries the action, as opposed to the key list beside it. */
     private static final String SEND = "send key action";
 
+    /** What logcat prints first, once it has opened the buffer. */
+    private static final String HEADER = "--------- beginning of";
+
+    /** Length of "MM-DD HH:MM:SS.mmm", the timestamp of logcat's threadtime format. */
+    private static final int STAMP = 18;
+
     /** True while the log is being read: the SDK's copies of those buttons are dropped. */
     private static volatile boolean sActive;
 
     private RcDpadLog() {}
 
     /** Called from {@code EdgeTxApplication.onCreate}. */
-    static void start() {
+    static void start(Context context) {
+        if (context.checkSelfPermission(Manifest.permission.READ_LOGS)
+                != PackageManager.PERMISSION_GRANTED) {
+            // Signature-level, so it is either granted by hand or not there at all: say so
+            // once rather than start a logcat that would only print nothing.
+            Log.i(TAG, "rc: no READ_LOGS, the remote's button log stays unread");
+            return;
+        }
         final Thread thread = new Thread(RcDpadLog::read, "rc-dpad-log");
         thread.setDaemon(true);
         thread.start();
@@ -70,20 +88,33 @@ final class RcDpadLog {
     private static void read() {
         Process process = null;
         try {
-            // -s silences every other tag, so only this one comes through.
-            process = new ProcessBuilder("logcat", "-v", "brief", "-s", LISTENER + ":D")
+            // -T 1 asks for the newest buffered line as well as the new ones. Without it
+            // logcat prints the whole buffer first - 649 lines for this tag alone, measured -
+            // and those are presses made in earlier runs that have already been handled:
+            // replayed, every button the app has ever seen fires again at every start, and
+            // the switches it leaves behind read as a wrong key map. The one line it still
+            // prints is an old one too, and the timestamp below drops it.
+            process = new ProcessBuilder("logcat", "-v", "threadtime", "-s", LISTENER + ":D",
+                    "-T", "1")
                     .redirectErrorStream(true)
                     .start();
             final BufferedReader reader = new BufferedReader(
                     new InputStreamReader(process.getInputStream()));
 
+            final String started = new SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US)
+                    .format(new Date());
+
             String line;
-            boolean announced = false;
             while ((line = reader.readLine()) != null) {
-                if (!announced) {
-                    announced = true;
-                    sActive = true;
-                    Log.i(TAG, "rc: reading the remote's own button log (" + LISTENER + ")");
+                if (line.startsWith(HEADER)) {
+                    if (!sActive) {
+                        sActive = true;
+                        Log.i(TAG, "rc: reading the remote's own button log (" + LISTENER + ")");
+                    }
+                    continue;
+                }
+                if (!afterStart(line, started)) {
+                    continue;
                 }
                 handle(line);
             }
@@ -99,6 +130,22 @@ final class RcDpadLog {
                 process.destroy();
             }
         }
+    }
+
+    /**
+     * Whether a line was logged after this reader started. Both sides are stamped
+     * "MM-DD HH:MM:SS.mmm", so comparing them as strings compares them as times, except in the
+     * one second of the year where the date rolls over.
+     */
+    private static boolean afterStart(String line, String started) {
+        if (line.length() < STAMP) {
+            return false;
+        }
+        final String stamp = line.substring(0, STAMP);
+        if (stamp.charAt(2) != '-' || stamp.charAt(5) != ' ') {
+            return false;
+        }
+        return stamp.compareTo(started) >= 0;
     }
 
     /**
