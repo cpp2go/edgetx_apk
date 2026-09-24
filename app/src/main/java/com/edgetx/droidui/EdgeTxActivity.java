@@ -60,6 +60,18 @@ public class EdgeTxActivity extends NativeActivity {
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        // The raw joystick reports need a USB permission, and that one can only be granted
+        // through a dialog: asked for from the Application, before any window exists, the
+        // system refuses it without showing anything (measured on the RC Pro, where the
+        // photo and record buttons are in those reports and nowhere else). Here the window
+        // is there, so the dialog is real. The call is idempotent: with the permission
+        // already held it only makes sure the reader is running.
+        RcRawJoystick.start(this);
+    }
+
+    @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(requestCode, permissions, results);
         if (requestCode != REQUEST_STORAGE) {

@@ -148,6 +148,22 @@ final class RcRawJoystick {
     /** True while reports are being fed to the firmware: the SDK's copies are redundant. */
     private static volatile boolean sOwned;
 
+    /**
+     * True from the moment a reader thread is started until it returns. Kept apart from
+     * {@link #sOwned}, which only says the reports are flowing: a reader that is still
+     * claiming the interface must not be started a second time.
+     */
+    private static volatile boolean sReaderStarted;
+
+    /** The permission receiver is registered once, however often {@link #start} is called. */
+    private static volatile boolean sReceiverRegistered;
+
+    /** When the last permission request went out, so the asking can be spaced out. */
+    private static volatile long sAskedAt;
+
+    /** How long to wait before asking again: the answer normally takes a couple of seconds. */
+    private static final int ASK_AGAIN_MS = 5000;
+
     /** Verbose flag, decided once at start. */
     private static volatile boolean sVerbose;
 
@@ -173,7 +189,19 @@ final class RcRawJoystick {
 
     // ---- start-up -----------------------------------------------------------
 
-    /** Called from {@code EdgeTxApplication.onCreate}. */
+    /**
+     * Called from {@code EdgeTxApplication.onCreate}, and again from the launcher activity
+     * whenever it comes to the front.
+     *
+     * <p>It is idempotent, which is what the second caller is for: a USB permission can only be
+     * granted through a dialog, and a request made from the Application - before any activity is
+     * up - is refused by the system without ever being shown. Measured on the RC Pro after a
+     * fresh install: "asking for permission for /dev/bus/usb/001/007" 6 s before "activity
+     * started", then "USB permission denied" 1.5 s later, and with the raw reports gone the
+     * photo and record buttons went with them. Asked again once the window is there, the dialog
+     * appears and the answer is real. A denied answer is simply asked again on the next resume,
+     * spaced out so a dialog cannot pile up.
+     */
     static void start(Context context) {
         try {
             sVerbose = new File(context.getExternalFilesDir(null), TRIGGER).isFile();
@@ -195,26 +223,19 @@ final class RcRawJoystick {
             }
 
             if (manager.hasPermission(device)) {
-                readInBackground(manager, device);
+                if (!sReaderStarted) {
+                    readInBackground(manager, device);
+                }
                 return;
             }
 
             final Context app = context.getApplicationContext();
-            app.registerReceiver(new BroadcastReceiver() {
-                @Override
-                public void onReceive(Context received, Intent intent) {
-                    if (intent == null || !ACTION_PERMISSION.equals(intent.getAction())) {
-                        return;
-                    }
-                    final boolean granted =
-                            intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false);
-                    Log.i(TAG, "raw joystick: USB permission " + (granted ? "granted" : "denied"));
-                    final UsbDevice permitted = deviceFrom(intent);
-                    if (granted && permitted != null) {
-                        readInBackground(manager, permitted);
-                    }
-                }
-            }, new IntentFilter(ACTION_PERMISSION));
+            registerPermissionReceiver(app);
+
+            if (System.currentTimeMillis() - sAskedAt < ASK_AGAIN_MS) {
+                return;
+            }
+            sAskedAt = System.currentTimeMillis();
 
             final Intent intent = new Intent(ACTION_PERMISSION);
             intent.setPackage(context.getPackageName());
@@ -229,6 +250,37 @@ final class RcRawJoystick {
         } catch (Throwable t) {
             Log.w(TAG, "raw joystick: could not start", t);
         }
+    }
+
+    /** The answer to a permission request, listened for once for the life of the process. */
+    private static void registerPermissionReceiver(final Context app) {
+        if (sReceiverRegistered) {
+            return;
+        }
+        sReceiverRegistered = true;
+        app.registerReceiver(new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context received, Intent intent) {
+                if (intent == null || !ACTION_PERMISSION.equals(intent.getAction())) {
+                    return;
+                }
+                final boolean granted =
+                        intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false);
+                Log.i(TAG, "raw joystick: USB permission " + (granted ? "granted" : "denied"));
+                if (!granted) {
+                    // Never fatal: this class only carries the reports the SDK cannot, so a
+                    // refusal leaves the app working with the buttons the SDK does deliver.
+                    sAskedAt = 0;
+                    return;
+                }
+                final UsbManager manager =
+                        (UsbManager) app.getSystemService(Context.USB_SERVICE);
+                final UsbDevice permitted = deviceFrom(intent);
+                if (manager != null && permitted != null && !sReaderStarted) {
+                    readInBackground(manager, permitted);
+                }
+            }
+        }, new IntentFilter(ACTION_PERMISSION));
     }
 
     /**
@@ -267,6 +319,7 @@ final class RcRawJoystick {
     // ---- the reader ---------------------------------------------------------
 
     private static void readInBackground(final UsbManager manager, final UsbDevice device) {
+        sReaderStarted = true;
         final Thread thread = new Thread(() -> {
             try {
                 read(manager, device);
@@ -274,6 +327,7 @@ final class RcRawJoystick {
                 Log.w(TAG, "raw joystick: reader stopped", t);
             } finally {
                 sOwned = false;
+                sReaderStarted = false;
             }
         }, "raw-joystick");
         thread.setDaemon(true);
