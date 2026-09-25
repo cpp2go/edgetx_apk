@@ -34,10 +34,13 @@ import java.util.Locale;
  * prints nothing and this class stays inactive, which is deliberate: the app then behaves exactly
  * as it did before, with the buttons the SDK cannot deliver simply missing.
  *
- * <p>Only what the other sources cannot do is handled from here. The 5-way, the shutter, the
- * record and the return button are all in the joystick's raw USB reports (see RcRawJoystick),
- * which are faster and unaffected by the SDK's silences - handling them here as well would make
- * every press land twice.
+ * <p>What is read here goes into {@link RcButtons} together with what the SDK and the raw USB
+ * reports see, and that class merges the copies of one press. So a button this log is the only
+ * source for keeps working on a remote where READ_LOGS was never granted - it just falls back to
+ * the SDK's copy there - and one this log shares with another reader still counts one press. The
+ * four controls that are in the joystick's raw reports and nowhere in the SDK (see RcRawJoystick)
+ * are deliberately not handled here twice over: they are faster and unaffected by the SDK's
+ * silences, so there is nothing to gain by adding a second edge for them.
  */
 final class RcDpadLog {
 
@@ -58,7 +61,7 @@ final class RcDpadLog {
     /** Length of "MM-DD HH:MM:SS.mmm", the timestamp of logcat's threadtime format. */
     private static final int STAMP = 18;
 
-    /** True while the log is being read: the SDK's copies of those buttons are dropped. */
+    /** True once the channel is known to be live, so the line above is printed once. */
     private static volatile boolean sActive;
 
     private RcDpadLog() {}
@@ -78,8 +81,9 @@ final class RcDpadLog {
     }
 
     /**
-     * Whether the remote's button log is being read. While it is, the SDK's own callbacks for the
-     * same buttons are the second copy of one press - see DjiMsdkBridge.listenToggleSwitch.
+     * Whether the remote's button log is being read. Nothing decides anything from it any more -
+     * the presses go into RcButtons either way and it merges the copies - so this is only what
+     * the start-up line above is about, and what a check of "is that reader alive?" reads.
      */
     static boolean active() {
         return sActive;
@@ -120,7 +124,8 @@ final class RcDpadLog {
             }
 
             // Endless while the app lives; if it ends, logcat refused us - the permission is
-            // missing, or logd was restarted. Either way the SDK paths carry on alone.
+            // missing, or logd was restarted. Either way every button this reader covers is
+            // down to the SDK's copies alone, which is what RcButtons allows for.
             Log.i(TAG, "rc: the remote's button log ended, its buttons fall back to the SDK");
         } catch (Throwable t) {
             Log.w(TAG, "rc: could not read the remote's button log", t);

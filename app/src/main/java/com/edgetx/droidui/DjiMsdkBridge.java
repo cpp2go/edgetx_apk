@@ -452,6 +452,12 @@ public final class DjiMsdkBridge {
     // F4..F6 (see kSwitchKeys in joystick.cpp) and KeyRcButtonEventPro never fires on this
     // remote, so they have no SDK route and stop with the window.
     //
+    // Which reader actually delivers a given button differs per reader and per remote: the SDK's
+    // keys go silent in waves, the raw reports carry four buttons only, and the remote's own log
+    // needs READ_LOGS. That is no longer decided here button by button - every reader feeds the
+    // same place (RcButtons), which merges their copies of one press, so no button is left
+    // waiting on a single reader that happens to be having a bad day.
+    //
     // Measured on the RC: all of them fire. The shutter is the odd one - it reports a press
     // but not its half press, so it drives a switch of its own, see listenShutter().
 
@@ -512,11 +518,17 @@ public final class DjiMsdkBridge {
      * deliver would otherwise step that switch twice and leave it where it started, which is
      * exactly how it looked before this existed (measured: "shutter -> low" 46 ms before
      * "shutter -> high" on one press out of four). One physical press is one step, so the
-     * second copy is dropped - the rule the record and pause buttons already use, see
-     * noteButtonState().
+     * second copy is dropped by {@link RcButtons}, which is where that rule lives now - and
+     * because both readers are wired in, this button also works on a remote whose shutter key
+     * never answers at all.
      */
-    private static void shutterEdge(boolean down) {
-        if (!noteButtonState(SLOT_PHOTO, down)) {
+    private static void shutterEdge(boolean down, int source) {
+        final int what = RcButtons.edge(SLOT_PHOTO, source, down);
+        if (what == RcButtons.MERGED) {
+            logMerged("photo", source, SLOT_PHOTO);
+            return;
+        }
+        if (what != RcButtons.PRESS) {
             return;
         }
         setShutterPosition(sShutterPosition > 0 ? SHUTTER_HIGH : SHUTTER_LOW);
@@ -537,7 +549,7 @@ public final class DjiMsdkBridge {
                             if (oldValue == null) {
                                 return;   // the SDK's initial snapshot, not a release
                             }
-                            shutterEdge(Boolean.TRUE.equals(newValue));
+                            shutterEdge(Boolean.TRUE.equals(newValue), RcButtons.SOURCE_SDK);
                         }
                     });
 
@@ -554,14 +566,12 @@ public final class DjiMsdkBridge {
         // one press and it stays where it went. Held down it reports a press, nothing more -
         // the SDK has no latched level for it, and the button itself is momentary - so
         // without the toggle there is no level for a model to assign.
-        listenToggleSwitch(SLOT_VIDEO, "video", DJIRemoteControllerKey.KeyRecordButtonDown, true,
-                false);
+        listenToggleSwitch(SLOT_VIDEO, "video", DJIRemoteControllerKey.KeyRecordButtonDown);
         listenShutter();
         // The pause button is a press-only button like the takeoff one, and the model
         // wants a latched level out of it (a channel that stays high until the next
         // press), so it toggles SD instead of being high only while it is held.
-        listenToggleSwitch(SLOT_PAUSE, "pause", DJIRemoteControllerKey.KeyPauseButtonDown, false,
-                true);
+        listenToggleSwitch(SLOT_PAUSE, "pause", DJIRemoteControllerKey.KeyPauseButtonDown);
         // C1/C2/C3 are the three positions of SF: up, middle, down. They used to be SG/SH/SI,
         // which the RC's R1/R2/R3 buttons now drive from Android key codes - SF is the one
         // that had to move onto the SDK, because only the SDK keeps reporting while the UI
@@ -573,10 +583,8 @@ public final class DjiMsdkBridge {
         // as the return button's raw bit, so whatever it is, a slot for it would move whenever
         // the return key is pressed.
         if (isRcPro()) {
-            listenToggleSwitch(SW_SG, "C1", DJIRemoteControllerKey.KeyCustomButton1Down, false,
-                    true);
-            listenToggleSwitch(SW_SH, "C2", DJIRemoteControllerKey.KeyCustomButton2Down, false,
-                    true);
+            listenToggleSwitch(SW_SG, "C1", DJIRemoteControllerKey.KeyCustomButton1Down);
+            listenToggleSwitch(SW_SH, "C2", DJIRemoteControllerKey.KeyCustomButton2Down);
         } else {
             listenPositionButton(DJIRemoteControllerKey.KeyCustomButton1Down, "C1", SWITCH_F, -1);
             listenPositionButton(DJIRemoteControllerKey.KeyCustomButton2Down, "C2", SWITCH_F, 0);
@@ -600,8 +608,12 @@ public final class DjiMsdkBridge {
                     new CommonCallbacks.KeyListener<Boolean>() {
                         @Override
                         public void onValueChange(Boolean oldValue, Boolean newValue) {
-                            if (oldValue == null || !Boolean.TRUE.equals(newValue)) {
+                            if (oldValue == null) {
                                 return;   // the initial snapshot, or the release half
+                            }
+                            if (RcButtons.edge(index, RcButtons.SOURCE_SDK,
+                                    Boolean.TRUE.equals(newValue)) != RcButtons.PRESS) {
+                                return;   // the release half, or a copy of this press
                             }
                             Log.i(TAG, "dji: " + name + " -> switch " + (char) ('A' + index)
                                     + " position " + position);
@@ -648,19 +660,16 @@ public final class DjiMsdkBridge {
                                 (oldValue == null || !oldValue)) {
                                 pressedAt = System.currentTimeMillis();
                                 Log.i(TAG, "dji: go-home pressed");
-                                // On the RC Pro this button IS the landing switch, and the SDK
-                                // is the only copy of it that does not need READ_LOGS: the
-                                // remote's own log reports the same press as ACTION_KEY_GOHOME
-                                // (see onDpadPress), and that copy is the one that keeps
-                                // arriving through an SDK wave - so it wins while it is being
-                                // read. Driving both would move SA twice per press, which is
-                                // why the two are exclusive instead of independent back-ups:
-                                // a reinstall takes READ_LOGS away (it is granted by hand) and
-                                // this branch is what stops that from costing the switch.
+                                // On the RC Pro this button IS the landing switch, and two
+                                // readers report it that are not copies of each other: the SDK
+                                // here, and the remote's own log as ACTION_KEY_GOHOME (see
+                                // onDpadPress). They used to be exclusive - the log while it was
+                                // being read, this branch otherwise - which left the switch
+                                // depending on READ_LOGS, a hand grant a reinstall takes away.
+                                // Both go into RcButtons now and it merges them, so the switch
+                                // moves once whichever reader saw the press.
                                 if (isRcPro()) {
-                                    if (!RcDpadLog.active()) {
-                                        toggleSwitch(SW_SA, "landing");
-                                    }
+                                    buttonEdge(SW_SA, "landing", RcButtons.SOURCE_SDK, true);
                                     return;
                                 }
                                 nativeOnDjiGoHome();
@@ -681,7 +690,11 @@ public final class DjiMsdkBridge {
                             pressedAt = 0;
                             Log.i(TAG, "dji: go-home released after " + held + " ms");
                             if (isRcPro()) {
-                                return;   // the landing button has a job of its own there, see above
+                                // The landing button has a job of its own there (see above), but
+                                // its readers still have to be told the press is over, or the
+                                // next one would be taken for a copy of this one.
+                                buttonEdge(SW_SA, "landing", RcButtons.SOURCE_SDK, false);
+                                return;
                             }
                             if (held >= HOLD_FOR_EXIT_MS) {
                                 try {
@@ -812,13 +825,17 @@ public final class DjiMsdkBridge {
      * does not have that switch and the key never fires on it.
      */
     private static void listenSwitches() {
-        listenToggleSwitch(SW_SA, "takeoff", DJIRemoteControllerKey.KeyRCAuthLedButtonDown, false,
-                false);
+        listenToggleSwitch(SW_SA, "takeoff", DJIRemoteControllerKey.KeyRCAuthLedButtonDown);
         listenEnumSwitch(SW_SB, "flightMode", DJIRemoteControllerKey.KeyFlightModeSwitchState);
         // The same switch again, under the name the remote publishes more willingly: measured on
         // the RC Pro, KeySoftSwitchMode kept arriving through a wave in which every other key of
         // the set (flight-mode key included) was null. Two keys, one switch, and
         // applySwitchPosition() drops a repeat, so neither can move SB twice.
+        // CORRECTED 2026-09-25 (probe on, every key listened to at once): on this remote
+        // KeySoftSwitchMode and KeyFlightModeString deliver **nothing at all** - not even the
+        // initial snapshot - so the flight-mode key above is the only source SB has. They stay
+        // listened to for the other remotes and for the flight controller's own switch, which
+        // is the same key name there.
         listenEnumSwitch(SW_SB, "softSwitchMode", DJIRemoteControllerKey.KeySoftSwitchMode);
         // And a third time as a string. Same switch, same three positions, published under yet
         // another name - which matters because the SDK's silences are not the same for every
@@ -889,36 +906,36 @@ public final class DjiMsdkBridge {
      * Latched state of each button that only reports presses, as EdgeTX sees it: one
      * SDK press pulse maps to exactly one toggle, so this has to track it here.
      */
-    private static final int SWITCH_COUNT = 10;   // SA..SJ
+    static final int SWITCH_COUNT = 10;   // SA..SJ
     private static final boolean[] sToggleHigh = new boolean[SWITCH_COUNT];
 
     /**
-     * When each press-only button was last seen going down, or 0 while it is up.
+     * One press or one release of a switch-driving button, from whichever reader saw it: the
+     * press moves the switch, the release only closes it, and a copy of a press that another
+     * reader has already counted moves nothing.
      *
-     * Both sources see the same press - the SDK callback and, for the video button, the
-     * joystick's raw reports - and the SDK delivers the same value twice (measured: every
-     * listener's initial snapshot arrives twice, and so does the press that follows it). One
-     * physical press has to be exactly one toggle, so a press that arrives while the button is
-     * already down is the other copy of it, not a second press.
+     * <p>Which readers see which buttons, how far apart their copies of one press arrive, and
+     * why they are merged rather than outvoted is {@link RcButtons}' business - this is only the
+     * last step of it, shared by every reader so no button can be left depending on one of them.
      */
-    private static final long[] sButtonDownAt = new long[SWITCH_COUNT];
-
-    /** A press still open after this long had its release missed: take the next one anyway. */
-    private static final long PRESS_STALE_MS = 1000;
-
-    /** One press or one release of a press-only button; true only for a press that is news. */
-    private static boolean noteButtonState(int index, boolean down) {
-        if (!down) {
-            sButtonDownAt[index] = 0;
-            return false;
+    private static void buttonEdge(int index, String label, int source, boolean down) {
+        final int what = RcButtons.edge(index, source, down);
+        if (what == RcButtons.PRESS) {
+            toggleSwitch(index, label, source);
+        } else if (what == RcButtons.MERGED) {
+            logMerged(label, source, index);
         }
+    }
 
-        final long now = SystemClock.uptimeMillis();
-        final long since = sButtonDownAt[index];
-        if (since != 0 && now - since < PRESS_STALE_MS) return false;
-
-        sButtonDownAt[index] = now;
-        return true;
+    /**
+     * Two readers saw the same physical press. Worth a line every time: it is what says both are
+     * alive for that button, which is the question behind every "this switch only works
+     * sometimes" report - and it is also what proves one press is still only one movement.
+     */
+    private static void logMerged(String label, int source, int index) {
+        Log.i(TAG, "dji: " + label + " press came from " + RcButtons.sourceName(source)
+                + " as well, merged with the " + RcButtons.sourceName(RcButtons.pressSource(index))
+                + " one");
     }
 
     /**
@@ -1020,8 +1037,7 @@ public final class DjiMsdkBridge {
      * the toggling stops being a guess.
      */
     private static void listenToggleSwitch(final int index, final String label,
-                                           DJIKeyInfo<Boolean> info, boolean rawBacked,
-                                           boolean logBacked) {
+                                           DJIKeyInfo<Boolean> info) {
         try {
             final DJIKey<Boolean> key = KeyTools.createKey(info);
             final CommonCallbacks.KeyListener<Boolean> listener =
@@ -1035,31 +1051,11 @@ public final class DjiMsdkBridge {
                                 Log.i(TAG, "dji: " + label + " initial snapshot " + newValue);
                                 return;
                             }
-                            // The release is not a toggle, but it is what lets the next press
-                            // through - see noteButtonState().
-                            if (!Boolean.TRUE.equals(newValue)) {
-                                noteButtonState(index, false);
-                                return;
-                            }
-                            // The joystick's raw USB reports carry this same button (see
-                            // RcRawJoystick): while they are feeding the firmware, this copy
-                            // would be the second press of it, and a second press is a second
-                            // toggle.
-                            if (rawBacked && RcRawJoystick.ownsInputs()) {
-                                return;
-                            }
-                            // Same for the remote's own button log (see RcDpadLog): while it is
-                            // being read this button is already coming from there, and the SDK's
-                            // copy arriving a few milliseconds later is that same press.
-                            if (logBacked && RcDpadLog.active()) {
-                                return;
-                            }
-                            if (!noteButtonState(index, true)) {
-                                Log.i(TAG, "dji: " + label
-                                        + " press ignored, the button is already down");
-                                return;
-                            }
-                            toggleSwitch(index, label);
+                            // Which reader gets to count this press is RcButtons' business: this
+                            // reader may be the raw report's copy of the same press, or it may
+                            // be the only one that saw it at all - and that is the point.
+                            buttonEdge(index, label, RcButtons.SOURCE_SDK,
+                                    Boolean.TRUE.equals(newValue));
                         }
                     };
             KeyManager.getInstance().listen(key, OWNER, listener);
@@ -1070,17 +1066,18 @@ public final class DjiMsdkBridge {
     }
 
     /**
-     * One press of a press-only button: the latched level flips and goes out. Shared by the
-     * SDK callback and by the joystick's raw reports, which see the same button.
+     * One press of a switch-driving button: the latched level flips and goes out. Called by
+     * {@link #buttonEdge} for every reader, and the source only ever appears in the log line -
+     * which reader it was is exactly what a "this switch works only sometimes" report needs.
      */
-    private static void toggleSwitch(final int index, final String label) {
+    private static void toggleSwitch(final int index, final String label, final int source) {
         final boolean high;
         synchronized (DjiMsdkBridge.class) {
             sToggleHigh[index] = !sToggleHigh[index];
             high = sToggleHigh[index];
         }
         Log.i(TAG, "dji: switch " + index + " (" + label + ") -> "
-                + (high ? "high" : "low"));
+                + (high ? "high" : "low") + " [from " + RcButtons.sourceName(source) + "]");
         dispatchToggle(index, high);
     }
 
@@ -1686,13 +1683,13 @@ public final class DjiMsdkBridge {
     }
 
     /**
-     * The record button as EdgeTX switch SC: the same thing {@code listenButtonKeys} drives, and
-     * the same press - noteButtonState() is what keeps the two from both counting it.
+     * The record button as the joystick's raw reports see it: the same switch {@code video}
+     * drives and the same press - RcButtons is what keeps the two from both counting it, and the
+     * button keeps working on a remote where the SDK's copy of it never arrives.
      */
     static void onRawRecordButton(boolean down) {
         try {
-            if (!noteButtonState(SLOT_VIDEO, down)) return;
-            toggleSwitch(SLOT_VIDEO, "video");
+            buttonEdge(SLOT_VIDEO, "video", RcButtons.SOURCE_RAW, down);
         } catch (Throwable t) {
             Log.w(TAG, "dji: record button dispatch failed", t);
         }
@@ -1701,15 +1698,15 @@ public final class DjiMsdkBridge {
     /**
      * The photo button as the joystick's raw reports see it - byte 16 bit 3.
      *
-     * <p>On the RC Pro the shutter is in those reports and nowhere else: its
-     * {@code KeyShutterButtonDown} never fires, so {@link #listenShutter} gets nothing there
-     * and the button was dead. Stepping SE is the same work that callback does, so the two
-     * remotes end up in one place - and on the RC Plus 2, which never sets this bit, nothing
-     * changes at all.
+     * <p>On the RC Pro the shutter is in those reports and the SDK's
+     * {@code KeyShutterButtonDown} only answers now and then (measured: it does fire on this
+     * remote, but not for every press) - so before this the button missed presses. Stepping SE is
+     * the same work that callback does, so the two remotes end up in one place - and on the
+     * RC Plus 2, which never sets this bit, nothing changes at all.
      */
     static void onRawShutter(boolean down) {
         try {
-            shutterEdge(down);
+            shutterEdge(down, RcButtons.SOURCE_RAW);
         } catch (Throwable t) {
             Log.w(TAG, "dji: shutter from the raw report failed", t);
         }
@@ -1717,34 +1714,35 @@ public final class DjiMsdkBridge {
 
     /**
      * The round button beside the screen: byte 16 bit 0x01 of the joystick report, which is the
-     * only place the SDK does not also carry it. It drives SI.
+     * only place the SDK does not also carry it.
      *
-     * <p>It drives SE on the RC Plus 2 and SF on the RC Pro - the other half of the photo button's
-     * slot, which the user swapped at the end of the 2026-09-25 session.
+     * <p>It drives SE on the RC Pro and SI on the RC Plus 2 - the other half of the photo
+     * button's slot, which the user swapped at the end of the 2026-09-25 session.
      *
      * <p>It reaches the app twice, which is what this button taught us: the joystick report
      * calls it bit 0x01, and the remote's own log calls it {@code ACTION_KEY_C4}. With the bit
-     * on SA and C4 on SI, one press moved both switches (the user's report). SI is the slot it
-     * keeps, and the log's copy is dropped while this one is feeding the firmware - see
-     * onDpadPress(). That way the button also works on a remote where READ_LOGS was never
-     * granted, and never counts one press as two.
+     * on SA and C4 on SI, one press moved both switches (the user's report). Both readers feed
+     * the one slot now and RcButtons merges them, so the press counts once whether or not
+     * READ_LOGS was ever granted and whether or not the USB claim went through.
      */
     static void onRawRoundButton(boolean down) {
         try {
-            if (!noteButtonState(SLOT_ROUND, down)) return;
-            toggleSwitch(SLOT_ROUND, "round button");
+            buttonEdge(SLOT_ROUND, "round button", RcButtons.SOURCE_RAW, down);
         } catch (Throwable t) {
             Log.w(TAG, "dji: the round button could not be delivered", t);
         }
     }
 
     /**
-     * One press or release of a button the remote reported in its own log - see RcDpadLog for
-     * why that log is the reliable source for these and not the SDK.
+     * One press of a button the remote reported in its own log - see RcDpadLog for why that log
+     * is the reliable reader for these and not the SDK.
      *
-     * <p>All of them are press-only buttons, and each press toggles its switch. The 5-way, the
-     * shutter and the record button are not handled here on purpose: they are in the joystick's
-     * raw USB reports, and a press would then land twice.
+     * <p>All of them are press-only buttons, and each press steps its switch. Where the SDK, the
+     * raw report or both also carry the same button, their copies are merged with this one by
+     * RcButtons, so a press that both readers see still counts once. The 5-way, the shutter, the
+     * focus and the record buttons are not mapped from here at all: the first four are in the
+     * joystick's raw USB reports, and for the two camera buttons the raw bit is the reliable
+     * reader on this remote - see onRawShutter and onRawRecordButton.
      */
     static void onDpadPress(final String name) {
         // On the RC Plus 2 the SDK and Android key codes already deliver all of this, and its
@@ -1757,20 +1755,18 @@ public final class DjiMsdkBridge {
         final String label;
         switch (name) {
             case "PAUSE":  index = SLOT_PAUSE; label = "pause"; break;
-            // The remote's own landing / return-to-home button. It is the better source for SA
-            // than the SDK's KeyGoHomeButtonDown - this log is what keeps arriving while the
-            // SDK's keys are silent (see listenGoHome, which uses the SDK copy only while this
-            // log is not being read) - and it is the only source left on a remote where the
-            // takeoff button does not exist.
+            // The remote's own landing / return-to-home button. It is the reader that keeps
+            // arriving while the SDK's keys are silent (see listenGoHome for the other one) and
+            // the only source left on a remote where the takeoff button does not exist. The two
+            // are merged now, so a press lands whichever of them is having a good day.
             case "GOHOME": index = SW_SA;    label = "landing"; break;
             case "C1":     index = SW_SG;    label = "C1"; break;
             case "C2":     index = SW_SH;    label = "C2"; break;
             case "C3":     index = SLOT_C3;  label = "C3"; break;
             case "C4":
                 // The round button beside the screen, under the name the remote's log uses for
-                // it - the same press the joystick report delivers as byte 16 bit 0x01. While
-                // that reader is feeding the switch, this is the older copy of it.
-                if (RcRawJoystick.ownsInputs()) return;
+                // it - the same press the joystick report delivers as byte 16 bit 0x01, merged
+                // with it by RcButtons.
                 index = SLOT_ROUND;
                 label = "round button";
                 break;
@@ -1783,11 +1779,14 @@ public final class DjiMsdkBridge {
                 announceDpad(name);
                 return;
         }
-        // Straight to the switch, with no press latch: noteButtonState() exists to keep a button
-        // whose press and release are both reported from counting twice, and this source reports
-        // one line per press and no release at all (see RcDpadLog). Latched, the second tap of a
-        // double tap would be swallowed.
-        toggleSwitch(index, label);
+        // This reader writes one line per press and never a release (see RcDpadLog), so the
+        // switch is stepped straight away - and RcButtons drops the copy when one of the readers
+        // that does report both edges has already counted this press.
+        if (RcButtons.tap(index, RcButtons.SOURCE_LOG) != RcButtons.PRESS) {
+            logMerged(label, RcButtons.SOURCE_LOG, index);
+            return;
+        }
+        toggleSwitch(index, label, RcButtons.SOURCE_LOG);
     }
 
     /** One log line the first time each unknown action turns up. */
