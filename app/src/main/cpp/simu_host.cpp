@@ -147,6 +147,39 @@ std::atomic<uint16_t> g_batteryMv{0};
 std::atomic<uint8_t> g_batteryPercent{0};
 std::atomic<bool> g_batteryCharging{false};
 
+void setGps(int32_t latitude, int32_t longitude, int32_t altitude, uint16_t speed,
+            uint16_t course, uint8_t satellites, bool fix) {
+    if (edgetxAndroidSetGps == nullptr) {
+        // An older simulator library: say so once rather than pretend the position is visible.
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LOGE("gps: the simulator library has no GPS injection");
+        }
+        return;
+    }
+    edgetxAndroidSetGps(latitude, longitude, altitude, speed, course, satellites, fix ? 1 : 0);
+}
+
+uint32_t hapticEvents() {
+    return simuGetHaptic != nullptr ? simuGetHaptic() : 0;
+}
+
+bool firmwareGps(int32_t* latitude, int32_t* longitude, int* satellites, bool* fix) {
+    if (edgetxAndroidGetGps == nullptr) return false;
+
+    int32_t lat = 0;
+    int32_t lon = 0;
+    uint8_t sats = 0;
+    uint8_t has = 0;
+    edgetxAndroidGetGps(&lat, &lon, &sats, &has);
+    if (latitude) *latitude = lat;
+    if (longitude) *longitude = lon;
+    if (satellites) *satellites = sats;
+    if (fix) *fix = has != 0;
+    return true;
+}
+
 void setBattery(uint16_t millivolts, uint8_t percent, bool charging) {
     g_batteryMv = millivolts;
     g_batteryPercent = percent;
@@ -175,7 +208,6 @@ void setBattery(uint16_t millivolts, uint8_t percent, bool charging) {
 uint32_t takeAudio(uint8_t* dst, uint32_t maxLen) {
     return edgetxAndroidTakeAudio(dst, maxLen);
 }
-
 uint32_t audioSampleRate() { return edgetxAndroidAudioSampleRate(); }
 uint32_t audioWrittenBytes() { return edgetxAndroidAudioWrittenBytes(); }
 uint32_t audioDroppedBytes() { return edgetxAndroidAudioDroppedBytes(); }

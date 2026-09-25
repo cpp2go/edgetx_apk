@@ -12,6 +12,12 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!-- The remote controller's own GPS, which is what EdgeTX's own position (gpsData) is filled
+         from - see RcGps. A runtime permission, asked for by EdgeTxActivity; without it the
+         firmware simply shows no fix. The RF link's telemetry GPS does not need any of this. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
     <!-- RcDpadLog: the remote's own key handler writes every button it handles to logcat,
          and on the RC Pro that is the only reliable source for the pause, landing, C1 and
          C2 buttons (the DJI SDK sets its whole key set to null in waves and loses presses

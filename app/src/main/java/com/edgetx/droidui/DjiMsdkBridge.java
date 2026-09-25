@@ -4,6 +4,8 @@ import android.app.Application;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.util.Log;
 
@@ -12,11 +14,14 @@ import dji.sdk.keyvalue.key.DJIKey;
 import dji.sdk.keyvalue.key.DJIKeyInfo;
 import dji.sdk.keyvalue.key.DJIRemoteControllerKey;
 import dji.sdk.keyvalue.key.KeyTools;
+import dji.sdk.keyvalue.value.common.EmptyMsg;
+import dji.sdk.keyvalue.value.common.LocationCoordinate2D;
 import dji.sdk.keyvalue.value.remotecontroller.BatteryInfo;
 import dji.sdk.keyvalue.value.remotecontroller.FiveDimensionPressedStatus;
 import dji.sdk.keyvalue.value.remotecontroller.RcCustomButtonEvent;
 import dji.sdk.keyvalue.value.remotecontroller.RcCustomButtonHardwareStatus;
 import dji.sdk.keyvalue.value.remotecontroller.RCFlightModeSwitch;
+import dji.sdk.keyvalue.value.remotecontroller.RcGPSInfo;
 import dji.sdk.keyvalue.value.remotecontroller.RCTransformationSwitchState;
 import dji.sdk.keyvalue.value.remotecontroller.RcSoftSwitchMode;
 import dji.v5.common.callback.CommonCallbacks;
@@ -288,6 +293,7 @@ public final class DjiMsdkBridge {
             listenBattery();
             listenDials();
             if (sProbe) probeKeys();
+            startHapticPolling();
             Log.i(TAG, "dji: registered, product category "
                     + SDKManager.getInstance().getProductCategory());
             sListening = true;
@@ -329,6 +335,7 @@ public final class DjiMsdkBridge {
         probe("transform", DJIRemoteControllerKey.KeyRCTransformationSwitchState);
         probe("uavLock", DJIRemoteControllerKey.KeyUavLockStatus);
         probe("machineMode", DJIRemoteControllerKey.KeyRcMachineMode);
+        probe("rcShake", DJIRemoteControllerKey.KeyRcShakeMotor);
         reportSupport("flightMode", DJIRemoteControllerKey.KeyFlightModeSwitchState);
         reportSupport("softSwitchMode", DJIRemoteControllerKey.KeySoftSwitchMode);
         reportSupport("transform", DJIRemoteControllerKey.KeyRCTransformationSwitchState);
@@ -341,6 +348,7 @@ public final class DjiMsdkBridge {
         reportSupport("flightModeString", DJIFlightControllerKey.KeyFlightModeString);
         reportSupport("fcSwitchMode", DJIFlightControllerKey.KeyFCRemoteControllerSwitchMode);
         reportSupport("fcFlightMode", DJIFlightControllerKey.KeyFCFlightMode);
+        reportSupport("rcShake", DJIRemoteControllerKey.KeyRcShakeMotor);
     }
 
     /**
@@ -1123,6 +1131,92 @@ public final class DjiMsdkBridge {
         }
     }
 
+    // ---------------------------------------------------- EdgeTX's haptics -> the RC's motor ---
+    //
+    // EdgeTX decides when to buzz (its own Haptic setting and the model's alarms) and the
+    // simulator counts each event; the remote controller's motor is what can actually make a
+    // noise here, through KeyRcShakeMotor. Only events turn into a shake - a continuous buzz is
+    // not something that motor could follow - and they are rate-limited, because a burst of
+    // alarms would otherwise be a queue of shakes the motor cannot keep up with.
+
+    /**
+     * How many haptic events the firmware has raised so far, counted by radio/src/haptic.cpp.
+     */
+    static native int nativeHapticEvents();
+
+    private static final long HAPTIC_POLL_MS = 50;
+    /** The motor shakes rather than vibrates: leave it time to finish before the next one. */
+    private static final long HAPTIC_MIN_GAP_MS = 150;
+
+    private static long sHapticSeen;
+    private static long sLastShakeAt;
+    private static long sShakes;
+
+    /**
+     * Watches the firmware's haptic counter. A poll rather than a callback because that is what
+     * the counter is for (the WASM build reads it the same way, every 50 ms), and it has to keep
+     * running after the UI is closed, which the main looper does while the link service holds the
+     * process.
+     */
+    private static void startHapticPolling() {
+        final Handler handler = new Handler(Looper.getMainLooper());
+        handler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                pollHaptics();
+                handler.postDelayed(this, HAPTIC_POLL_MS);
+            }
+        }, HAPTIC_POLL_MS);
+    }
+
+    private static void pollHaptics() {
+        try {
+            final long events = nativeHapticEvents();
+            if (events == sHapticSeen) {
+                return;
+            }
+            if (events < sHapticSeen) {
+                sHapticSeen = events;   // the firmware was restarted, not another event
+                return;
+            }
+            sHapticSeen = events;
+
+            final long now = System.currentTimeMillis();
+            if (now - sLastShakeAt < HAPTIC_MIN_GAP_MS) {
+                return;   // still shaking: one event is enough for a burst
+            }
+            sLastShakeAt = now;
+            shakeRemote();
+        } catch (Throwable t) {
+            Log.w(TAG, "dji: haptic poll failed", t);
+        }
+    }
+
+    /** One shake of the remote controller's motor. */
+    private static void shakeRemote() {
+        try {
+            final DJIKey.ActionKey<EmptyMsg, EmptyMsg> key =
+                    KeyTools.createKey(DJIRemoteControllerKey.KeyRcShakeMotor);
+            KeyManager.getInstance().performAction(key, new EmptyMsg(),
+                    new CommonCallbacks.CompletionCallbackWithParam<EmptyMsg>() {
+                        @Override
+                        public void onSuccess(EmptyMsg result) {
+                            sShakes++;
+                            if (sShakes <= 3 || sShakes % 20 == 0) {
+                                Log.i(TAG, "dji: haptic -> remote shake " + sShakes);
+                            }
+                        }
+
+                        @Override
+                        public void onFailure(IDJIError error) {
+                            Log.w(TAG, "dji: could not shake the remote: " + error);
+                        }
+                    });
+        } catch (Throwable t) {
+            Log.w(TAG, "dji: could not shake the remote", t);
+        }
+    }
+
     /**
      * The aircraft's real arm state, as opposed to the button's latch.
      *
@@ -1428,6 +1522,11 @@ public final class DjiMsdkBridge {
         final DJIKey<RCFlightModeSwitch> flightModeKey =
                 createKeyOf(DJIRemoteControllerKey.KeyFlightModeSwitchState);
         RCFlightModeSwitch lastFlightMode = null;
+
+        // The remote's own GPS used to be listened for here as KeyRcGPSInfo, which reports as
+        // supported on the RC Pro and then never delivers anything (measured with the probe, like
+        // KeySoftSwitchMode and KeyFlightModeString). It comes from Android's own location stack
+        // instead, which is already tracking the same chip - see RcGps.
 
         sRateWindowStartMs = System.currentTimeMillis();
 

@@ -201,9 +201,25 @@ android {
 // -Pedgetx.dir=... / -Pedgetx.abis=... if your checkout differs.
 // ---------------------------------------------------------------------------
 val edgetxDir = (findProperty("edgetx.dir") as String?) ?: "E:/develop/dev/edgetx_esp32"
+
+// local.properties is where the Android plugin itself takes the SDK path from, but
+// findProperty() looks at Gradle's properties and does not read that file. Without this, a
+// machine whose SDK is only written down there falls through to the path the port was written
+// on - and CMake then fails with "not a valid program" for a cmake.exe that has nothing to do
+// with the real problem (measured here).
+fun localProperty(name: String): String? {
+    val file = rootProject.file("local.properties")
+    if (!file.isFile) return null
+    val props = Properties()
+    file.inputStream().use { props.load(it) }
+    return props.getProperty(name)
+}
+
 val sdkDir = (findProperty("sdk.dir") as String?)
+    ?: localProperty("sdk.dir")
     ?: System.getenv("ANDROID_HOME")
-    ?: "E:/develop/android-sdk"
+    ?: System.getenv("ANDROID_SDK_ROOT")
+    ?: error("no Android SDK found: set sdk.dir in local.properties, or ANDROID_HOME")
 val ndkDir = "$sdkDir/ndk/28.2.13676358"
 val cmakeExe = "$sdkDir/cmake/3.22.1/bin/cmake.exe"
 val simuPcb = (findProperty("edgetx.pcb") as String?) ?: "TX16SMK3"

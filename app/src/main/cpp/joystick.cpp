@@ -1553,6 +1553,53 @@ Java_com_edgetx_droidui_DjiMsdkBridge_nativeSetInputsReady(JNIEnv* env, jclass c
     setInputsReady(true);
 }
 
+// Called from RcGps.java with the remote controller's own position, which comes from Android's
+// location stack there (the DJI SDK's KeyRcGPSInfo never delivers anything on the RC Pro). It
+// goes into the firmware's own GPS (edgetxAndroidSetGps, see the simulator's simulib.cpp), which
+// is what the Radio Info, Statistics and top-bar views and luaGetGPSPosition() read - deliberately
+// not the telemetry GPS, because that one belongs to the aircraft and arrives over the RF link.
+//
+// Values arrive in the firmware's units (1e-6 degrees, 0.1 m, 0.1 m/s, 0.1 degrees, satellites),
+// see RcGps.onLocationChanged().
+extern "C" JNIEXPORT void JNICALL
+Java_com_edgetx_droidui_RcGps_nativeSetGps(JNIEnv* env, jclass clazz, jint latitude,
+                                           jint longitude, jint altitude, jint speed,
+                                           jint course, jint satellites, jboolean fix) {
+    (void)env;
+    (void)clazz;
+    simu::setGps(latitude, longitude, altitude, (uint16_t)speed, (uint16_t)course,
+                 (uint8_t)satellites, fix != JNI_FALSE);
+
+    // The firmware's own view of what was just pushed, so the log says whether the position
+    // landed rather than that it was sent (the app's own line says the latter). Throttled: this
+    // arrives about once a second while the remote is moving.
+    static long lastCheckMs = 0;
+    const long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (nowMs - lastCheckMs < 10000) {
+        return;
+    }
+    lastCheckMs = nowMs;
+    int32_t lat = 0;
+    int32_t lon = 0;
+    int sats = 0;
+    bool hasFix = false;
+    if (simu::firmwareGps(&lat, &lon, &sats, &hasFix)) {
+        LOGI("gps: the firmware's own GPS holds %d, %d sats=%d fix=%d", (int)lat, (int)lon, sats,
+             hasFix ? 1 : 0);
+    }
+}
+
+// Called from DjiMsdkBridge.java: how many haptic events the firmware has raised so far. The
+// firmware counts them itself (radio/src/haptic.cpp, under SIMU) and the app turns each new one
+// into a shake of the remote controller's motor.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_edgetx_droidui_DjiMsdkBridge_nativeHapticEvents(JNIEnv* env, jclass clazz) {
+    (void)env;
+    (void)clazz;
+    return (jint)simu::hapticEvents();
+}
+
 // Called from RcRawJoystick.java for the buttons that only exist in the joystick's raw
 // reports - the return button (see handleKeyCode above). It goes through the same handler
 // as Android's key events, so the key map file and EdgeTX's own long-press timing apply

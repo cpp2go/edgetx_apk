@@ -93,6 +93,29 @@ uint8_t edgetxAndroidExternalModuleType() __attribute__((weak));
 // until the firmware restarts.
 void edgetxAndroidSetSwitch(uint8_t index, int8_t state) __attribute__((weak));
 
+// The remote controller's own GPS, written by DjiMsdkBridge (see listenGps). It lands in the
+// firmware's gpsData - the same slot an internal GPS module fills (radio/src/gps.h) - so Radio
+// Info, Statistics, the top-bar GPS view and luaGetGPSPosition() show the remote's position.
+// The telemetry GPS that arrives over the RF module is a different thing and is not touched.
+//
+// Units are the firmware's: 1e-6 degrees, 0.1 m, 0.1 m/s, 0.1 degrees, satellites, and 0/1 for
+// the fix. Weak like the others, so an older simulator library still lets the app load - check
+// for null before calling, see simu::setGps().
+void edgetxAndroidSetGps(int32_t latitude, int32_t longitude, int32_t altitude, uint16_t speed,
+                         uint16_t course, uint8_t satellites, uint8_t fix)
+    __attribute__((weak));
+
+// What the firmware's own GPS holds after such a push (radio/src/gps.h), so the app can check
+// instead of assume. Weak like the rest: an older simulator library has no such entry point.
+void edgetxAndroidGetGps(int32_t* latitude, int32_t* longitude, uint8_t* satellites,
+                         uint8_t* fix) __attribute__((weak));
+
+// How many haptic events the firmware has raised so far (radio/src/haptic.cpp counts them under
+// SIMU). Only the event path is counted - a continuous buzz is not something the RC's shake motor
+// could follow anyway - and the app turns each new event into one shake of the remote, see
+// DjiMsdkBridge.pollHaptics(). Weak for the same reason as above.
+uint32_t simuGetHaptic() __attribute__((weak));
+
 // Implemented by the simulator library (gui/colorlcd/lcd.cpp). Weak so an older
 // library without it still links, and then nothing is done.
 void lcdRequestFullRefresh() __attribute__((weak));
@@ -223,6 +246,24 @@ void setSwitch(uint8_t index, int8_t state);
 // the simulator library to be rebuilt.
 void setBattery(uint16_t millivolts, uint8_t percent, bool charging);
 
+    /**
+     * The remote controller's own GPS, into the firmware's own GPS (see edgetxAndroidSetGps
+     * above). Called from DjiMsdkBridge when the DJI SDK publishes a new position.
+     */
+    void setGps(int32_t latitude, int32_t longitude, int32_t altitude, uint16_t speed,
+                uint16_t course, uint8_t satellites, bool fix);
+
+    /**
+     * The firmware's own view of the same position, or false when the loaded simulator library
+     * is older than this call. Used to log whether a push really landed - see setGps above.
+     */
+    bool firmwareGps(int32_t* latitude, int32_t* longitude, int* satellites, bool* fix);
+
+    /**
+     * How many haptic events the firmware has raised so far, or 0 when the loaded simulator
+     * library is older than this call. Never decreases, so a caller can act on the difference.
+     */
+    uint32_t hapticEvents();
 // Logs the battery the firmware itself reports, next to the RC's. Only call this once
 // the firmware is running (the ADC tables are set up by simuInit()).
 void logFirmwareBattery();

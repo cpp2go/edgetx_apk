@@ -59,6 +59,9 @@ public class EdgeTxApplication extends Application {
 
         askForSdCardAccess();
         RcBattery.start(this);
+        // The remote's own GPS, for EdgeTX's own position. Needs ACCESS_FINE_LOCATION, which only
+        // the activity can ask for - this call is the one that works once that has been granted.
+        RcGps.start(this);
         // The squelch, beeps and voice prompts are the firmware's own audio; this only
         // gives it an output device (see RcAudio).
         RcAudio.start(this);
