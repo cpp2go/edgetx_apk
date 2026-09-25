@@ -1314,15 +1314,26 @@ public final class DjiMsdkBridge {
     // round to it. Measured on the RC Pro: waves of 20-60 s in which controls can be moved with
     // nothing arriving at all, which is what "sometimes it does nothing" is.
     //
-    // The cause is the DJI app (dji.go.v5) running in the background: it subscribes to the same
+    // The DJI app (dji.go.v5) is what was measured to cause this: it subscribes to the same
     // remote through the same SDK, and while it is there the pushes arrive late or not at all.
     // Measured on the RC Pro, one app instance, one switch:
     //   * with dji.go.v5 force-stopped: four positions in 13 s, every value distinct, and not a
     //     single "went silent" line in the log;
     //   * with it started again: the flight-mode key, C1, C2, video and pause all went null
     //     within seconds.
-    // That is also why a remote reboot used to look like the cure - after one, the DJI app has
-    // not started yet.
+    // It cannot simply be kept away, though: on this remote it comes back on its own (seen twice,
+    // the second time a force-stop was needed again 20 minutes later - pidof empty at one check
+    // and the app at pid 7488 at the next), and a wave every 10 to 30 s was observed on
+    // 2026-09-25 18:12-18:16 at a moment when a pidof check happened to find it stopped. So treat
+    // that app as the usual cause rather than as something this code can force away, and treat a
+    // wave as possible either way.
+    //
+    // What matters for a model is which control has a second reader: the flight-mode switch has
+    // none (the remote's own log has no name for a switch, the raw reports do not carry it). The
+    // landing, pause and C1..C3 buttons are wave-proof through the remote's own button log
+    // (RcDpadLog), which is exactly why READ_LOGS is worth having; the raw USB report covers the
+    // rest. A remote reboot used to look like the cure because the DJI app has not started yet
+    // after one.
     //
     // Nothing an app does shortens a wave; all of these were tried against one:
     //   * cancelling the subscription and re-issuing it every 10 s, and again every 4 s once the
@@ -1353,10 +1364,13 @@ public final class DjiMsdkBridge {
                 SILENT_SINCE.put(name, System.currentTimeMillis());
                 if (sProbe) Log.i(TAG, "dji: " + name + " went silent");
                 if ("flightMode".equals(name)) {
-                    // Once per wave, and only for the switch a model is likely to use: what to
-                    // do about it is the whole remedy, see the note above this method.
-                    Log.i(TAG, "dji: the flight-mode switch has stopped being reported - "
-                            + "the DJI app running in the background is what does this");
+                    // Once per wave, and only for the switch a model is likely to use: it is the
+                    // one control with no second reader - the remote's own button log has no
+                    // name for a switch, and the raw reports do not carry it - so a wave is felt
+                    // here first and nowhere else. Nothing an app does shortens one; see the
+                    // silence notes above.
+                    Log.i(TAG, "dji: the flight-mode switch has stopped being reported - the "
+                            + "remote's own data channel is having one of its quiet spells");
                 }
             }
             return;
@@ -1516,9 +1530,9 @@ public final class DjiMsdkBridge {
         // point a published one does (applySwitchPosition), which is what keeps one movement
         // from being applied twice.
         //
-        // The buttons are deliberately *not* polled: the ones the SDK drops are the ones the
-        // remote's own log carries (see RcDpadLog), and a third source for a press-only button
-        // would give a second toggle for it.
+        // The buttons are not polled: a press is an event, so the cache holds nothing to read
+        // between presses, and during a wave it holds null - the log reader (RcDpadLog) is what
+        // covers the buttons the SDK drops, and RcButtons merges the two where both see a press.
         final DJIKey<RCFlightModeSwitch> flightModeKey =
                 createKeyOf(DJIRemoteControllerKey.KeyFlightModeSwitchState);
         RCFlightModeSwitch lastFlightMode = null;

@@ -62,6 +62,9 @@ public class EdgeTxApplication extends Application {
         // The remote's own GPS, for EdgeTX's own position. Needs ACCESS_FINE_LOCATION, which only
         // the activity can ask for - this call is the one that works once that has been granted.
         RcGps.start(this);
+        // Diagnostic only, and only while files/hid_probe exists: asks whether DJI's own protocol
+        // library is reachable from this app (see RcVendorProtocol).
+        RcVendorProtocol.start(this);
         // The squelch, beeps and voice prompts are the firmware's own audio; this only
         // gives it an output device (see RcAudio).
         RcAudio.start(this);
