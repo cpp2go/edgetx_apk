@@ -22,6 +22,7 @@
 #include <dirent.h>
 #include <jni.h>
 #include <sys/stat.h>
+#include <sys/system_properties.h>
 
 #include <algorithm>
 #include <atomic>
@@ -318,7 +319,7 @@ std::string prepare_sd_root(const char* filesDir, const char* externalFilesDir) 
 
 // ------------------------------------------------------- switch types --------
 //
-// Three of the switches this port drives do not match what the board's own default
+// Four of the switches this port drives do not match what the board's own default
 // radio.yml declares:
 //
 //   SI  the R3 button (see joystick.cpp: kSwitchKeys)          the board leaves it unset
@@ -326,10 +327,15 @@ std::string prepare_sd_root(const char* filesDir, const char* externalFilesDir) 
 //   SE  the shutter button (DjiMsdkBridge.setShutterPosition)  the board calls it
 //       three-position, while the button only has two ends: every press steps it to the
 //       other one, and no middle position is ever reported
+//   SF  the same button again on the RC Pro, which is the other remote this port runs on:
+//       there the photo button drives SF (the round button drives SE) and it has two ends
+//       just the same. On the RC Plus 2 SF is where its C1/C2/C3 buttons pick one of three
+//       positions, so there it keeps the board's 3POS - which is why the table below can
+//       name a remote.
 //
 // A switch with no type is missing from the Hardware page and cannot be used as a mixer
 // source, and a three-position switch whose middle never happens is a middle position
-// waiting to be picked. All three are two-ended controls, so 2POS is what they get.
+// waiting to be picked. All four are two-ended controls, so 2POS is what they get.
 //
 // The host cannot set the type through the firmware. The firmware reads radio.yml in
 // its own boot (storageReadAll() in edgetx.cpp) and only ever writes its settings from
@@ -339,15 +345,28 @@ std::string prepare_sd_root(const char* filesDir, const char* externalFilesDir) 
 // has not picked one in the Hardware page. Nothing else in the file is touched.
 struct SwitchTypeDefault {
     const char* name;
-    const char* board;  // the type the board's own default radio.yml carries
-    const char* type;   // what the control behind it actually is
+    const char* board;   // the type the board's own default radio.yml carries
+    const char* type;    // what the control behind it actually is
+    const char* device;  // the remote it applies to, or nullptr for every remote
 };
 
 constexpr SwitchTypeDefault kSwitchTypeDefaults[] = {
-    {"SI", "NONE", "2POS"},
-    {"SJ", "NONE", "2POS"},
-    {"SE", "3POS", "2POS"},
+    {"SI", "NONE", "2POS", nullptr},
+    {"SJ", "NONE", "2POS", nullptr},
+    {"SE", "3POS", "2POS", nullptr},
+    {"SF", "3POS", "2POS", "rm510"},   // RC Pro only: see the note above
 };
+
+// The remote this build is running on, as Build.DEVICE reports it and as DjiMsdkBridge's
+// isRcPro() reads it - the two have to agree, so the property is where that name comes from.
+// Read here rather than handed over from Java because these types are applied in link_start(),
+// which runs before the SDK bridge exists (and on a build without the SDK at all), while the
+// property is there from boot either way.
+std::string remoteModel() {
+    char value[PROP_VALUE_MAX] = {0};
+    __system_property_get("ro.product.device", value);
+    return std::string(value);
+}
 
 std::string trim(const std::string& text) {
     const size_t begin = text.find_first_not_of(" \t\r\n");
@@ -399,6 +418,8 @@ unsigned set_default_switch_types(const std::string& sdRoot) {
         return 0;
     }
 
+    const std::string model = remoteModel();
+
     const std::string text = read_text_file(path);
     if (text.empty()) return 0;
 
@@ -442,12 +463,13 @@ unsigned set_default_switch_types(const std::string& sdRoot) {
 
         for (const SwitchTypeDefault& def : kSwitchTypeDefaults) {
             if (current != def.name) continue;
+            if (def.device != nullptr && def.device != model) continue;
             if (trimmed != std::string("type: ") + def.board) continue;
 
             line = line.substr(0, line.find_first_not_of(" \t")) + "type: " + def.type +
                    (crlf ? "\r" : "");
-            LOGI("sdcard: switch %s: type %s -> %s in RADIO/radio.yml", def.name, def.board,
-                 def.type);
+            LOGI("sdcard: switch %s: type %s -> %s in RADIO/radio.yml%s", def.name, def.board,
+                 def.type, def.device == nullptr ? "" : " (this remote's default)");
             ++changed;
         }
     }
