@@ -2,6 +2,7 @@
 
 #include <android/keycodes.h>
 #include <jni.h>
+#include <sys/system_properties.h>
 
 #include <algorithm>
 #include <atomic>
@@ -911,8 +912,95 @@ bool g_exitDownSwallowed = false;   // the press of the second click, not yet re
 bool g_exitTapSeen = false;         // the previous click ended within the window
 std::chrono::steady_clock::time_point g_exitTapAt;
 
+// Clicks counted for the trim mode, and when the last one arrived - see handle_exit_click.
+// Guarded by its own mutex: the count is made on the input thread and read on the link thread,
+// which is where the burst is handed to the trim counter (settle_exit_clicks).
+std::mutex g_exitClickMutex;
+int g_exitClickCount = 0;
+
+// One press of the trim-mode button, defined with the trim mode further down.
+void requestTrimModePress();
+
+// The remote this build runs on, from the same property DjiMsdkBridge.isRcPro() reads
+// (Build.DEVICE), so the two sides cannot disagree.
+bool is_rc_pro() {
+    static const bool rcPro = [] {
+        char value[PROP_VALUE_MAX] = {0};
+        __system_property_get("ro.product.device", value);
+        return std::string(value) == "rm510";
+    }();
+    return rcPro;
+}
+
+// The RC Pro's return button carries the gesture the RC Plus 2's landing (H) button carries
+// there: one click puts the 5-way back to its normal job, two make it trim the left stick,
+// three the right one (see the trim mode below).
+//
+// The clicks are counted here and every click after the first is kept from the firmware, so
+// the UI still sees one RTN press for a double click - which on this remote is what it saw
+// before, where the second click was turned into a long press instead. That synthesis is off
+// on the RC Pro because a real hold now reaches EdgeTX from the raw joystick reports (see the
+// note above), and because a long press on the main view is its own gesture (ViewMain::
+// onLongPress) rather than something a double click should be doing by accident.
+//
+// The count is not the trim counter's yet: nothing is forwarded from here, see
+// settle_exit_clicks for why.
+bool handle_exit_click_rc_pro(bool down) {
+    const auto now = std::chrono::steady_clock::now();
+
+    if (down) {
+        int count;
+        {
+            std::lock_guard<std::mutex> lock(g_exitClickMutex);
+            const bool continuing = g_exitClickCount > 0 && now - g_exitTapAt <= kDoubleClickWindow;
+            g_exitTapAt = now;
+            g_exitClickCount = continuing ? g_exitClickCount + 1 : 1;
+            count = g_exitClickCount;
+        }
+        if (count > 1) {
+            LOGI("joystick: RTN click %d -> trim mode", count);
+            g_exitDownSwallowed = true;   // counted, but the UI does not see it
+            return true;
+        }
+        g_exitDownSwallowed = false;
+        report_key_hold(kKeyExit, true);
+        set_key(kKeyExit, true);
+        return true;
+    }
+
+    if (g_exitDownSwallowed) {
+        g_exitDownSwallowed = false;
+        return true;
+    }
+
+    report_key_hold(kKeyExit, false);
+    set_key(kKeyExit, false);
+    return true;
+}
+
+// Hands the clicks of a finished burst to the trim counter, from the link thread.
+//
+// Two back presses 400-800 ms apart are an ordinary thing to do in a menu, and the trim
+// counter counts presses up to 800 ms apart - so forwarding each click as it arrives would
+// leave the trim mode armed after them, with the 5-way silently trimming a stick for the next
+// three seconds instead of turning the encoder. The gesture on this remote is a burst within
+// the double click window, so only a finished burst is forwarded, in one go, which is also
+// what makes "two clicks = left stick, three = right stick" mean exactly that.
+void settle_exit_clicks(std::chrono::steady_clock::time_point now) {
+    int clicks = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_exitClickMutex);
+        if (g_exitClickCount > 0 && now - g_exitTapAt >= kDoubleClickWindow) {
+            clicks = g_exitClickCount;
+            g_exitClickCount = 0;
+        }
+    }
+    for (int i = 0; i < clicks; i++) requestTrimModePress();
+}
+
 // Returns true when the click was dealt with here, which for the return key is always.
 bool handle_exit_click(bool down) {
+    if (is_rc_pro()) return handle_exit_click_rc_pro(down);
     const auto now = std::chrono::steady_clock::now();
 
     if (down) {
@@ -1408,6 +1496,9 @@ void tick() {
         }
         if (queued) simu::setSwitch(static_cast<uint8_t>(index), state);
     }
+
+    // The return button's clicks become trim counter presses here, once the burst is over.
+    if (is_rc_pro()) settle_exit_clicks(std::chrono::steady_clock::now());
 
     // Trim mode: settle on the mode once the go-home presses stop, then hold every
     // queued trim step long enough for the firmware's own polling to see it.

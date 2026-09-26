@@ -687,7 +687,10 @@ public final class DjiMsdkBridge {
                                 // being read, this branch otherwise - which left the switch
                                 // depending on READ_LOGS, a hand grant a reinstall takes away.
                                 // Both go into RcButtons now and it merges them, so the switch
-                                // moves once whichever reader saw the press.
+                                // moves once whichever reader saw the press. The trim gesture is
+                                // not wanted here: SA is a switch the user toggles freely, and on
+                                // the RC Pro the return button carries that gesture instead (see
+                                // joystick.cpp: handle_exit_click).
                                 if (isRcPro()) {
                                     buttonEdge(SW_SA, "landing", RcButtons.SOURCE_SDK, true);
                                     return;
