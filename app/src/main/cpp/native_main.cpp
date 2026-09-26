@@ -957,32 +957,35 @@ int32_t on_input_event(struct android_app* app, AInputEvent* event) {
     // No window means no touch anyway; the firmware may well still be up.
     if (g_window.load() == nullptr || g_lcdW <= 0) return 0;
 
+    static const bool isRcProDevice = remoteModel() == "rm510";
     const int32_t action = AMotionEvent_getAction(event);
     const int32_t action_code = action & AMOTION_EVENT_ACTION_MASK;
 
     const float wx = AMotionEvent_getX(event, 0);
     const float wy = AMotionEvent_getY(event, 0);
-    ANativeWindow* window = g_window.load();
-    const int32_t windowHeight = ANativeWindow_getHeight(window);
-    const int32_t densityDpi = g_app != nullptr && g_app->config != nullptr
-            ? AConfiguration_getDensity(g_app->config)
-            : ACONFIGURATION_DENSITY_DEFAULT;
-    const int32_t gestureInset = std::max(1, densityDpi * 24 / 160);
+    if (isRcProDevice) {
+        ANativeWindow* window = g_window.load();
+        const int32_t windowHeight = ANativeWindow_getHeight(window);
+        const int32_t densityDpi = g_app != nullptr && g_app->config != nullptr
+                ? AConfiguration_getDensity(g_app->config)
+                : ACONFIGURATION_DENSITY_DEFAULT;
+        const int32_t gestureInset = std::max(1, densityDpi * 24 / 160);
 
-    if (action_code == AMOTION_EVENT_ACTION_DOWN) {
-        g_ignoreBottomGesture = wy >= windowHeight - gestureInset;
+        if (action_code == AMOTION_EVENT_ACTION_DOWN) {
+            g_ignoreBottomGesture = wy >= windowHeight - gestureInset;
+            if (g_ignoreBottomGesture) {
+                LOGI("touch: ignoring Android bottom gesture area y=%.0f height=%d inset=%d",
+                     wy, windowHeight, gestureInset);
+            }
+        }
+
         if (g_ignoreBottomGesture) {
-            LOGI("touch: ignoring Android bottom gesture area y=%.0f height=%d inset=%d",
-                 wy, windowHeight, gestureInset);
+            if (action_code == AMOTION_EVENT_ACTION_UP
+                    || action_code == AMOTION_EVENT_ACTION_CANCEL) {
+                g_ignoreBottomGesture = false;
+            }
+            return 1;
         }
-    }
-
-    if (g_ignoreBottomGesture) {
-        if (action_code == AMOTION_EVENT_ACTION_UP
-                || action_code == AMOTION_EVENT_ACTION_CANCEL) {
-            g_ignoreBottomGesture = false;
-        }
-        return 1;
     }
 
     int32_t lx = (static_cast<int32_t>(wx) - g_offX) * kFp / g_scaleFP;
@@ -1003,7 +1006,11 @@ int32_t on_input_event(struct android_app* app, AInputEvent* event) {
             simu::touchUp();
             break;
         case AMOTION_EVENT_ACTION_CANCEL:
-            simu::touchCancel();
+            if (isRcProDevice) {
+                simu::touchCancel();
+            } else {
+                simu::touchUp();
+            }
             break;
         default:
             break;
