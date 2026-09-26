@@ -16,6 +16,7 @@
 // radio/src/targets/simu/simulib.h for the platform API being used.
 #include <android/asset_manager.h>
 #include <android/asset_manager_jni.h>
+#include <android/configuration.h>
 #include <android/native_activity.h>
 #include <android/native_window.h>
 #include <android_native_app_glue.h>
@@ -55,6 +56,7 @@ struct android_app* g_app = nullptr;
 
 // Set by the activity thread while a window is up, cleared when it goes away.
 std::atomic<ANativeWindow*> g_window{nullptr};
+bool g_ignoreBottomGesture = false;
 
 // Guards the activity's side of the link: the window, the frame buffers and the
 // transform, plus the render step itself. Everything in there normally runs on the
@@ -960,6 +962,29 @@ int32_t on_input_event(struct android_app* app, AInputEvent* event) {
 
     const float wx = AMotionEvent_getX(event, 0);
     const float wy = AMotionEvent_getY(event, 0);
+    ANativeWindow* window = g_window.load();
+    const int32_t windowHeight = ANativeWindow_getHeight(window);
+    const int32_t densityDpi = g_app != nullptr && g_app->config != nullptr
+            ? AConfiguration_getDensity(g_app->config)
+            : ACONFIGURATION_DENSITY_DEFAULT;
+    const int32_t gestureInset = std::max(1, densityDpi * 24 / 160);
+
+    if (action_code == AMOTION_EVENT_ACTION_DOWN) {
+        g_ignoreBottomGesture = wy >= windowHeight - gestureInset;
+        if (g_ignoreBottomGesture) {
+            LOGI("touch: ignoring Android bottom gesture area y=%.0f height=%d inset=%d",
+                 wy, windowHeight, gestureInset);
+        }
+    }
+
+    if (g_ignoreBottomGesture) {
+        if (action_code == AMOTION_EVENT_ACTION_UP
+                || action_code == AMOTION_EVENT_ACTION_CANCEL) {
+            g_ignoreBottomGesture = false;
+        }
+        return 1;
+    }
+
     int32_t lx = (static_cast<int32_t>(wx) - g_offX) * kFp / g_scaleFP;
     int32_t ly = (static_cast<int32_t>(wy) - g_offY) * kFp / g_scaleFP;
     lx = std::clamp(lx, 0, g_lcdW - 1);
@@ -975,8 +1000,10 @@ int32_t on_input_event(struct android_app* app, AInputEvent* event) {
             break;
         case AMOTION_EVENT_ACTION_UP:
         case AMOTION_EVENT_ACTION_POINTER_UP:
-        case AMOTION_EVENT_ACTION_CANCEL:
             simu::touchUp();
+            break;
+        case AMOTION_EVENT_ACTION_CANCEL:
+            simu::touchCancel();
             break;
         default:
             break;

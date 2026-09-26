@@ -90,6 +90,7 @@ public class EdgeTxActivity extends NativeActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        EdgeTxApplication.startFromActivity(this);
         super.onCreate(savedInstanceState);
 
         // The two runtime permissions this app has, and neither one has a settings screen that

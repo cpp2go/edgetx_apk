@@ -35,6 +35,7 @@ uint32_t simuLcdGetDepth();
 void simuLcdFlushed();
 void simuTouchDown(int16_t x, int16_t y);
 void simuTouchUp();
+void simuTouchCancel();
 
 // Key injection. `key` is an index into EdgeTX's EnumKeys
 // (radio/src/hal/key_driver.h): 0 MENU, 1 EXIT, 2 ENTER, 3 PAGEUP, 4 PAGEDN,
@@ -197,6 +198,7 @@ bool takeFrame(uint8_t* dst, uint32_t dstLen);
 // Touch input in LCD coordinates.
 void touchDown(int16_t x, int16_t y);
 void touchUp();
+void touchCancel();
 
 // ------------------------------------------------------------- input API --
 //

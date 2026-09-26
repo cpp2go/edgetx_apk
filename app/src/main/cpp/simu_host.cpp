@@ -121,6 +121,8 @@ void touchDown(int16_t x, int16_t y) { simuTouchDown(x, y); }
 
 void touchUp() { simuTouchUp(); }
 
+void touchCancel() { simuTouchCancel(); }
+
 void pushAnalog(uint8_t idx, uint16_t value) { edgetxAndroidSetAnalog(idx, value); }
 
 void setAnalogSource(bool external) {

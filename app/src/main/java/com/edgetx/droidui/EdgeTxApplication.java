@@ -29,6 +29,9 @@ public class EdgeTxApplication extends Application {
 
     /** The process {@link UsbAttachActivity} runs in, and which must stay empty. */
     private static final String USB_ATTACH_PROCESS = ":usbattach";
+    private static final String LINK_PREFS = "link";
+    private static final String PREF_MANUAL_CLOSED = "manualClosed";
+    private static boolean sRuntimeStarted;
 
     @Override
     protected void attachBaseContext(Context base) {
@@ -56,6 +59,37 @@ public class EdgeTxApplication extends Application {
             Log.i(TAG, "usb: attach-only process, nothing to start here");
             return;
         }
+
+        if (isManuallyClosed(this)) {
+            Log.i(TAG, "link: previously closed by the user; waiting for a manual app launch");
+            return;
+        }
+
+        startRuntime();
+    }
+
+    static void startFromActivity(Context context) {
+        final EdgeTxApplication app = (EdgeTxApplication) context.getApplicationContext();
+        setManuallyClosed(app, false);
+        app.startRuntime();
+    }
+
+    static boolean isManuallyClosed(Context context) {
+        return context.getSharedPreferences(LINK_PREFS, MODE_PRIVATE)
+                .getBoolean(PREF_MANUAL_CLOSED, false);
+    }
+
+    static void setManuallyClosed(Context context, boolean closed) {
+        final boolean saved = context.getSharedPreferences(LINK_PREFS, MODE_PRIVATE)
+                .edit().putBoolean(PREF_MANUAL_CLOSED, closed).commit();
+        if (!saved) {
+            Log.w(TAG, "link: could not persist manual-close state");
+        }
+    }
+
+    private synchronized void startRuntime() {
+        if (sRuntimeStarted) return;
+        sRuntimeStarted = true;
 
         askForSdCardAccess();
         RcBattery.start(this);

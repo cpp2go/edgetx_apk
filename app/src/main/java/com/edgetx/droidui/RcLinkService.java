@@ -1,5 +1,6 @@
 package com.edgetx.droidui;
 
+import android.app.ActivityManager;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -10,7 +11,9 @@ import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.content.res.AssetManager;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.PowerManager;
 import android.util.Log;
 
@@ -58,6 +61,9 @@ public final class RcLinkService extends Service {
 
     private static final String CHANNEL_ID = "rc_link";
     private static final int NOTIFICATION_ID = 1;
+    private static final String ACTION_STOP_LINK = "com.edgetx.droidui.action.STOP_LINK";
+    private static final String DJI_FLY_PACKAGE = "dji.go.v5";
+    private static final long DJI_FLY_CHECK_MS = 5000;
 
     static {
         // Normally already loaded by NativeActivity / RcModuleSerial; loading it
@@ -93,6 +99,21 @@ public final class RcLinkService extends Service {
     private static native boolean nativeLinkRunning();
 
     private PowerManager.WakeLock mWakeLock;
+    private final Handler mHandler = new Handler(Looper.getMainLooper());
+    private int mDjiStopRequests;
+    private boolean mExitProcessOnDestroy;
+    private final Runnable mDjiFlyGuard = new Runnable() {
+        @Override
+        public void run() {
+            if (EdgeTxApplication.isManuallyClosed(RcLinkService.this)) {
+                return;
+            }
+            stopDjiFlyInBackground();
+            if (!EdgeTxApplication.isManuallyClosed(RcLinkService.this)) {
+                mHandler.postDelayed(this, DJI_FLY_CHECK_MS);
+            }
+        }
+    };
 
     // ------------------------------------------------------------- lifecycle --
 
@@ -103,6 +124,10 @@ public final class RcLinkService extends Service {
      * own UI going away.
      */
     public static void start(Context context) {
+        if (EdgeTxApplication.isManuallyClosed(context)) {
+            Log.i(TAG, "link: start ignored because the user closed EdgeTX");
+            return;
+        }
         final Intent intent = new Intent(context, RcLinkService.class);
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -120,6 +145,15 @@ public final class RcLinkService extends Service {
         }
     }
 
+    static void stopForManualHandoff(Context context) {
+        final Intent intent = new Intent(context, RcLinkService.class).setAction(ACTION_STOP_LINK);
+        try {
+            context.startService(intent);
+        } catch (Throwable t) {
+            Log.w(TAG, "link: could not stop for manual handoff", t);
+        }
+    }
+
     @Override
     public IBinder onBind(Intent intent) {
         return null;
@@ -131,10 +165,32 @@ public final class RcLinkService extends Service {
         createChannel();
         promoteToForeground();
         acquireWakeLock();
+        if (!EdgeTxApplication.isManuallyClosed(this)) {
+            mHandler.post(mDjiFlyGuard);
+        }
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent != null && ACTION_STOP_LINK.equals(intent.getAction())) {
+            Log.i(TAG, "link: explicit stop requested; DJI Fly monitor stopped");
+            EdgeTxApplication.setManuallyClosed(this, true);
+            mExitProcessOnDestroy = true;
+            mHandler.removeCallbacks(mDjiFlyGuard);
+            stopForeground(true);
+            stopSelf(startId);
+            return START_NOT_STICKY;
+        }
+
+        if (EdgeTxApplication.isManuallyClosed(this)) {
+            Log.i(TAG, "link: ignoring automatic service restart after manual close");
+            mHandler.removeCallbacks(mDjiFlyGuard);
+            mExitProcessOnDestroy = true;
+            stopForeground(true);
+            stopSelf(startId);
+            return START_NOT_STICKY;
+        }
+
         // Booting the firmware seeds the simulated SD card first, which takes
         // seconds on the very first run: keep that off the main thread, where the
         // notification and the activity's lifecycle are handled.
@@ -157,6 +213,7 @@ public final class RcLinkService extends Service {
     @Override
     public void onDestroy() {
         Log.i(TAG, "link: service destroyed");
+        mHandler.removeCallbacks(mDjiFlyGuard);
         try {
             nativeStopLink();
         } catch (Throwable t) {
@@ -164,6 +221,12 @@ public final class RcLinkService extends Service {
         }
         releaseWakeLock();
         super.onDestroy();
+        if (mExitProcessOnDestroy) {
+            mHandler.postDelayed(() -> {
+                Log.i(TAG, "link: stopping the EdgeTX process to release the DJI SDK");
+                android.os.Process.killProcess(android.os.Process.myPid());
+            }, 250);
+        }
     }
 
     // ---------------------------------------------------------------- helpers --
@@ -219,17 +282,6 @@ public final class RcLinkService extends Service {
     }
 
     private Notification buildNotification() {
-        final Intent open = getPackageManager().getLaunchIntentForPackage(getPackageName());
-        PendingIntent contentIntent = null;
-        if (open != null) {
-            open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            int flags = PendingIntent.FLAG_UPDATE_CURRENT;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                flags |= PendingIntent.FLAG_IMMUTABLE;
-            }
-            contentIntent = PendingIntent.getActivity(this, 0, open, flags);
-        }
-
         final Notification.Builder builder =
                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
                         ? new Notification.Builder(this, CHANNEL_ID)
@@ -237,13 +289,33 @@ public final class RcLinkService extends Service {
 
         builder.setSmallIcon(R.drawable.ic_rc_link)
                 .setContentTitle("EdgeTX link running")
-                .setContentText("Sticks and switches keep going to the RF module")
+            .setContentText("Sticks and switches keep going to the RF module")
                 .setOngoing(true)
                 .setShowWhen(false);
-        if (contentIntent != null) {
-            builder.setContentIntent(contentIntent);
+        final Intent stop = new Intent(this, RcLinkService.class).setAction(ACTION_STOP_LINK);
+        int stopFlags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            stopFlags |= PendingIntent.FLAG_IMMUTABLE;
         }
+        final PendingIntent stopIntent = PendingIntent.getService(this, 1, stop, stopFlags);
+        builder.addAction(R.drawable.ic_rc_link, "Stop EdgeTX", stopIntent);
         return builder.build();
+    }
+
+    private void stopDjiFlyInBackground() {
+        try {
+            final ActivityManager manager =
+                    (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+            if (manager == null) return;
+            manager.killBackgroundProcesses(DJI_FLY_PACKAGE);
+            mDjiStopRequests++;
+            if (mDjiStopRequests <= 3 || mDjiStopRequests % 12 == 0) {
+                Log.i(TAG, "link: requested DJI Fly background stop (check "
+                        + mDjiStopRequests + "); ground use only");
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "link: could not request DJI Fly background stop", t);
+        }
     }
 
     private void createChannel() {
