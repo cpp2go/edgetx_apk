@@ -505,6 +505,110 @@ unsigned set_default_switch_types(const std::string& sdRoot) {
     return changed;
 }
 
+// ------------------------------------------------------- haptics ------------
+//
+// The motor is how this port plays an EdgeTX haptic: DjiMsdkBridge shakes the remote when
+// the firmware asks for one. It cannot ask for one unless the radio's settings allow it
+// (radio/src/haptic.cpp wants hapticMode >= e_mode_nokeys, and audio.cpp wants e_mode_all
+// for a key press), and the card the firmware creates for itself starts at
+// e_mode_nokeys with a length and a strength of 0 - under which nothing is ever played.
+//
+// So "vibration on by default" means this: the card gets mode_all with length and
+// strength 2, which is what the card this port was developed on carries. Same rule as the
+// switch types - only a value that is still the firmware's own default is touched, so once
+// the setting has been changed in Radio Setup -> Haptic, that choice stands and this pass
+// has nothing left to do.
+struct HapticDefault {
+    const char* key;
+    const char* from;   // the firmware's own default
+    const char* to;     // what the motor needs to do anything
+};
+
+constexpr HapticDefault kHapticDefaults[] = {
+    {"hapticMode", "mode_quiet", "mode_all"},
+    {"hapticMode", "mode_nokeys", "mode_all"},
+    {"hapticLength", "0", "2"},
+    {"hapticStrength", "0", "2"},
+};
+
+// Applies kHapticDefaults to RADIO/radio.yml and reports how many were changed. A missing
+// file is not a failure: the firmware is what creates it, on the boot after the one this
+// runs in, and the next start does it (the same two starts the switch types need).
+unsigned set_default_haptics(const std::string& sdRoot) {
+    const std::string path = sdRoot + "/RADIO/radio.yml";
+
+    if (!file_has_content(path)) {
+        LOGI("sdcard: no RADIO/radio.yml yet, the firmware creates it on this boot");
+        return 0;
+    }
+
+    const std::string text = read_text_file(path);
+    if (text.empty()) return 0;
+
+    const bool crlf = text.find("\r\n") != std::string::npos;
+    const bool endsWithNewline = text.back() == '\n';
+
+    std::vector<std::string> lines;
+    for (size_t start = 0; start < text.size();) {
+        size_t end = text.find('\n', start);
+        if (end == std::string::npos) end = text.size();
+        lines.push_back(text.substr(start, end - start));  // a '\r' stays on
+        start = end + 1;
+    }
+
+    // These are radio-wide settings, so they sit in column 0 - which is also what keeps
+    // this pass out of the per-switch records the switch types work in (struct_audioDef
+    // in the firmware's yaml_datastructs_tx16smk3.cpp).
+    unsigned changed = 0;
+    size_t editedFlag = lines.size();  // the file's "manuallyEdited:" line, if it has one
+
+    for (size_t i = 0; i < lines.size(); ++i) {
+        std::string& line = lines[i];
+        if (line.empty() || line[0] == ' ' || line[0] == '\t') continue;
+
+        const std::string trimmed = trim(line);
+        if (trimmed.rfind("manuallyEdited:", 0) == 0) editedFlag = i;
+
+        for (const HapticDefault& def : kHapticDefaults) {
+            const std::string prefix = std::string(def.key) + ": ";
+            if (trimmed.rfind(prefix, 0) != 0) continue;
+            if (trimmed != prefix + def.from) continue;
+
+            line = prefix + def.to + (crlf ? "\r" : "");
+            LOGI("sdcard: %s: %s -> %s in RADIO/radio.yml (this port's default)", def.key,
+                 def.from, def.to);
+            ++changed;
+        }
+    }
+
+    if (changed == 0) return 0;
+
+    // Hand-edited for the same reason the switch types are: the firmware only trusts a
+    // radio.yml whose checksum matches its own serialisation (see ChecksumResult in
+    // sdcard_yaml.cpp), and this flag is what makes it keep what it read instead of
+    // writing the file off as corrupt. See the note above set_default_switch_types().
+    const std::string edited = std::string("manuallyEdited: 1") + (crlf ? "\r" : "");
+    if (editedFlag < lines.size())
+        lines[editedFlag] = edited;
+    else
+        lines.insert(lines.begin(), edited);
+    LOGI("sdcard: RADIO/radio.yml marked as hand-edited (the firmware checks its checksum)");
+
+    std::string out;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        out += lines[i];
+        if (i + 1 < lines.size() || endsWithNewline) out += "\n";
+    }
+
+    if (!write_text_file(path, out)) {
+        LOGE("sdcard: cannot write %s", path.c_str());
+        return 0;
+    }
+
+    LOGI("sdcard: RADIO/radio.yml: %u haptic setting(s) filled in", changed);
+    return changed;
+}
+
 // Recompute how the LCD frame maps onto the window (aspect-fit + centred).
 void update_transform(int32_t winW, int32_t winH) {
     const int32_t sx = (winW * kFp) / g_lcdW;
@@ -683,8 +787,10 @@ bool link_start(AAssetManager* assets, const char* filesDir, const char* externa
         seed_assets(assets, sd);
     }
 
-    // Before the firmware loads its settings - see set_default_switch_types().
+    // Before the firmware loads its settings - see set_default_switch_types() and
+    // set_default_haptics().
     set_default_switch_types(sd);
+    set_default_haptics(sd);
 
     const simu::LcdInfo lcd = simu::lcdInfo();
     {

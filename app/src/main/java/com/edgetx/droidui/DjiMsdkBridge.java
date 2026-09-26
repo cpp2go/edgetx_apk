@@ -7,6 +7,8 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
 import android.util.Log;
 
 import dji.sdk.keyvalue.key.DJIFlightControllerKey;
@@ -221,6 +223,16 @@ public final class DjiMsdkBridge {
         } catch (Throwable t) {
             sProbe = false;
         }
+
+        // EdgeTX's haptics are played on the remote's own motor, and that does not need the SDK
+        // (see shakeRemote), so the motor is looked up before any of the registration below.
+        try {
+            sVibrator = (Vibrator) app.getSystemService(Context.VIBRATOR_SERVICE);
+        } catch (Throwable t) {
+            sVibrator = null;
+        }
+        Log.i(TAG, "dji: EdgeTX haptics go to the remote's own motor: "
+                + (sVibrator != null && sVibrator.hasVibrator() ? "yes" : "no motor here"));
 
         if (SDKManager.getInstance().isRegistered()) {
             listen();
@@ -1134,10 +1146,16 @@ public final class DjiMsdkBridge {
     // ---------------------------------------------------- EdgeTX's haptics -> the RC's motor ---
     //
     // EdgeTX decides when to buzz (its own Haptic setting and the model's alarms) and the
-    // simulator counts each event; the remote controller's motor is what can actually make a
-    // noise here, through KeyRcShakeMotor. Only events turn into a shake - a continuous buzz is
-    // not something that motor could follow - and they are rate-limited, because a burst of
-    // alarms would otherwise be a queue of shakes the motor cannot keep up with.
+    // simulator counts each event; the remote's motor is what can actually be felt. On an RC Pro
+    // the motor is Android's to drive: the SDK's KeyRcShakeMotor has no handler there at all
+    // (measured: REQUEST_HANDLER_NOT_FOUND, REMOTECONTROLLER.RcShakeMotor:-1), while the same
+    // motor answers the device's own vibrator (dumpsys vibrator shows it being driven), so the
+    // vibration is asked for directly - which needs no adb grant, only VIBRATE. The SDK call is
+    // kept as the fallback for a remote whose motor only answers the SDK.
+    //
+    // Only events turn into a buzz - a continuous vibration is not something a haptic queue can
+    // follow - and they are rate-limited, because a burst of alarms would otherwise be a queue of
+    // buzzes the motor cannot keep up with.
 
     /**
      * How many haptic events the firmware has raised so far, counted by radio/src/haptic.cpp.
@@ -1145,8 +1163,13 @@ public final class DjiMsdkBridge {
     static native int nativeHapticEvents();
 
     private static final long HAPTIC_POLL_MS = 50;
-    /** The motor shakes rather than vibrates: leave it time to finish before the next one. */
+    /** Long enough to be felt, short enough that a burst of them stays separate. */
+    private static final long HAPTIC_BUZZ_MS = 60;
+    /** Leave the motor time to finish before the next one. */
     private static final long HAPTIC_MIN_GAP_MS = 150;
+
+    /** The remote's own motor, as the device sees it (null on anything without one). */
+    private static Vibrator sVibrator;
 
     private static long sHapticSeen;
     private static long sLastShakeAt;
@@ -1192,8 +1215,26 @@ public final class DjiMsdkBridge {
         }
     }
 
-    /** One shake of the remote controller's motor. */
+    /** One buzz of the remote's motor, through the device's vibrator where there is one. */
     private static void shakeRemote() {
+        if (sVibrator != null && sVibrator.hasVibrator()) {
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    sVibrator.vibrate(VibrationEffect.createOneShot(HAPTIC_BUZZ_MS,
+                            VibrationEffect.DEFAULT_AMPLITUDE));
+                } else {
+                    sVibrator.vibrate(HAPTIC_BUZZ_MS);
+                }
+                sShakes++;
+                if (sShakes <= 3 || sShakes % 20 == 0) {
+                    Log.i(TAG, "dji: haptic -> the remote buzzes (" + sShakes + ")");
+                }
+                return;
+            } catch (Throwable t) {
+                Log.w(TAG, "dji: could not buzz the remote", t);
+            }
+        }
+
         try {
             final DJIKey.ActionKey<EmptyMsg, EmptyMsg> key =
                     KeyTools.createKey(DJIRemoteControllerKey.KeyRcShakeMotor);
