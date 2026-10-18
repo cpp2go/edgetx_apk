@@ -285,6 +285,8 @@ final class RcModuleSerial {
         /** Valid frames seen at the current rate, see {@link #CRSF_LOCK_FRAMES}. */
         int crsfFrames;
         long lastValidFrameAtMs;
+        /** Rate the firmware asked for when the lock was taken; a change means re-probing. */
+        int lockedWanted;
         final byte[] crsfTail = new byte[64];
         int crsfTailLength;
         long writeMaxMs;
@@ -780,6 +782,7 @@ final class RcModuleSerial {
         link.fineStepAtMs = 0;
         link.crsfSeen = false;
         link.crsfFrames = 0;
+        link.lockedWanted = 0;
         link.lastValidFrameAtMs = 0;
         link.crsfTailLength = 0;
         link.hexDumps = 0;
@@ -872,7 +875,23 @@ final class RcModuleSerial {
             return;
         }
 
-        final int wanted = resolveBaud(link, nativeWantedBaudrate(link.port));
+        final int wantedRaw = nativeWantedBaudrate(link.port);
+
+        // A lock pins the rate that works, which is not necessarily the one the firmware asks
+        // for - but when the firmware changes its mind the pin belongs to the wrong rate, and
+        // waiting at a rate the model no longer uses makes everything on the link slower.
+        if (link.crsfSeen && wantedRaw > 0 && link.lockedWanted != 0
+                && wantedRaw != link.lockedWanted) {
+            logi(link.role + ": firmware now asks for " + wantedRaw + " baud, probing again");
+            dropLock(link);
+        }
+        if (!link.crsfSeen) {
+            link.lockedWanted = 0;
+        } else if (link.lockedWanted == 0 && wantedRaw > 0) {
+            link.lockedWanted = wantedRaw;
+        }
+
+        final int wanted = resolveBaud(link, wantedRaw);
         final int encoding = nativeWantedEncoding(link.port);
 
         // A lock is only as good as the frames that keep arriving: a rate that was accepted by
@@ -881,14 +900,7 @@ final class RcModuleSerial {
                 && System.currentTimeMillis() - link.lastValidFrameAtMs > CRSF_LOCK_TIMEOUT_MS) {
             logi(link.role + ": nothing valid for " + CRSF_LOCK_TIMEOUT_MS + " ms at "
                     + link.appliedBaud + " baud, probing again");
-            link.crsfSeen = false;
-            link.crsfFrames = 0;
-            link.autoBaudIndex = -1;
-            link.autoBaudPass = 0;
-            link.autoBaudStepAtMs = 0;
-            link.autoBaudDone = false;
-            link.fineIndex = -1;
-            link.deviceRxBytes = 0;
+            dropLock(link);
         }
 
         if (wanted > 0 && (wanted != link.appliedBaud || encoding != link.appliedEncoding)) {
@@ -1107,6 +1119,19 @@ final class RcModuleSerial {
         return (int) Math.round(wanted * (1.0 + offset));
     }
 
+    /** Forgets the current rate so the next tick probes again from what the firmware asks for. */
+    private static void dropLock(Link link) {
+        link.crsfSeen = false;
+        link.crsfFrames = 0;
+        link.lockedWanted = 0;
+        link.autoBaudIndex = -1;
+        link.autoBaudPass = 0;
+        link.autoBaudStepAtMs = 0;
+        link.autoBaudDone = false;
+        link.fineIndex = -1;
+        link.deviceRxBytes = 0;
+    }
+
     /**
      * Notes whether a CRC-valid CRSF frame went past, which is what tells a rate that decodes the
      * module apart from one that merely produces bytes.
@@ -1133,7 +1158,9 @@ final class RcModuleSerial {
             }
             if (crc == (buf[i + 1 + length] & 0xFF)) {
                 link.lastValidFrameAtMs = System.currentTimeMillis();
-                if (link.crsfSeen) {
+                if (link.crsfSeen || !link.firmwarePortOpen) {
+                    // Frames only count once the firmware opened its side: before that the port
+                    // sits at the rate it was opened with, which is not a rate anything asked for.
                     continue;
                 }
                 // One frame can be a coincidence in garbage: a wrong baud rate produces random
