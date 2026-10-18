@@ -832,28 +832,19 @@ const SwitchKey kSwitchKeys[] = {
 // Android's key codes - so like every Android-delivered button they stop arriving once the
 // window is gone (see the note above).
 //
-// Holding one of them still opens the page it used to: a press that lasts longer than
-// kPositionKeyLongPress is not a switch move but the SYS/MODEL/TELE key, because those three
-// buttons are the only way into the setup pages on this remote.
+// These three are only switch positions now. They used to open the SYS/MODEL/TELE pages and
+// no longer do: the pages are reached from the radio's own screens.
 struct PositionKey {
     int32_t keycode;
     uint8_t index;
     int8_t  position;
-    uint8_t key;     // the page key a long press still opens
 };
 
 const PositionKey kPositionKeys[] = {
-    {AKEYCODE_F1, 9, -1, kKeySys},    // L1 -> SJ up
-    {AKEYCODE_F2, 9,  0, kKeyModel},  // L2 -> SJ middle
-    {AKEYCODE_F3, 9,  1, kKeyTele},   // L3 -> SJ down
+    {AKEYCODE_F1, 9, -1},  // L1 -> SJ up
+    {AKEYCODE_F2, 9,  0},  // L2 -> SJ middle
+    {AKEYCODE_F3, 9,  1},  // L3 -> SJ down
 };
-
-constexpr auto kPositionKeyLongPress = std::chrono::milliseconds(650);
-
-std::mutex g_positionKeyMutex;
-int32_t g_positionKeyDown = 0;                 // keycode held down, 0 when none
-std::chrono::steady_clock::time_point g_positionKeyDownAt{};
-bool g_positionKeyLongSent = false;            // its page key already went out
 
 std::vector<int32_t> g_loggedSwitchKeys;
 
@@ -1103,42 +1094,13 @@ bool handleKeyCode(int32_t keycode, bool down) {
         }
     }
 
-    // A position button sets its switch when it is released: a short press is the switch move,
-    // a long one opens the page it used to (see tick(), which sends that while it is held).
+    // A position button sets its switch and leaves it there: the release is swallowed here.
     for (const PositionKey& entry : kPositionKeys) {
         if (entry.keycode != keycode) continue;
-
         if (down) {
-            std::lock_guard<std::mutex> lock(g_positionKeyMutex);
-            g_positionKeyDown = keycode;
-            g_positionKeyDownAt = std::chrono::steady_clock::now();
-            g_positionKeyLongSent = false;
-            return true;
+            log_position_key_once(keycode, entry.index, entry.position);
+            requestSwitch(entry.index, entry.position);
         }
-
-        bool longSent;
-        std::chrono::steady_clock::time_point downAt;
-        {
-            std::lock_guard<std::mutex> lock(g_positionKeyMutex);
-            longSent = g_positionKeyLongSent;
-            downAt = g_positionKeyDownAt;
-            g_positionKeyDown = 0;
-        }
-        if (longSent) return true;
-
-        const auto held =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - downAt);
-        if (held >= kPositionKeyLongPress) {
-            // Released after the page key already went out, or exactly at the threshold.
-            LOGI("joystick: %s released after %d ms (page key, no switch move)", key_name(keycode),
-                 static_cast<int>(held.count()));
-            return true;
-        }
-        LOGI("joystick: %s released after %d ms (short press)", key_name(keycode),
-             static_cast<int>(held.count()));
-        log_position_key_once(keycode, entry.index, entry.position);
-        requestSwitch(entry.index, entry.position);
         return true;
     }
 
@@ -1577,32 +1539,6 @@ void tick() {
             g_switchQueued[index] = false;
         }
         if (queued) simu::setSwitch(static_cast<uint8_t>(index), state);
-    }
-
-    // A held L1/L2/L3 still opens its page: the press is reported to EdgeTX once it has
-    // lasted long enough, and the release then no longer moves SJ (see handleKeyCode).
-    {
-        int32_t heldKey = 0;
-        uint8_t heldPageKey = 0;
-        {
-            std::lock_guard<std::mutex> lock(g_positionKeyMutex);
-            if (g_positionKeyDown != 0 && !g_positionKeyLongSent &&
-                std::chrono::steady_clock::now() - g_positionKeyDownAt >=
-                    kPositionKeyLongPress) {
-                for (const PositionKey& entry : kPositionKeys) {
-                    if (entry.keycode != g_positionKeyDown) continue;
-                    heldKey = entry.keycode;
-                    heldPageKey = entry.key;
-                    break;
-                }
-                if (heldKey != 0) g_positionKeyLongSent = true;
-            }
-        }
-        if (heldKey != 0) {
-            LOGI("joystick: %s held -> %s key (not a switch move)", key_name(heldKey),
-                 etkey_name(heldPageKey));
-            requestKey(heldPageKey, 60);
-        }
     }
 
     // The return button's clicks become trim counter presses here, once the burst is over.
