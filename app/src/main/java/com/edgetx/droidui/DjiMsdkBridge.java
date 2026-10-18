@@ -829,13 +829,6 @@ public final class DjiMsdkBridge {
     private static final int SLOT_PHOTO = isRcPro() ? SWITCH_F : SWITCH_E;
 
     /**
-     * Free slot used to carry the aircraft's arm state into EdgeTX, where any screen,
-     * logical switch or special function can pick it up. On this board SJ is a real
-     * 2POS position that nothing else drives.
-     */
-    static final int SW_SJ = 9;
-
-    /**
      * The takeoff button and the flight-mode switch.
      *
      * The takeoff button latches in hardware and has its own red/green LED (red = low,
@@ -1234,11 +1227,10 @@ public final class DjiMsdkBridge {
                             // The one lamp this app can reach is not the one on the arm
                             // button, but it is a real lamp, so it follows the arm state.
                             RcLed.setColor(newValue ? RcLed.GREEN : RcLed.RED);
-                            try {
-                                nativeOnDjiSwitch(SW_SJ, newValue ? 1 : -1);
-                            } catch (Throwable t) {
-                                Log.w(TAG, "dji: arm state dispatch failed", t);
-                            }
+                            // Deliberately not a switch position: SJ used to carry this, but on
+                            // the RC Plus 2 it is now the 3-position switch L1/L2/L3 picks
+                            // (see joystick.cpp, kPositionKeys), and two writers would fight
+                            // over it. Nothing else asked for the arm state as a switch.
                         }
                     });
         } catch (Throwable t) {

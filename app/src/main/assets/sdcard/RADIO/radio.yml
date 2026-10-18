@@ -165,7 +165,7 @@ switchConfig:
       type: NONE
    SJ:
       name: ""
-      type: NONE
+      type: 3POS
    SW1:
       name: ""
       type: 2POS

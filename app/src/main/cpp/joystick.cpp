@@ -130,18 +130,14 @@ struct KeyChoice {
 // DjiMsdkBridge -> nativeOnDjiButton), because the RC firmware never dispatches
 // their events to apps.
 //
-// The RC's right-hand shoulder buttons are EdgeTX keys rather than switches, so
-// that a single press opens the setup, model and telemetry pages - the same
-// thing the hardware TX16S does with its SYS/MDL/TELE buttons, which this remote
-// does not have. The DJI SDK's own C1/C2/C3 custom-button event is not usable
-// here: the RcCustomButtonEvent listener never fires on this remote, so the
-// buttons are taken from the Android key codes the kernel reports for them.
+// L1/L2/L3 are deliberately not keys: they pick the position of the 3-position
+// switch SJ, the same way C1/C2/C3 pick SF on the RC Pro (see kPositionKeys).
+// That is why the SYS/MDL/TELE shortcuts a hardware TX16S has on its own buttons
+// are not on this remote any more - one button cannot be both a page key and a
+// third of a switch.
 const KeyChoice kKeyMap[] = {
     {AKEYCODE_BACK, kKeyExit},            // the remote's RTN (return) button
     {AKEYCODE_BUTTON_THUMBL, kKeyEnter},  // 5-way centre press
-    {AKEYCODE_F1, kKeySys},               // L1 -> SYS  (radio setup)
-    {AKEYCODE_F2, kKeyModel},             // L2 -> MDL  (model setup)
-    {AKEYCODE_F3, kKeyTele},              // L3 -> TELE (telemetry)
 };
 
 // ------------------------------------------------------------------ state ----
@@ -791,17 +787,19 @@ constexpr auto kThumbLDedup = std::chrono::milliseconds(500);
 // instead, and they can do that from the DJI SDK (see DjiMsdkBridge.listenPositionButton) -
 // which is also why SF is the switch that keeps being usable with the UI closed.
 //
-// The L1/L2/L3 buttons (F1..F3) are EdgeTX keys instead, see kKeyMap above.
+// The L1/L2/L3 buttons (F1..F3) pick the position of the 3-position switch SJ - up,
+// middle, down - and leave it there, exactly like C1/C2/C3 do for SF on the RC Pro (see
+// kPositionKeys above). They used to be EdgeTX keys that opened the SYS/MDL/TELE pages.
 //
 // Android only delivers key events to the window that has focus, so these three - and
-// with them L1/L2/L3 (F1..F3) and the RC's RTN button (BACK) - stop arriving as soon as
-// the UI is gone (the app swiped away; RcLinkService keeps the *firmware* running, but
-// there is no window left to receive keys). Everything the DJI SDK reports keeps coming:
-// the sticks, the dials and the switches DjiMsdkBridge drives (SA/SD/SE/SF/SC/SJ).
-// There is no way around it from here - the kernel's input node is root:input 0660 and
-// the only permission that grants that group is signature-level - so a switch that has to
-// be usable with the UI closed has to come from the SDK. The positions the switches are
-// left in are kept, they simply cannot be moved while no window exists.
+// with them L1/L2/L3 (F1..F3), R1/R2/R3 (F4..F6) and the RC's RTN button (BACK) - stop
+// arriving as soon as the UI is gone (the app swiped away; RcLinkService keeps the
+// *firmware* running, but there is no window left to receive keys). Everything the DJI SDK
+// reports keeps coming: the sticks, the dials and the switches DjiMsdkBridge drives
+// (SA/SD/SE/SF/SC). SJ therefore cannot be moved while no window exists - it keeps the
+// position it was left in. There is no way around it from here: the kernel's input node is
+// root:input 0660 and the only permission that grants that group is signature-level, so a
+// switch that has to be usable with the UI closed has to come from the SDK.
 //
 // The photo, video and pause buttons are NOT here: their kernel key codes never
 // reach an app (the RC's own dpad service consumes them, and pause is not in the
@@ -825,6 +823,38 @@ const SwitchKey kSwitchKeys[] = {
     {AKEYCODE_F6, 8, 1},  // R3 -> SI down while held
 };
 
+// A button that selects one position of a switch, which then stays there until another of
+// its buttons is pressed. Only the press matters - the release is dropped, otherwise the
+// switch would spring back and the model would see two moves per press.
+//
+// This is SJ: L1 up, L2 middle, L3 down. It mirrors what C1/C2/C3 do to SF on the RC Pro
+// (DjiMsdkBridge.listenPositionButton), except that these buttons only reach an app through
+// Android's key codes - so like every Android-delivered button they stop arriving once the
+// window is gone (see the note above).
+//
+// Holding one of them still opens the page it used to: a press that lasts longer than
+// kPositionKeyLongPress is not a switch move but the SYS/MODEL/TELE key, because those three
+// buttons are the only way into the setup pages on this remote.
+struct PositionKey {
+    int32_t keycode;
+    uint8_t index;
+    int8_t  position;
+    uint8_t key;     // the page key a long press still opens
+};
+
+const PositionKey kPositionKeys[] = {
+    {AKEYCODE_F1, 9, -1, kKeySys},    // L1 -> SJ up
+    {AKEYCODE_F2, 9,  0, kKeyModel},  // L2 -> SJ middle
+    {AKEYCODE_F3, 9,  1, kKeyTele},   // L3 -> SJ down
+};
+
+constexpr auto kPositionKeyLongPress = std::chrono::milliseconds(650);
+
+std::mutex g_positionKeyMutex;
+int32_t g_positionKeyDown = 0;                 // keycode held down, 0 when none
+std::chrono::steady_clock::time_point g_positionKeyDownAt{};
+bool g_positionKeyLongSent = false;            // its page key already went out
+
 std::vector<int32_t> g_loggedSwitchKeys;
 
 const char* switch_name(uint8_t index) {
@@ -841,6 +871,18 @@ void log_switch_key_once(int32_t keycode, uint8_t index, int8_t state) {
     g_loggedSwitchKeys.push_back(keycode);
     LOGI("joystick: button keycode %d (%s) -> EdgeTX switch %s position %d", keycode,
          key_name(keycode), switch_name(index), (int)state);
+}
+
+std::vector<int32_t> g_loggedPositionKeys;
+
+void log_position_key_once(int32_t keycode, uint8_t index, int8_t position) {
+    if (std::find(g_loggedPositionKeys.begin(), g_loggedPositionKeys.end(), keycode) !=
+        g_loggedPositionKeys.end()) {
+        return;
+    }
+    g_loggedPositionKeys.push_back(keycode);
+    LOGI("joystick: button keycode %d (%s) -> EdgeTX switch %s position %d", keycode,
+         key_name(keycode), switch_name(index), (int)position);
 }
 
 // How long each mapped button was held, plus the repeats Android sends while one is held.
@@ -1061,6 +1103,45 @@ bool handleKeyCode(int32_t keycode, bool down) {
         }
     }
 
+    // A position button sets its switch when it is released: a short press is the switch move,
+    // a long one opens the page it used to (see tick(), which sends that while it is held).
+    for (const PositionKey& entry : kPositionKeys) {
+        if (entry.keycode != keycode) continue;
+
+        if (down) {
+            std::lock_guard<std::mutex> lock(g_positionKeyMutex);
+            g_positionKeyDown = keycode;
+            g_positionKeyDownAt = std::chrono::steady_clock::now();
+            g_positionKeyLongSent = false;
+            return true;
+        }
+
+        bool longSent;
+        std::chrono::steady_clock::time_point downAt;
+        {
+            std::lock_guard<std::mutex> lock(g_positionKeyMutex);
+            longSent = g_positionKeyLongSent;
+            downAt = g_positionKeyDownAt;
+            g_positionKeyDown = 0;
+        }
+        if (longSent) return true;
+
+        const auto held =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - downAt);
+        if (held >= kPositionKeyLongPress) {
+            // Released after the page key already went out, or exactly at the threshold.
+            LOGI("joystick: %s released after %d ms (page key, no switch move)", key_name(keycode),
+                 static_cast<int>(held.count()));
+            return true;
+        }
+        LOGI("joystick: %s released after %d ms (short press)", key_name(keycode),
+             static_cast<int>(held.count()));
+        log_position_key_once(keycode, entry.index, entry.position);
+        requestSwitch(entry.index, entry.position);
+        return true;
+    }
+
     log_key_once(keycode);
     return true;
 }
@@ -1150,8 +1231,9 @@ constexpr int32_t kDjiStickRange = 660;
 //   2-4  video, pause, photo            (DJI SDK / raw report; which slot is which depends on
 //                                        the remote, see SLOT_* in DjiMsdkBridge)
 //   5-8  C1, C2, C3, C4/round button    (DJI SDK; on the RC Pro SF/SG/SH/SI, see SLOT_*)
-//   2-7  L1/L2/L3/R1/R2/R3              (RC Plus 2 only, Android key codes, see kSwitchKeys)
-//   9    aircraft arm state             (DJI SDK KeyAreMotorsOn; SJ is unused otherwise)
+//   6-8  R1, R2, R3                     (RC Plus 2 only, Android key codes, see kSwitchKeys)
+//   9    L1, L2, L3 as one 3-position switch, up/middle/down (RC Plus 2, Android key codes,
+//        see kPositionKeys; it stays where it was put, so it is also the persisted one)
 constexpr int kSwitchCount = 10;
 
 std::mutex g_switchMutex;
@@ -1350,7 +1432,7 @@ void requestScrollWheel(int32_t steps) {
 //
 // The RC's latching switches stay where the user put them while the app is not
 // looking: the takeoff button latches in the remote's own hardware, and the pause
-// and L1/L2/L3 buttons work the same way for whoever is pressing them. The DJI SDK
+// button works the same way for whoever is pressing it. The DJI SDK
 // only ever reports a press, never the latched level, so the position has to be
 // remembered here - and remembered across a restart, because EdgeTX reads its switch
 // positions once while booting and warns about every one that is not where the model
@@ -1358,7 +1440,8 @@ void requestScrollWheel(int32_t steps) {
 //
 // Only the latch that this module is the only witness of is kept here:
 //
-//   5  SF  L1/L2/L3  (Android key codes F1..F3, see kSwitchKeys)
+//   5  SF  C1/C2/C3     (DJI SDK, see DjiMsdkBridge.listenPositionButton)
+//   9  SJ  L1/L2/L3     (Android key codes F1..F3, see kPositionKeys)
 //
 // SA (takeoff), SD (pause) and SE (photo) latch in exactly the same way, but they come
 // from DjiMsdkBridge.java, which keeps their positions itself: the SDK's registration is
@@ -1367,13 +1450,12 @@ void requestScrollWheel(int32_t steps) {
 // runs after Application.onCreate has already called the bridge).
 //
 // The momentary ones (SC/SG/SH from the buttons, SI from C3) are back where they
-// belong as soon as nothing is held, and SJ carries the aircraft's arm state, about
-// which only the aircraft can be authoritative.
+// belong as soon as nothing is held.
 //
 // Caveat, and it cannot be fixed from here: the remote's latch moves even while the app
 // is dead, and a press made in that window is invisible. The restored position is
 // therefore the app's best guess, and the next press puts both sides back in step.
-constexpr uint8_t kPersistedSwitches[] = {5};
+constexpr uint8_t kPersistedSwitches[] = {5, 9};
 
 bool is_latching_switch(int index) {
     for (uint8_t persisted : kPersistedSwitches) {
@@ -1495,6 +1577,32 @@ void tick() {
             g_switchQueued[index] = false;
         }
         if (queued) simu::setSwitch(static_cast<uint8_t>(index), state);
+    }
+
+    // A held L1/L2/L3 still opens its page: the press is reported to EdgeTX once it has
+    // lasted long enough, and the release then no longer moves SJ (see handleKeyCode).
+    {
+        int32_t heldKey = 0;
+        uint8_t heldPageKey = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_positionKeyMutex);
+            if (g_positionKeyDown != 0 && !g_positionKeyLongSent &&
+                std::chrono::steady_clock::now() - g_positionKeyDownAt >=
+                    kPositionKeyLongPress) {
+                for (const PositionKey& entry : kPositionKeys) {
+                    if (entry.keycode != g_positionKeyDown) continue;
+                    heldKey = entry.keycode;
+                    heldPageKey = entry.key;
+                    break;
+                }
+                if (heldKey != 0) g_positionKeyLongSent = true;
+            }
+        }
+        if (heldKey != 0) {
+            LOGI("joystick: %s held -> %s key (not a switch move)", key_name(heldKey),
+                 etkey_name(heldPageKey));
+            requestKey(heldPageKey, 60);
+        }
     }
 
     // The return button's clicks become trim counter presses here, once the burst is over.
