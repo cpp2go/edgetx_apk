@@ -269,21 +269,42 @@ link: firmware running, module tx 4213 B rx 0 B dropped 0 B, port open, window d
 ## Simulated SD card
 
 `app/src/main/assets/sdcard/` holds a full EdgeTX SD-card tree (RADIO, MODELS,
-THEMES, SOUNDS, WIDGETS, …). On first launch it is unpacked into the app's
-**external** files directory, so the card can be edited from outside the app:
+THEMES, SOUNDS, WIDGETS, …). On first launch it is unpacked into a directory the
+user can reach with a file manager:
 
 ```
-/sdcard/Android/data/com.edgetx.droidui/files/sdcard      # the card the firmware sees
+/storage/emulated/0/EdgeTX          # the card the firmware sees
+```
+
+Writing there needs a permission that differs per remote, and the firmware is held
+back until it is there (it picks its card root when it starts and cannot be moved
+to another one afterwards):
+
+| Remote | Android | Grant |
+|---|---|---|
+| RC Pro | 10 | `WRITE_EXTERNAL_STORAGE`, a runtime dialog the app raises at start-up |
+| RC Plus / RC Plus 2 | 11 | "All files access" (`MANAGE_EXTERNAL_STORAGE`), a system settings page the app opens at start-up |
+
+The app asks once per launch until the grant exists, and boots with the card in
+its own directory if it is never given. Grant it from the shell instead:
+
+```powershell
+adb shell appops set com.edgetx.droidui MANAGE_EXTERNAL_STORAGE allow   # Android 11
+adb shell pm grant com.edgetx.droidui android.permission.WRITE_EXTERNAL_STORAGE  # Android 10
+```
+
+Without any grant the card stays in the app's **external** files directory, which
+needs no permission at all and which adb can also read and write:
+
+```
+/sdcard/Android/data/com.edgetx.droidui/files/sdcard      # fallback card
 /sdcard/Android/data/com.edgetx.droidui/files/joystick.keys
 ```
-
-That path needs no permission at all (it belongs to the app) and adb can read and
-write it without root:
 
 ```powershell
 adb push main.lua /sdcard/Android/data/com.edgetx.droidui/files/sdcard/SCRIPTS/
 adb pull /sdcard/Android/data/com.edgetx.droidui/files/sdcard/RADIO/radio.yml .
-adb shell ls /sdcard/Android/data/com.edgetx.droidui/files/sdcard
+adb shell ls /storage/emulated/0/EdgeTX
 ```
 
 Files are picked up the next time the firmware reads them (a model is loaded from
@@ -304,7 +325,7 @@ or the whole folder and relaunch to get the bundled version back. The seeding
 result is in logcat:
 
 ```
-sdcard: root /sdcard/Android/data/com.edgetx.droidui/files/sdcard (push files into it to edit the card, no reboot needed)
+sdcard: root /storage/emulated/0/EdgeTX (push files into it to edit the card, no reboot needed)
 sdcard: 918 copied, 0 kept, 918 bundled
 ```
 

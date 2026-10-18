@@ -11,10 +11,10 @@ import android.content.SharedPreferences;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
-import android.os.Handler;
-import android.os.Looper;
 import android.provider.Settings;
 import android.util.Log;
+
+import java.io.File;
 
 /**
  * Application subclass that gives the optional DJI Mobile SDK somewhere to start.
@@ -31,7 +31,17 @@ public class EdgeTxApplication extends Application {
     private static final String USB_ATTACH_PROCESS = ":usbattach";
     private static final String LINK_PREFS = "link";
     private static final String PREF_MANUAL_CLOSED = "manualClosed";
+
+    /** The notification that leads to the "All files access" page. */
+    private static final int SD_ACCESS_NOTIFICATION_ID = 1;
+
     private static boolean sRuntimeStarted;
+
+    /**
+     * Set when the runtime was held back because the card had no user-visible place. The
+     * activity clears it once the grant is there (or once the user has said no).
+     */
+    private static boolean sWaitingForCardAccess;
 
     @Override
     protected void attachBaseContext(Context base) {
@@ -65,13 +75,81 @@ public class EdgeTxApplication extends Application {
             return;
         }
 
+        if (!cardDirectoryUsable(this)) {
+            // The firmware picks its card root when it starts, and it cannot be moved to
+            // another one afterwards: stopping and starting the link re-initialises the
+            // simulator in the same process, and that second initialisation never finishes
+            // (it stops at the boot splash). So the start is held back instead, until the
+            // grant that puts the card in /storage/emulated/0/EdgeTX is there - see
+            // EdgeTxActivity, which starts the runtime again once it is.
+            sWaitingForCardAccess = true;
+            RcLinkService.holdLink(true);
+            notifySdAccess(sdAccessSettings(this));
+            Log.i(TAG, "sdcard: waiting for the card permission before starting the link");
+            return;
+        }
+
         startRuntime();
     }
 
+    /**
+     * Called from the activity on every launch: starts the runtime, unless the card has
+     * nowhere user-visible to live yet.
+     */
     static void startFromActivity(Context context) {
         final EdgeTxApplication app = (EdgeTxApplication) context.getApplicationContext();
         setManuallyClosed(app, false);
+
+        if (!sRuntimeStarted && !cardDirectoryUsable(app)) {
+            // The same hold as in onCreate: the firmware picks its card root when it starts
+            // and cannot be moved to another one afterwards.
+            sWaitingForCardAccess = true;
+            RcLinkService.holdLink(true);
+            app.askForSdCardAccess();
+            Log.i(TAG, "sdcard: waiting for the card permission before starting the link");
+            return;
+        }
+
+        sWaitingForCardAccess = false;
         app.startRuntime();
+    }
+
+    /**
+     * Starts the runtime even though the card has no user-visible place: the user was asked
+     * and did not grant it (Android 10's dialog answered with "no", or the settings page left
+     * without a grant). Booting with the card in the app's own directory is better than not
+     * booting at all, and the notification stays up so the grant can still be given later.
+     */
+    static void startWithoutCardAccess(Context context) {
+        final EdgeTxApplication app = (EdgeTxApplication) context.getApplicationContext();
+        sWaitingForCardAccess = false;
+        app.startRuntime();
+    }
+
+    /** True while the firmware is held back waiting for the card permission. */
+    static boolean isWaitingForCardAccess() {
+        return sWaitingForCardAccess;
+    }
+
+    /**
+     * Whether the card can be created where the user can reach it: "All files access" on
+     * Android 11 and later, the legacy storage permission on Android 10, and nothing at all
+     * on the versions before it.
+     */
+    static boolean cardDirectoryUsable(Context context) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                return Environment.isExternalStorageManager();
+            }
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+                return true;
+            }
+            return context.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                    == android.content.pm.PackageManager.PERMISSION_GRANTED;
+        } catch (Throwable t) {
+            Log.w(TAG, "sdcard: could not look up the card permission", t);
+            return true;
+        }
     }
 
     static boolean isManuallyClosed(Context context) {
@@ -90,6 +168,9 @@ public class EdgeTxApplication extends Application {
     private synchronized void startRuntime() {
         if (sRuntimeStarted) return;
         sRuntimeStarted = true;
+
+        // The card has a place now (or the user declined): let the firmware come up.
+        RcLinkService.holdLink(false);
 
         askForSdCardAccess();
         RcBattery.start(this);
@@ -149,9 +230,15 @@ public class EdgeTxApplication extends Application {
     /**
      * The simulated SD card lives in {@code /storage/emulated/0/EdgeTX} so the models,
      * sounds and radio.yml can be edited with a file manager. Writing there needs
-     * "All files access" ({@code MANAGE_EXTERNAL_STORAGE}); without it the card stays in
-     * the app's own directory, which is why this asks for it - once, at start-up, since
-     * there is no in-app dialog for this particular permission.
+     * "All files access" ({@code MANAGE_EXTERNAL_STORAGE}), which has no runtime dialog:
+     * the only way to it is {@link Settings#ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION}.
+     *
+     * <p>That page is opened from {@link EdgeTxActivity}, where a window exists and the
+     * start is not refused as a background activity start; here the notification that
+     * leads to the same page is posted, and the card is moved the moment the grant
+     * arrives. Without the grant the firmware keeps the card in the app's own directory,
+     * which no file manager can reach - so it is asked for again on every launch until
+     * it is granted, not once per installation.
      */
     private void askForSdCardAccess() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
@@ -159,36 +246,20 @@ public class EdgeTxApplication extends Application {
         }
 
         try {
+            final NotificationManager manager =
+                    (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+
             if (Environment.isExternalStorageManager()) {
+                if (manager != null) manager.cancel(SD_ACCESS_NOTIFICATION_ID);
                 Log.i(TAG, "sdcard: all-files access granted, the card lives in /storage/emulated/0/EdgeTX");
                 return;
             }
 
-            SharedPreferences prefs = getSharedPreferences("link", MODE_PRIVATE);
-            if (prefs.getBoolean("sdAccessAsked", false)) {
-                // Asked before and still not granted: keep quiet, the firmware logs the
-                // directory it fell back to.
-                return;
-            }
-            prefs.edit().putBoolean("sdAccessAsked", true).apply();
+            notifySdAccess(sdAccessSettings(this));
 
-            final Intent settings = new Intent(
-                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                    Uri.parse("package:" + getPackageName()));
-
-            // Opening the page straight away is what usually works, but an Application
-            // context may not be allowed to start an activity at all (background
-            // activity start restrictions). A notification is tappable in any case, so
-            // post one as well - tapping it lands on the same page.
-            try {
-                startActivity(new Intent(settings).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
-            } catch (Throwable t) {
-                Log.w(TAG, "sdcard: could not open the settings page directly", t);
-            }
-
-            notifySdAccess(settings);
-            Log.i(TAG, "sdcard: asking for all-files access");
-            watchForSdAccess();
+            // The page itself is opened from EdgeTxActivity, and the card is moved there
+            // too, once the user comes back with the grant (see resumeCardDirectory).
+            Log.i(TAG, "sdcard: all-files access missing, the card stays in the app directory until it is granted");
         } catch (Throwable t) {
             // Some vendor builds have no such settings page; the app then simply keeps
             // its card in the app directory.
@@ -196,37 +267,36 @@ public class EdgeTxApplication extends Application {
         }
     }
 
+    /** The system page on which "All files access" is granted. */
+    static Intent sdAccessSettings(Context context) {
+        return new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                Uri.parse("package:" + context.getPackageName()));
+    }
+
     /**
-     * Moves the card to the user directory the moment the grant arrives, instead of
-     * waiting for the next launch: the firmware picked its directory when it started,
-     * so nothing changes until the link is restarted - and the whole point of asking is
-     * that the card should be in /storage/emulated/0/EdgeTX from the start.
+     * The card directory the user sees, derived the same way as {@code user_sd_root()} in
+     * native_main.cpp: {@code /storage/emulated/0/Android/data/<pkg>/files} minus the part
+     * from {@code /Android/} on, plus {@code /EdgeTX}. {@code null} when the device has no
+     * shared storage, which is the case prepare_sd_root() also gives up on.
      */
-    private void watchForSdAccess() {
-        final Handler handler = new Handler(Looper.getMainLooper());
-        final long deadline = System.currentTimeMillis() + 10 * 60 * 1000;
+    static File cardDirectory(Context context) {
+        final File external = context.getExternalFilesDir(null);
+        if (external == null) return null;
+        final String path = external.getAbsolutePath();
+        final int pos = path.indexOf("/Android/");
+        if (pos < 0) return null;
+        return new File(path.substring(0, pos) + "/EdgeTX");
+    }
 
-        handler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    if (Environment.isExternalStorageManager()) {
-                        Log.i(TAG, "sdcard: access granted, restarting the link to use "
-                                + "/storage/emulated/0/EdgeTX");
-                        stopService(new Intent(EdgeTxApplication.this, RcLinkService.class));
-                        RcLinkService.start(EdgeTxApplication.this);
-                        return;
-                    }
-                } catch (Throwable t) {
-                    Log.w(TAG, "sdcard: could not move the card to the user directory", t);
-                    return;
-                }
-
-                if (System.currentTimeMillis() < deadline) {
-                    handler.postDelayed(this, 2000);
-                }
-            }
-        }, 2000);
+    /** Takes the permission notification out of the shade once it is no longer needed. */
+    static void cancelSdAccessNotification(Context context) {
+        try {
+            final NotificationManager manager =
+                    (NotificationManager) context.getSystemService(NOTIFICATION_SERVICE);
+            if (manager != null) manager.cancel(SD_ACCESS_NOTIFICATION_ID);
+        } catch (Throwable t) {
+            Log.w(TAG, "sdcard: could not clear the permission notification", t);
+        }
     }
 
     /**
@@ -254,7 +324,7 @@ public class EdgeTxApplication extends Application {
                     ? new Notification.Builder(this, channelId)
                     : new Notification.Builder(this);
 
-            manager.notify(1, builder
+            manager.notify(SD_ACCESS_NOTIFICATION_ID, builder
                     .setSmallIcon(R.mipmap.ic_launcher)
                     .setContentTitle("允许 EdgeTX 访问存储")
                     .setContentText("点此授予\"所有文件访问\"，模拟 SD 卡会放到 /storage/emulated/0/EdgeTX")

@@ -98,6 +98,23 @@ public final class RcLinkService extends Service {
     /** True while the firmware is up. */
     private static native boolean nativeLinkRunning();
 
+    /**
+     * Holds the firmware back (or releases it). The activity's own native loop starts the
+     * firmware whenever it finds it stopped - that is the fallback that keeps a UI without a
+     * service from staying black - so a Java-side "do not start yet" would be pointless
+     * without this: the firmware would come up with the card root it cannot use afterwards.
+     */
+    static native void nativeHoldLink(boolean hold);
+
+    /** Holds the firmware back until the card has a place the user can reach. */
+    static void holdLink(boolean hold) {
+        try {
+            nativeHoldLink(hold);
+        } catch (Throwable t) {
+            Log.w(TAG, "link: could not set the start gate", t);
+        }
+    }
+
     private PowerManager.WakeLock mWakeLock;
     private final Handler mHandler = new Handler(Looper.getMainLooper());
     private int mDjiStopRequests;

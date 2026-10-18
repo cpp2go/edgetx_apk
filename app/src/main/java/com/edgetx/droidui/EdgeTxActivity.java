@@ -2,11 +2,15 @@ package com.edgetx.droidui;
 
 import android.Manifest;
 import android.app.NativeActivity;
+import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.util.Log;
 import android.widget.Toast;
 
@@ -20,19 +24,19 @@ import android.widget.Toast;
  * native side changes; the manifest names this class instead of {@code android.app.NativeActivity}
  * and everything after that (lib_name meta-data, the callbacks) is inherited.
  *
- * <p>The permission it asks for is the one Android 10 needs for the simulated SD card. Android 11
- * and later use "All files access", which the user grants once in system settings (see
- * {@link EdgeTxApplication}), but Android 10 has no such thing: the card in
- * {@code /storage/emulated/0/EdgeTX} is written with {@code WRITE_EXTERNAL_STORAGE} there, and a
- * runtime permission can only be requested from an activity. On the RC Pro (Android 10) that is
- * what puts the card where a file manager can reach it, the way it already is on every other
- * remote. Android 11+ returns immediately: the permission is not even declared for those versions
- * (maxSdkVersion 29 in the manifest), and cannot be requested.
+ * <p>The simulated card in {@code /storage/emulated/0/EdgeTX} is why most of this exists, and
+ * every supported remote needs a different grant to write there. The RC Pro (Android 10) has
+ * {@code WRITE_EXTERNAL_STORAGE}, a runtime dialog that only an activity can raise. The RC Plus and
+ * RC Plus 2 (Android 11) have "All files access" ({@code MANAGE_EXTERNAL_STORAGE}), which has no
+ * dialog at all - the only way to it is a system settings page, put up from here rather than from
+ * the Application because a background activity start would be refused without showing anything.
+ * Without the grant the firmware keeps the card in the app's own directory, where no file manager
+ * can reach it ("after a fresh install there is no EdgeTX folder"), so both are asked for again on
+ * later launches until they are given.
  *
- * <p>The other two are one that needs a dialog ({@code UsbManager.requestPermission}, asked for
- * again below until it is granted - see {@link RcRawJoystick}) and one that cannot be asked for at
- * all: {@code READ_LOGS} is signature-level and adb-only, so all this activity can do about it is
- * say on the screen that it is missing and what that costs.
+ * <p>The other one is a permission that needs a dialog: {@code UsbManager.requestPermission},
+ * asked for again below until it is granted - see {@link RcRawJoystick}. {@code READ_LOGS} is
+ * signature-level and adb-only, so it is deliberately not mentioned on screen.
  */
 public class EdgeTxActivity extends NativeActivity {
 
@@ -47,6 +51,9 @@ public class EdgeTxActivity extends NativeActivity {
     /** The dialog right after the window appears, not one interval later. */
     private static final long USB_FIRST_ASK_MS = 2500;
 
+    /** Delay before the card permission page is put up, counted from the window appearing. */
+    private static final long SD_ACCESS_ASK_MS = 1500;
+
     /**
      * How many times to ask before leaving it alone until the app comes to the front again. Five
      * is enough that a dialog missed once is not the end of it, and few enough that a deliberate
@@ -57,8 +64,88 @@ public class EdgeTxActivity extends NativeActivity {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private int usbAsks;
 
-    /** Said once per process, so the reminder does not repeat at every resume. */
-    private static boolean sToldAboutLogs;
+    /**
+     * How long to wait before putting the SD-card permission page up again while it is still
+     * missing. Long enough that declining once is not answered with the page again a moment
+     * later, short enough that a user who is still looking for the reason gets another chance
+     * without restarting the app.
+     */
+    private static final long SD_ACCESS_ASK_EVERY_MS = 5 * 60 * 1000;
+
+    /** When the SD-card permission page was last put up, 0 = never in this launch. */
+    private long sdAccessAskedAt;
+
+    /** True while the storage dialog this app raised in {@code onCreate} is unanswered. */
+    private boolean storageRequestPending;
+
+    /**
+     * Puts the SD-card permission page up while the card has nowhere user-visible to live.
+     *
+     * <p>What "the permission" is depends on the remote's Android version, and all three of the
+     * supported ones need this:
+     *
+     * <ul>
+     *   <li>RC Pro (Android 10) - {@code WRITE_EXTERNAL_STORAGE}, a normal runtime dialog, asked
+     *       for in {@code onCreate}; when it is denied for good only the app's own permission
+     *       page can turn it back on.
+     *   <li>RC Plus and RC Plus 2 (Android 11) - {@code MANAGE_EXTERNAL_STORAGE} ("All files
+     *       access"), which has no dialog at all: only a system settings page grants it.
+     * </ul>
+     *
+     * <p>Without the grant the firmware keeps the card in the app's own directory, where no file
+     * manager can see it - the "after a fresh install there is no EdgeTX folder" report. That is
+     * why this is not a one-off: it comes back on the next launch (and every five minutes while
+     * the app stays in front) until the card is where it belongs.
+     */
+    private final Runnable sdAccessAsk = new Runnable() {
+        @Override
+        public void run() {
+            if (storageRequestPending || cardDirectoryReady()) {
+                return;
+            }
+            final long now = System.currentTimeMillis();
+            if (now - sdAccessAskedAt < SD_ACCESS_ASK_EVERY_MS) {
+                return;
+            }
+            sdAccessAskedAt = now;
+            try {
+                Toast.makeText(EdgeTxActivity.this, Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+                                ? "请允许\"所有文件访问\"，EdgeTX 目录才会出现在 /storage/emulated/0/EdgeTX"
+                                : "请允许存储权限，EdgeTX 目录才会出现在 /storage/emulated/0/EdgeTX",
+                        Toast.LENGTH_LONG).show();
+
+                final Intent page = (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R)
+                        ? EdgeTxApplication.sdAccessSettings(EdgeTxActivity.this)
+                        : new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                Uri.parse("package:" + getPackageName()));
+                startActivity(page);
+                Log.i(TAG, "sdcard: showing the page that grants the card directory");
+            } catch (Throwable t) {
+                // Some vendor builds have no such page; the firmware then keeps the card in
+                // the app's own directory, which still works.
+                Log.w(TAG, "sdcard: could not open the card permission page", t);
+            }
+        }
+    };
+
+    /**
+     * Whether the simulated card can be created where a user can reach it. Android 11 and later
+     * gate that on "All files access"; Android 10 uses the legacy storage permission instead,
+     * and older versions hand it out at install time.
+     */
+    private boolean cardDirectoryReady() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                return Environment.isExternalStorageManager();
+            }
+            return Build.VERSION.SDK_INT < Build.VERSION_CODES.M
+                    || checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                            == PackageManager.PERMISSION_GRANTED;
+        } catch (Throwable t) {
+            Log.w(TAG, "sdcard: could not look up the card permission", t);
+            return true;  // never keep asking because of an exception
+        }
+    }
 
     /**
      * Puts the USB permission dialog back up until the raw joystick is claimed.
@@ -104,6 +191,7 @@ public class EdgeTxActivity extends NativeActivity {
                     && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
                             != PackageManager.PERMISSION_GRANTED) {
                 wanted.add(Manifest.permission.WRITE_EXTERNAL_STORAGE);
+                storageRequestPending = true;
             }
             if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
                     != PackageManager.PERMISSION_GRANTED) {
@@ -144,7 +232,34 @@ public class EdgeTxActivity extends NativeActivity {
         // window for the USB dialog, and the location permission for the remote's GPS.
         RcGps.start(this);
 
-        tellAboutMissingLogAccess();
+        resumeCardDirectory();
+    }
+
+    /**
+     * Creates the card directory as soon as the grant is there, and asks for the grant while it
+     * is not. Called from {@code onResume} so that the grant page is put up from a window the
+     * system will actually honour, and again when the user comes back from that page.
+     */
+    private void resumeCardDirectory() {
+        if (EdgeTxApplication.isWaitingForCardAccess()) {
+            if (cardDirectoryReady()) {
+                Log.i(TAG, "sdcard: granted, booting with /storage/emulated/0/EdgeTX");
+                EdgeTxApplication.startFromActivity(this);
+                return;
+            }
+            if (sdAccessAskedAt != 0) {
+                // The page was put up in this launch and came back without a grant: boot with
+                // the card in the app's own directory rather than not at all.
+                Log.i(TAG, "sdcard: no grant, booting with the card in the app directory");
+                EdgeTxApplication.startWithoutCardAccess(this);
+                return;
+            }
+        } else if (cardDirectoryReady()) {
+            return;
+        }
+
+        handler.removeCallbacks(sdAccessAsk);
+        handler.postDelayed(sdAccessAsk, SD_ACCESS_ASK_MS);
     }
 
     @Override
@@ -153,36 +268,9 @@ public class EdgeTxActivity extends NativeActivity {
         // A request made without a window is refused without a dialog, so do not ask while the
         // firmware is not the thing on screen; onResume starts the asking again.
         handler.removeCallbacks(usbAsk);
-    }
-
-    /**
-     * The one grant this app cannot ask for anywhere, said where the user can see it.
-     *
-     * <p>{@code READ_LOGS} is signature|privileged and adb-only ({@code pm grant}), and it is
-     * stored per installation, so a reinstall takes it away again. Without it the remote's own
-     * button log is unread (see {@link RcDpadLog}) and the landing, pause and C1..C3 buttons are
-     * down to the DJI SDK alone - which loses them in waves while the DJI app holds the remote's
-     * data channel. That is the "these switches only work sometimes" report, and until now the
-     * only sign of it was a line in logcat. A toast costs nothing and is the difference between
-     * a user who can fix it and one who cannot.
-     */
-    private void tellAboutMissingLogAccess() {
-        if (sToldAboutLogs) {
-            return;
-        }
-        try {
-            if (checkSelfPermission(Manifest.permission.READ_LOGS)
-                    == PackageManager.PERMISSION_GRANTED) {
-                return;
-            }
-            sToldAboutLogs = true;
-            Toast.makeText(this, "READ_LOGS not granted: landing, pause and C1..C3 will miss "
-                            + "presses.\nRun once per install: adb shell pm grant "
-                            + getPackageName() + " android.permission.READ_LOGS",
-                    Toast.LENGTH_LONG).show();
-        } catch (Throwable t) {
-            Log.w(TAG, "could not tell the user about READ_LOGS", t);
-        }
+        // The grant page itself is what pauses this activity, so this is also what keeps it
+        // from going up again the moment the user comes back from it.
+        handler.removeCallbacks(sdAccessAsk);
     }
 
     @Override
@@ -195,12 +283,26 @@ public class EdgeTxActivity extends NativeActivity {
             final boolean granted = results != null && i < results.length
                     && results[i] == PackageManager.PERMISSION_GRANTED;
             if (Manifest.permission.WRITE_EXTERNAL_STORAGE.equals(permissions[i])) {
-                // The card's root is decided when the link starts, which has already happened by
-                // the time this answer arrives - so a grant takes effect on the next start, and
-                // saying so is the point of this line.
+                storageRequestPending = false;
                 Log.i(TAG, "sdcard: WRITE_EXTERNAL_STORAGE " + (granted
-                        ? "granted - the card moves to /storage/emulated/0/EdgeTX on the next start"
+                        ? "granted - the card is created in /storage/emulated/0/EdgeTX"
                         : "denied - the card stays in the app's own directory"));
+                if (!granted) {
+                    // Do not put the settings page on top of the dialog just answered: give it
+                    // a few minutes, or the next launch.
+                    sdAccessAskedAt = System.currentTimeMillis();
+                    Toast.makeText(this, "存储权限被拒绝，EdgeTX 目录无法创建；可在应用权限中开启",
+                            Toast.LENGTH_LONG).show();
+                }
+                // The firmware was held back until this answer (see EdgeTxApplication): boot
+                // now, with the card in the user directory if the grant arrived.
+                if (EdgeTxApplication.isWaitingForCardAccess()) {
+                    if (granted) {
+                        EdgeTxApplication.startFromActivity(this);
+                    } else {
+                        EdgeTxApplication.startWithoutCardAccess(this);
+                    }
+                }
             } else if (Manifest.permission.ACCESS_FINE_LOCATION.equals(permissions[i])) {
                 Log.i(TAG, "gps: ACCESS_FINE_LOCATION " + (granted
                         ? "granted - the remote's own GPS is read from now on"

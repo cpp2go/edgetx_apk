@@ -10,7 +10,10 @@ import android.hardware.usb.UsbDeviceConnection;
 import android.hardware.usb.UsbInterface;
 import android.hardware.usb.UsbManager;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
+import android.widget.Toast;
 
 import com.hoho.android.usbserial.driver.Ch34xSerialDriver;
 import com.hoho.android.usbserial.driver.ProbeTable;
@@ -25,6 +28,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -220,7 +224,16 @@ final class RcModuleSerial {
 
     private static Context sAppContext;
     private static UsbManager sUsbManager;
-    private static final List<String> sPermissionRequested = new ArrayList<>();
+
+    /**
+     * USB devices the user has already been asked about, and when. Not a permanent list: a
+     * dialog that was dismissed, or a grant broadcast that never arrived, used to leave that
+     * module dead for the rest of the session - the slot was never opened again until the app
+     * was restarted. Asking again after a cooldown, and immediately whenever the model switches
+     * to that slot, is what makes "internal off, external on" work without a restart.
+     */
+    private static final Map<String, Long> sPermissionAskedAt = new HashMap<>();
+    private static final long PERMISSION_REASK_MS = 30_000;
 
     /** One module slot and the USB serial device that carries it. */
     private static final class Link {
@@ -235,6 +248,14 @@ final class RcModuleSerial {
         volatile UsbDeviceConnection connection;
         SerialInputOutputManager ioManager;
         volatile String deviceName;
+
+        /**
+         * Incremented on every open. A reader or writer thread from an earlier open must not
+         * touch the link any more: its device is gone, and closing "the link" from that thread
+         * would take down the port that was just opened - which is what a slot switch back and
+         * forth could do, leaving a slot with an open device and no thread driving it.
+         */
+        volatile int generation;
 
         volatile int appliedBaud = -1;
         volatile int appliedEncoding = -1;
@@ -357,6 +378,10 @@ final class RcModuleSerial {
                     intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false);
             logi("module: USB permission "
                     + (granted ? "granted" : "denied") + " for " + describe(device));
+            // Either answer settles the question for now; a later slot switch asks again.
+            if (device != null && device.getDeviceName() != null) {
+                sPermissionAskedAt.remove(device.getDeviceName());
+            }
             if (granted) {
                 for (Link link : sLinks) {
                     openWhenAvailable(link);
@@ -542,14 +567,18 @@ final class RcModuleSerial {
 
     private static void requestPermission(Link link, UsbDevice device) {
         final String name = device.getDeviceName();
-        if (name != null && sPermissionRequested.contains(name)) {
-            return;  // already asked; waiting for the user
-        }
+        final long now = System.currentTimeMillis();
         if (name != null) {
-            sPermissionRequested.add(name);
+            final Long askedAt = sPermissionAskedAt.get(name);
+            if (askedAt != null && now - askedAt < PERMISSION_REASK_MS) {
+                return;  // asked a moment ago; waiting for the user
+            }
+            sPermissionAskedAt.put(name, now);
         }
 
         logi(link.role + ": requesting USB permission for " + describe(device));
+        hint("请允许 USB 设备访问（" + (link.internal ? "内部" : "外部")
+                + "高频头），否则模块无法通信");
 
         final Intent intent = new Intent(ACTION_USB_PERMISSION);
         intent.setPackage(deviceName());
@@ -630,15 +659,16 @@ final class RcModuleSerial {
         link.appliedBaud = initialBaud;
         link.appliedEncoding = ENCODING_8N1;
         link.lastRxAtMs = 0;
+        final int generation = ++link.generation;
         logi(link.role + ": " + describe(device) + " open at " + initialBaud + " 8N1");
 
-        link.ioManager = new SerialInputOutputManager(port, listenerFor(link));
+        link.ioManager = new SerialInputOutputManager(port, listenerFor(link, generation));
         // A read with no timeout can block for ever (Android's USB stack does not always honour the
         // device disappearing), which would take the reader thread with it.
         link.ioManager.setReadTimeout(READ_TIMEOUT_MS);
         link.ioManager.setWriteTimeout(WRITE_TIMEOUT_MS);
         sIoExecutor.submit(link.ioManager);
-        sIoExecutor.submit(() -> writeLoop(link));
+        sIoExecutor.submit(() -> writeLoop(link, generation));
     }
 
     /** Rate to open a port at: what the firmware configured, or the default while it has not. */
@@ -654,12 +684,15 @@ final class RcModuleSerial {
         return DEFAULT_BAUD;
     }
 
-    private static SerialInputOutputManager.Listener listenerFor(Link link) {
+    private static SerialInputOutputManager.Listener listenerFor(Link link, int generation) {
         return new SerialInputOutputManager.Listener() {
             @Override
             public void onNewData(byte[] data) {
                 if (data == null || data.length == 0) {
                     return;
+                }
+                if (link.generation != generation) {
+                    return;  // this reader belongs to an earlier open of the link
                 }
                 link.deviceRxBytes += data.length;
                 if (link.hexDumps < 3) {
@@ -697,18 +730,20 @@ final class RcModuleSerial {
             @Override
             public void onRunError(Exception e) {
                 Log.w(TAG, link.role + ": read loop stopped", e);
-                close(link);
+                if (link.generation == generation) {
+                    close(link);
+                }
             }
         };
     }
 
     /** Drains the firmware's TX queue for one slot into that port. Exits when it closes. */
-    private static void writeLoop(Link link) {
+    private static void writeLoop(Link link, int generation) {
         final byte[] buffer = new byte[1024];
 
         while (true) {
             final UsbSerialPort port = link.usbPort;
-            if (port == null) {
+            if (port == null || link.generation != generation) {
                 return;
             }
 
@@ -760,7 +795,9 @@ final class RcModuleSerial {
                 }
             } catch (Throwable t) {
                 Log.w(TAG, link.role + ": write failed", t);
-                close(link);
+                if (link.generation == generation) {
+                    close(link);
+                }
                 return;
             }
         }
@@ -821,10 +858,18 @@ final class RcModuleSerial {
 
         if (active != sActiveLink) {
             sActiveLink = active;
+            // The model just switched slots: whatever was answered for the other module says
+            // nothing about this one, and its device may never have been asked about at all.
+            sPermissionAskedAt.clear();
+            if (active != null) {
+                active.lastOpenAttemptMs = 0;  // open it now, not one throttle later
+            }
             logi("module: " + (active != null ? "using the " + active.role
                                               : "no module slot is enabled")
                     + " (internal type " + internalType + ", external type "
-                    + externalType + ")");
+                    + externalType + "; firmware ports: internal "
+                    + (portOpenOrFalse(0) ? "open" : "closed") + ", external "
+                    + (portOpenOrFalse(1) ? "open" : "closed") + ")");
         }
         for (Link link : sLinks) {
             link.active = (link == active);
@@ -876,6 +921,15 @@ final class RcModuleSerial {
             return internal ? nativeInternalModuleType() : nativeExternalModuleType();
         } catch (Throwable t) {
             return 0;
+        }
+    }
+
+    /** Whether the firmware has that slot's module port open; false when the library is not up. */
+    private static boolean portOpenOrFalse(int port) {
+        try {
+            return nativePortOpen(port);
+        } catch (Throwable t) {
+            return false;
         }
     }
 
@@ -1320,6 +1374,25 @@ final class RcModuleSerial {
 
     private static Context appContext() {
         return sAppContext;
+    }
+
+    /**
+     * Says something on the screen. The module monitor and the USB read/write threads are not
+     * on the main thread, where a Toast has to be shown from.
+     */
+    private static void hint(final String message) {
+        final Context context = sAppContext;
+        if (context == null) return;
+        try {
+            new Handler(Looper.getMainLooper()).post(new Runnable() {
+                @Override
+                public void run() {
+                    Toast.makeText(context, message, Toast.LENGTH_LONG).show();
+                }
+            });
+        } catch (Throwable t) {
+            Log.w(TAG, "module: could not show the hint", t);
+        }
     }
 
     private static String deviceName() {

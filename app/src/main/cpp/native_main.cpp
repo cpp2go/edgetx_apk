@@ -101,6 +101,14 @@ std::atomic<bool> g_linkStarting{false};
 // behaviour is kept for the case where the service could not be started.
 std::atomic<bool> g_keepAlive{false};
 
+// True while the app is waiting for the permission that puts the simulated SD card in
+// a directory the user can reach. The firmware picks its card root when it starts and
+// cannot be moved to another one afterwards (stopping and restarting it re-initialises
+// the simulator in this process, and that second initialisation stops at the boot
+// splash), so it has to wait instead. Both starts - the service's and the activity's
+// fallback - are gated on this.
+std::atomic<bool> g_linkHeld{false};
+
 void sleep_ms(uint32_t ms) {
     std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 }
@@ -611,6 +619,175 @@ unsigned set_default_haptics(const std::string& sdRoot) {
     return changed;
 }
 
+// ------------------------------------------------------- model defaults -----
+//
+// Two things the stock model defaults get wrong on this port. Both are applied to every
+// model the first time it is seen:
+//
+//   - the internal module slot is off, while the RF bridge of this port is wired to the
+//     remote's own module port (see module_serial.h: internal is the C3). A model that
+//     drives only the external slot leaves that link silent until the slot is switched on
+//     by hand in MODEL SETUP -> Internal RF;
+//   - every switch warning expects "up", while the switches on this remote rest low - the
+//     boot check then complains about switches that are exactly where they are supposed to
+//     be. SB is left alone: it is the arm/disarm switch.
+//
+// "The first time" is kept in a marker file in the app's own directory, because a position
+// changed later in MODEL SETUP -> Switch warnings is the user's choice and must not be
+// undone on the next start.
+const char* const kSwitchWarningDown[] = {"SA", "SC", "SD", "SE", "SF", "SG", "SH", "SI", "SJ"};
+
+bool switch_warning_down(const std::string& name) {
+    for (const char* candidate : kSwitchWarningDown) {
+        if (name == candidate) return true;
+    }
+    return false;
+}
+
+// The internal slot as the firmware writes it for a CRSF module. `indent` is one level, the
+// fields go one deeper.
+std::vector<std::string> internal_module_block(const std::string& indent, const std::string& eol) {
+    const std::string field = indent + indent;
+    return {
+        indent + "0:" + eol,
+        field + "type: TYPE_CROSSFIRE" + eol,
+        field + "antennaMode: MODE_PER_MODEL" + eol,
+        field + "subType: 0" + eol,
+        field + "channelsStart: 0" + eol,
+        field + "channelsCount: 16" + eol,
+        field + "failsafeMode: NOT_SET" + eol,
+        field + "mod: " + eol,
+        field + field + "crsf: " + eol,
+        field + field + field + "telemetryBaudrate: 0" + eol,
+        field + field + field + "crsfArmingMode: 0" + eol,
+        field + field + field + "crsfArmingTrigger: \"NONE\"" + eol,
+        field + field + field + "spare3: 0" + eol,
+    };
+}
+
+// Returns what it changed, 0 when the file already carries both defaults.
+unsigned patch_model_defaults(const std::string& path) {
+    const std::string text = read_text_file(path);
+    if (text.empty()) return 0;
+
+    const bool crlf = text.find("\r\n") != std::string::npos;
+    const bool endsWithNewline = text.back() == '\n';
+    const std::string eol = crlf ? "\r" : "";
+
+    std::vector<std::string> lines;
+    for (size_t start = 0; start < text.size();) {
+        size_t end = text.find('\n', start);
+        if (end == std::string::npos) end = text.size();
+        lines.push_back(text.substr(start, end - start));  // a '\r' stays on
+        start = end + 1;
+    }
+
+    unsigned changed = 0;
+
+    // switchWarning: <name>: pos: up  ->  pos: down
+    bool inWarnings = false;
+    std::string switchName;
+    for (std::string& line : lines) {
+        if (line.empty()) continue;
+
+        if (line[0] != ' ' && line[0] != '\t') {
+            inWarnings = trim(line) == "switchWarning:";
+            switchName.clear();
+            continue;
+        }
+        if (!inWarnings) continue;
+
+        const std::string trimmed = trim(line);
+        if (trimmed.size() > 1 && trimmed.back() == ':' &&
+            trimmed.find_first_of(" \t") == std::string::npos) {
+            switchName = trimmed.substr(0, trimmed.size() - 1);
+            continue;
+        }
+        if (!switch_warning_down(switchName) || trimmed != "pos: up") continue;
+
+        line = line.substr(0, line.find_first_not_of(" \t")) + "pos: down" + eol;
+        LOGI("sdcard: switch warning %s: up -> down in %s", switchName.c_str(), path.c_str());
+        ++changed;
+    }
+
+    // moduleData: the firmware only writes a slot that is on, so the internal one is simply
+    // missing in a stock model - put it in front of whichever slot is there.
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (trim(lines[i]) != "moduleData:") continue;
+
+        bool hasInternal = false;
+        std::string childIndent;
+        for (size_t j = i + 1; j < lines.size(); ++j) {
+            const std::string& line = lines[j];
+            if (line.empty() || (line[0] != ' ' && line[0] != '\t')) break;
+            if (childIndent.empty()) {
+                childIndent = line.substr(0, line.find_first_not_of(" \t"));
+            }
+            if (trim(line) == "0:") {
+                hasInternal = true;
+                break;
+            }
+        }
+        if (hasInternal) break;
+
+        // Same indentation the firmware uses for the slots it does write.
+        if (childIndent.empty()) childIndent = "   ";
+        const std::vector<std::string> block = internal_module_block(childIndent, eol);
+        lines.insert(lines.begin() + static_cast<long>(i) + 1, block.begin(), block.end());
+        LOGI("sdcard: internal module switched on by default in %s", path.c_str());
+        ++changed;
+        break;
+    }
+
+    if (changed == 0) return 0;
+
+    std::string out;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        out += lines[i];
+        if (i + 1 < lines.size() || endsWithNewline) out += "\n";
+    }
+    if (!write_text_file(path, out)) {
+        LOGE("sdcard: cannot write %s", path.c_str());
+        return 0;
+    }
+    return changed;
+}
+
+// Runs patch_model_defaults() over every model the first time that model is seen, and
+// reports how many files changed. A model the firmware has not created yet is picked up on
+// the next start, the same two starts RADIO/radio.yml needs.
+unsigned set_model_defaults(const std::string& sdRoot, const char* filesDir) {
+    if (filesDir == nullptr || filesDir[0] == '\0') return 0;
+
+    const std::string markerPath = std::string(filesDir) + "/model-defaults";
+    const std::string marker = read_text_file(markerPath);
+
+    const std::string dirPath = sdRoot + "/MODELS";
+    DIR* dir = opendir(dirPath.c_str());
+    if (dir == nullptr) return 0;
+
+    unsigned changed = 0;
+    std::string added;
+    const struct dirent* entry = nullptr;
+    while ((entry = readdir(dir)) != nullptr) {
+        const std::string name = entry->d_name;
+        if (name.size() < 5 || name.compare(name.size() - 4, 4, ".yml") != 0) continue;
+        if (marker.find("\n" + name + "\n") != std::string::npos) continue;
+
+        const unsigned n = patch_model_defaults(dirPath + "/" + name);
+        changed += n;
+        added += name + "\n";
+        LOGI("sdcard: model defaults applied to %s (%u change(s))", name.c_str(), n);
+    }
+    closedir(dir);
+
+    if (!added.empty() && !write_text_file(markerPath, marker + added)) {
+        LOGW("sdcard: cannot write %s, the model defaults are applied again next start",
+             markerPath.c_str());
+    }
+    return changed;
+}
+
 // Recompute how the LCD frame maps onto the window (aspect-fit + centred).
 void update_transform(int32_t winW, int32_t winH) {
     const int32_t sx = (winW * kFp) / g_lcdW;
@@ -805,6 +982,8 @@ bool link_start(AAssetManager* assets, const char* filesDir, const char* externa
     // set_default_haptics().
     set_default_switch_types(sd);
     set_default_haptics(sd);
+    // Likewise, but per model: the internal RF slot on, switch warnings low.
+    set_model_defaults(sd, filesDir);
 
     const simu::LcdInfo lcd = simu::lcdInfo();
     {
@@ -1057,7 +1236,8 @@ extern "C" void android_main(struct android_app* app) {
         // be started at all: a UI without a service is better than a black screen.
         // While the service's start is still inside link_start() - waiting for the
         // RC's controls - this must not queue up behind it.
-        if (!link_running() && !g_linkStarting.load() && app->activity != nullptr) {
+        if (!link_running() && !g_linkStarting.load() && !g_linkHeld.load()
+                && app->activity != nullptr) {
             link_start(app->activity->assetManager, app->activity->internalDataPath,
                        app->activity->externalDataPath);
         }
@@ -1170,4 +1350,12 @@ Java_com_edgetx_droidui_RcLinkService_nativeStopLink(JNIEnv*, jclass) {
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_edgetx_droidui_RcLinkService_nativeLinkRunning(JNIEnv*, jclass) {
     return link_running() ? JNI_TRUE : JNI_FALSE;
+}
+
+// Called from RcLinkService.java: holds the firmware back until the simulated SD card has
+// a directory the user can reach (see g_linkHeld).
+extern "C" JNIEXPORT void JNICALL
+Java_com_edgetx_droidui_RcLinkService_nativeHoldLink(JNIEnv*, jclass, jboolean hold) {
+    g_linkHeld.store(hold == JNI_TRUE);
+    LOGI("link: start gate %s", hold == JNI_TRUE ? "closed" : "open");
 }
