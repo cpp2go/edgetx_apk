@@ -694,20 +694,32 @@ void link_thread_main() {
             nextHeartbeat = now + std::chrono::seconds(10);
 
             // Proof of life in logcat, and the only way to tell from outside
-            // whether the link really survived the UI going away.
-            LOGI("link: firmware %s, module tx %u B rx %u B dropped %u B, port %s, window %s",
-                 simu::running() ? "running" : "stopped", module_serial::txBytes(),
-                 module_serial::rxBytes(), module_serial::droppedBytes(),
-                 module_serial::portOpen() ? "open" : "closed",
+            // whether the link really survived the UI going away. Each module slot
+            // is its own wire (see module_serial.h): internal is the C3, external
+            // the module on the USB-UART adapter.
+            LOGI("link: firmware %s, internal tx %u B rx %u B dropped %u B, port %s; "
+                 "external tx %u B rx %u B dropped %u B, port %s; window %s",
+                 simu::running() ? "running" : "stopped",
+                 module_serial::txBytes(module_serial::kInternalPort),
+                 module_serial::rxBytes(module_serial::kInternalPort),
+                 module_serial::droppedBytes(module_serial::kInternalPort),
+                 module_serial::portOpen(module_serial::kInternalPort) ? "open" : "closed",
+                 module_serial::txBytes(module_serial::kExternalPort),
+                 module_serial::rxBytes(module_serial::kExternalPort),
+                 module_serial::droppedBytes(module_serial::kExternalPort),
+                 module_serial::portOpen(module_serial::kExternalPort) ? "open" : "closed",
                  g_window.load() != nullptr ? "attached" : "detached");
 
             if (!loggedOnce) {
                 loggedOnce = true;
-                // Says which protocol drives the module port (ModuleType:
+                // Says which protocol drives each module slot (ModuleType:
                 // 0 none, 1 ppm, 2 xjt, 3 isrm, 4 dsm2, 5 crsf, 6 multimodule). 0 means
-                // the model has the slot switched off, and then EdgeTX never opens it -
+                // the model has that slot switched off, and then EdgeTX never opens it -
                 // no bytes will flow however well the USB serial link itself is working.
-                LOGI("module: external RF protocol = %u (0 off, 5 crsf)",
+                // Internal is the built-in C3, external the module on the USB-UART
+                // adapter (see module_serial.h).
+                LOGI("module: RF protocols - internal %u, external %u (0 off, 5 crsf)",
+                     static_cast<unsigned>(simu::internalModuleType()),
                      static_cast<unsigned>(simu::externalModuleType()));
                 // The ADC driver tables exist by now, so the firmware's own battery
                 // reading can be logged next to what the RC reports.

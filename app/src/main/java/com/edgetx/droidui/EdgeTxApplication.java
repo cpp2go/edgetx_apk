@@ -132,11 +132,18 @@ public class EdgeTxApplication extends Application {
     }
 
     /** True in the process that exists only to carry the USB device filter. */
-    private static boolean inUsbAttachProcess() {
+    private boolean inUsbAttachProcess() {
         // API 28 has the process name; the RC is Android 11, and an older device that
         // still installs this app simply starts normally.
-        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
-                && USB_ATTACH_PROCESS.equals(Application.getProcessName());
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return false;
+
+        // getProcessName() returns the *full* name - "com.edgetx.droidui:usbattach" -
+        // not the ":usbattach" suffix the manifest declares. Comparing against the
+        // suffix never matched, so this process started the whole runtime as well:
+        // two RF module bridges, two SDK registrations and two battery readers, with
+        // both module bridges fighting over the same USB serial devices.
+        final String process = Application.getProcessName();
+        return process != null && process.equals(getPackageName() + USB_ATTACH_PROCESS);
     }
 
     /**

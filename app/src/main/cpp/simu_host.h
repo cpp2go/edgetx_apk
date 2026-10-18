@@ -85,7 +85,10 @@ uint16_t edgetxAndroidBatteryMillivolts() __attribute__((weak));
 void edgetxAndroidBatterySettings(uint16_t* warn, uint16_t* batMin, uint16_t* batMax)
     __attribute__((weak));
 
-// Protocol the model selected for the module (MODULE_TYPE_*, 0 = slot off).
+// Protocol the model selected for each module slot (MODULE_TYPE_*, 0 = slot off).
+// Weak like the rest: an older simulator library only has the external one, and
+// then the internal slot is reported as "not available".
+uint8_t edgetxAndroidInternalModuleType() __attribute__((weak));
 uint8_t edgetxAndroidExternalModuleType() __attribute__((weak));
 
 // Switch positions the app drives, kept by the library so the board's switch driver can
@@ -301,7 +304,11 @@ void requestFullRefresh();
 // link is stopped, and then nothing is taken or presented and the screen stays black.
 bool firmwareRunning();
 
-// Protocol the model selected for the module slot, 0 when it is off.
+// Protocol the model selected for each module slot, 0 when it is off. The two
+// slots are separate links (see module_serial.h): the internal one is the
+// built-in C3, the external one the module on the USB-UART adapter. Either can
+// be the one that is silent, so both are reported.
+uint8_t internalModuleType();
 uint8_t externalModuleType();
 
 }  // namespace simu

@@ -1,13 +1,32 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  The RC's internal joystick - "DJI Virtual Joystick", 2ca3:1501, the one device this app
-  is allowed to be the owner of.
+  The RC's internal joystick - "DJI Virtual Joystick", 2ca3:1501 - is the one device the
+  app can never do without. Declaring it is what puts the "use for this device by
+  default" tick into Android's USB permission dialog. Without a declaration the dialog
+  has no tick, and the grant it hands out does not survive a reboot, so the app had to
+  ask again after every one (see RcRawJoystick, which is the reason the app wants the
+  device at all).
 
-  Declaring it is what puts the "use for this device by default" tick into Android's USB
-  permission dialog. Without a declaration the dialog has no tick, and the grant it hands
-  out does not survive a reboot, so the app had to ask again after every one (see
-  RcRawJoystick, which is the reason the app wants the device at all).
+  The two RF modules (see RcModuleSerial) are declared for the same reason:
+
+  303a:1001 is the internal module: the ESP32-C3's native "USB Serial/JTAG", a standard
+  CDC-ACM device (class probe, see CdcAcmSerialDriver) that is wired inside the RC.
+
+  1a86:7523 / 1a86:7522 are the external module: a USB-UART adapter (WCH CH340),
+  where the module in the bay-style serial port is connected. 7523 is the classic
+  PID and is the one measured working here; some CH340 variants enumerate as 7522.
+
+  The other common USB-UART bridges are declared too, so swapping the adapter for a
+  CP210x, FTDI, PL2303 or a classic CH340 does not ask for permission again:
+  10c4:ea60 (SiLabs CP210x), 0403:6001 (FTDI FT232), 1a86:7523 (WCH CH340),
+  067b:2303 (Prolific PL2303).
 -->
 <resources>
     <usb-device vendor-id="11427" product-id="5377" />
+    <usb-device vendor-id="12346" product-id="4097" />
+    <usb-device vendor-id="6790" product-id="29986" />
+    <usb-device vendor-id="4292" product-id="60000" />
+    <usb-device vendor-id="1027" product-id="24577" />
+    <usb-device vendor-id="6790" product-id="29987" />
+    <usb-device vendor-id="1659" product-id="8963" />
 </resources>

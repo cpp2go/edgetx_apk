@@ -145,6 +145,79 @@ input device 4: "fts" sources=0x00001002  axes=[X,Y,...]
 If a remote controller's sticks do not show up there with a `JOYSTICK` marker,
 Android never sees them — a vendor SDK would be needed instead.
 
+## RF modules
+
+EdgeTX has two module slots. This app bridges each slot to its own USB serial
+port, but **drives only one at a time**, the one the model enables:
+
+| Slot | Device | Firmware port |
+|------|--------|---------------|
+| internal | the built-in module (the C3, ESP32 native USB Serial/JTAG, `303a:1001`) | AUX1 (port 0) |
+| external | a module on a USB-UART adapter (CH34x, CP210x, FTDI, Prolific) | AUX2 (port 1) |
+
+* Internal slot enabled → the internal device is opened; the external one is kept
+  closed and its frames are discarded, so the other module cannot transmit.
+* Internal slot off, external slot enabled → the external device is opened.
+* Only one module attached → it is used as the internal one, so a model with the
+  internal slot enabled works without changing any settings.
+* Both attached → the C3 is the internal module and anything else is the external
+  one; the internal slot still has priority.
+
+The active slot runs whatever protocol the model selects for it (CRSF, SBUS, DSM,
+PPM, ...), at the baud rate and framing EdgeTX configures for that slot. The
+firmware binds the internal slot to AUX1 and the external slot to AUX2, and
+`module_serial.cpp` keeps one TX queue per port, so bytes never have to be guessed
+into a slot.
+
+`RcModuleSerial` logs every transition with the slot's name (`internal slot` /
+`external slot`) and mirrors the log into `module_link.txt` in the app's external
+files directory.
+
+**Power:** a bus-powered USB hub may not be able to feed the C3 and an external
+module at the same time. The C3 declares 500 mA, and when the external module is
+also powered from the same hub the 5 V rail can sag: the external module's TX line
+then sits low (the link shows no bytes, or a single `0x00`) even though it works
+with the C3 unplugged. Use a powered hub, or power the external module from its own
+supply with a common ground; the app cannot power a USB port off.
+
+**Baud rate on the wire.** The app writes the rate EdgeTX configured into the
+adapter's divider, but what comes out depends on the adapter's own clock: the
+CH34x takes the divider from the host and derives the bit clock from its crystal
+or oscillator. The measured board here turned out to be accurate (399825 baud for
+a requested 400000, i.e. 100.0 %), so a wrong rate is *not* the usual explanation,
+but an out-of-spec adapter would look exactly like a dead wire: the module hears
+garbage, answers nothing, and a loopback test still passes because both directions
+share the clock.
+
+The external slot therefore does not trust the configured rate blindly. It starts
+with what the firmware asked for, then tries 460800, 921600, 230400 and 115200,
+measures the adapter's real rate for the log, and finally sweeps ±12 % around the
+configured rate in 2 % steps — UART tolerates about 2 %, so a chip that is a few
+percent off is still found. The first rate at which a **CRC-valid CRSF frame**
+arrives is kept for the rest of the session.
+
+While probing it also *sends* CRSF device pings, because an ELRS module answers
+only when it is asked: with the handset merely streaming RC channels it stays
+silent, and a silent module is indistinguishable from a wrong rate.
+
+**A silent module may be in WiFi mode.** ELRS transmitter modules reboot into WiFi
+(SSID `ExpressLRS TX`, so they still look powered and blink) when they have not
+received valid CRSF for about a minute. The serial port is dead in that mode, so
+the only way out is a power cycle or the module's button — no baud rate helps. The
+log says so when every rate has failed:
+`no CRSF frames between ... and ... baud either ...`.
+
+**Nothing received at all is a wiring problem.** A module prints its boot log on
+its TX pin every time it powers up, so a freshly powered module that yields *zero*
+bytes while the port is at its measured-correct rate means its TX is not reaching
+the adapter's RX: swapped TXD/RXD on a board whose silkscreen is wrong, a loose
+Dupont connector or a dead pin. A loopback short (touching the two signal wires
+together) tells the two apart: if that echoes bytes, the adapter is fine and the
+module side is not connected. Confirmed on the `1a86:7522` board here: its TXD/RXD
+labels are reversed, so "crossed" wiring as printed was straight through, nothing
+ever reached the module, and the module fell into WiFi mode about a minute later -
+which is why the whole chain looked dead no matter the baud rate.
+
 ## Link lifetime
 
 On a radio the sticks never stop reaching the RF module while the radio is on.

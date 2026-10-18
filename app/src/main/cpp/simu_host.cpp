@@ -47,7 +47,7 @@ void firmwareMain(const char* sdPath, const char* settingsPath) {
     // wizard stays off: it just needs to be seen once and the settings file this port
     // ships already carries a valid calibration.
     simuSetSplashStartup();
-    simuStart(false);  // blocks until the firmware shuts down
+    simuStart(false);  // returns once the firmware's own tasks are running
     LOGI("firmware: simuStart returned");
 
     g_started = false;
@@ -66,7 +66,10 @@ LcdInfo lcdInfo() {
 }
 
 bool start(const char* sdPath, const char* settingsPath) {
-    if (g_started) return true;
+    // simuStart() returns as soon as the firmware's tasks are up, so the worker's
+    // flag alone would let a second start boot a second firmware next to the first.
+    // The library's own running flag is the one that says whether a firmware exists.
+    if (g_started || (simuIsRunning != nullptr && simuIsRunning())) return true;
 
     // The firmware thread clears g_started as soon as simuStart() returns, but the
     // std::thread object stays joinable until somebody joins it. Assigning over a
@@ -82,7 +85,8 @@ bool start(const char* sdPath, const char* settingsPath) {
 }
 
 void stop() {
-    if (!g_started) return;
+    const bool firmwareUp = simuIsRunning != nullptr && simuIsRunning();
+    if (!g_started && !firmwareUp) return;
 
     LOGI("firmware: simuStop");
     g_stopRequested = true;
@@ -92,7 +96,13 @@ void stop() {
     g_started = false;
 }
 
-bool running() { return g_started && !g_stopRequested; }
+bool running() {
+    // The library returns from simuStart() once the firmware's tasks are up, so the
+    // worker thread's lifetime says nothing about the firmware: ask the firmware's own
+    // flag, and fall back to the thread's flag on a library without it.
+    if (simuIsRunning != nullptr) return simuIsRunning();
+    return g_started && !g_stopRequested;
+}
 
 bool takeFrame(uint8_t* dst, uint32_t dstLen) {
     if (!simuLcdChanged()) return false;
@@ -227,6 +237,10 @@ void setAudioPending(uint32_t bytes) {
 }
 
 uint32_t audioPendingBytes() { return g_audioPending.load(); }
+
+uint8_t internalModuleType() {
+    return edgetxAndroidInternalModuleType != nullptr ? edgetxAndroidInternalModuleType() : 0;
+}
 
 uint8_t externalModuleType() {
     return edgetxAndroidExternalModuleType != nullptr ? edgetxAndroidExternalModuleType() : 0;
