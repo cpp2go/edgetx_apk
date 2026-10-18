@@ -173,12 +173,18 @@ into a slot.
 `external slot`) and mirrors the log into `module_link.txt` in the app's external
 files directory.
 
-**Power:** a bus-powered USB hub may not be able to feed the C3 and an external
-module at the same time. The C3 declares 500 mA, and when the external module is
-also powered from the same hub the 5 V rail can sag: the external module's TX line
-then sits low (the link shows no bytes, or a single `0x00`) even though it works
-with the C3 unplugged. Use a powered hub, or power the external module from its own
-supply with a common ground; the app cannot power a USB port off.
+**Power.** A bus-powered USB hub may not be able to feed the C3 and an external
+module at the same time. Both devices sit behind the same hub here, and with the
+external module - a transmitter with a PA - on it the hub reset itself every 20 to
+60 seconds: both devices disappeared and came back with new device numbers, which
+the app sees as a detach, a re-open and a re-probe. The Lua then never finished a
+request/answer round trip and the module looked unreachable, while every individual
+sample looked healthy. A hub with its own power supply ended it: zero detaches in
+the same window that used to have seven.
+
+So when a module "sometimes" works: count `detached` lines in `module_link.txt`
+first. Use a powered hub, or power the external module from its own supply with a
+common ground; the app cannot power a USB port off.
 
 **Baud rate on the wire.** The app writes the rate EdgeTX configured into the
 adapter's divider, but what comes out depends on the adapter's own clock: the
