@@ -594,9 +594,13 @@ final class RcModuleSerial {
         }
 
         final UsbSerialPort port = ports.get(0);
+        // Open straight at the rate the firmware wants, not at a default the module would have
+        // to adapt to first: a reconnect is already a hiccup, and an extra rate change on top
+        // of it is what the module notices most.
+        final int initialBaud = initialBaud(link);
         try {
             port.open(connection);
-            port.setParameters(DEFAULT_BAUD, 8, UsbSerialPort.STOPBITS_1,
+            port.setParameters(initialBaud, 8, UsbSerialPort.STOPBITS_1,
                     UsbSerialPort.PARITY_NONE);
         } catch (Throwable t) {
             Log.w(TAG, link.role + ": could not open the serial port", t);
@@ -623,10 +627,10 @@ final class RcModuleSerial {
         link.usbPort = port;
         link.connection = connection;
         link.deviceName = device.getDeviceName();
-        link.appliedBaud = DEFAULT_BAUD;
+        link.appliedBaud = initialBaud;
         link.appliedEncoding = ENCODING_8N1;
         link.lastRxAtMs = 0;
-        logi(link.role + ": " + describe(device) + " open at " + DEFAULT_BAUD + " 8N1");
+        logi(link.role + ": " + describe(device) + " open at " + initialBaud + " 8N1");
 
         link.ioManager = new SerialInputOutputManager(port, listenerFor(link));
         // A read with no timeout can block for ever (Android's USB stack does not always honour the
@@ -635,6 +639,19 @@ final class RcModuleSerial {
         link.ioManager.setWriteTimeout(WRITE_TIMEOUT_MS);
         sIoExecutor.submit(link.ioManager);
         sIoExecutor.submit(() -> writeLoop(link));
+    }
+
+    /** Rate to open a port at: what the firmware configured, or the default while it has not. */
+    private static int initialBaud(Link link) {
+        try {
+            final int wanted = nativeWantedBaudrate(link.port);
+            if (wanted > 0) {
+                return wanted;
+            }
+        } catch (Throwable ignored) {
+            // the library may not be up yet
+        }
+        return DEFAULT_BAUD;
     }
 
     private static SerialInputOutputManager.Listener listenerFor(Link link) {
