@@ -47,8 +47,9 @@
 
          FOREGROUND_SERVICE_CONNECTED_DEVICE and FOREGROUND_SERVICE_SPECIAL_USE
          are the two types that service tries, in that order; see
-         RcLinkService.promoteToForeground(). WAKE_LOCK lets it keep streaming
-         with the screen off, POST_NOTIFICATIONS only affects whether the ongoing
+         RcLinkService.promoteToForeground(). WAKE_LOCK lets it hold the display on
+         (and with it the firmware's screen) for as long as the process lives, with
+         or without a window; POST_NOTIFICATIONS only affects whether the ongoing
          notification is visible on Android 13 and later. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />

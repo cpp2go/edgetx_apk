@@ -242,8 +242,8 @@ stopped getting frames. `RcLinkService` exists to prevent that.
   frame handshake is left to the activity, because `takeFrame()` ends inside LVGL
   (`lcdFlushed()` → `lv_disp_flush_ready()`) and that belongs to the thread which
   owns the window. Reopening the app resumes rendering where it left off.
-* It holds a **partial wake lock**, so the frames also keep flowing with the RC's
-  display switched off.
+* It holds a **screen wake lock**, so neither the RC's display nor the firmware
+  behind it ever goes to sleep while the process lives.
 * `android:stopWithTask="false"`: removing the task does not stop it.
 * The activity only attaches/detaches its window (`window_attach`/
   `window_detach` in `native_main.cpp`). Neither stops the firmware, and

@@ -35,8 +35,9 @@ import java.io.File;
  *   <li>the process is not killed when the task is removed, which is what makes
  *       the stick data keep reaching the module,
  *   <li>the process is not frozen by the cached-app freezer either,
- *   <li>a partial wake lock is held on top of that, so the stream also continues
- *       with the screen off.
+ *   <li>a screen wake lock is held on top of that, so the display stays on - and
+ *       with it the firmware's own screen - for as long as the process lives,
+ *       whether or not the UI is attached.
  * </ul>
  *
  * <p>What survives the UI and what does not:
@@ -352,20 +353,26 @@ public final class RcLinkService extends Service {
     }
 
     /**
-     * Keeps the CPU from suspending with the screen off. Without it the firmware's
-     * threads are frozen the moment the RC's display goes dark, and the module
-     * stops getting frames long before the app "was closed".
+     * Keeps the display on for as long as this process lives.
+     *
+     * <p>A partial lock only kept the CPU running and let the panel go dark; the firmware's
+     * screen is the whole point of the remote, and it has to stay readable whether or not the
+     * activity is attached. {@code FLAG_KEEP_SCREEN_ON} covers that for a window, but the
+     * requirement here is the process lifetime and a service has no window - so this is the
+     * lock that does it. Deprecated since API 17 in favour of that flag, and still the only
+     * way to hold the display on without one.
      */
+    @SuppressWarnings("deprecation")
     private void acquireWakeLock() {
         try {
             final PowerManager power = (PowerManager) getSystemService(Context.POWER_SERVICE);
             if (power == null) {
                 return;
             }
-            mWakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "edgetx:rc_link");
+            mWakeLock = power.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK, "edgetx:rc_link");
             mWakeLock.setReferenceCounted(false);
             mWakeLock.acquire();
-            Log.i(TAG, "link: partial wake lock held");
+            Log.i(TAG, "link: screen wake lock held, the display stays on with the process");
         } catch (Throwable t) {
             Log.w(TAG, "link: no wake lock", t);
         }
