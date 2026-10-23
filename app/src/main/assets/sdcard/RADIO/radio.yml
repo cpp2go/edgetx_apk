@@ -162,7 +162,7 @@ switchConfig:
       type: 2POS
    SI:
       name: ""
-      type: NONE
+      type: 3POS
    SJ:
       name: ""
       type: 3POS

@@ -70,8 +70,9 @@ void requestScrollWheel(int32_t steps);
 // Queue a hardware switch position from the DJI SDK. `index` is 0 = SA, 1 = SB
 // (see nativeOnDjiSwitch); `state` is <0 up, 0 middle, >0 down.
 //
-// The board's switch table and who drives what: SA takeoff, SB flight mode,
-// SC video, SD pause, SE photo, SF C1/C2/C3, SG/SH/SI R1/R2/R3, SJ arm state.
+// The board's switch table and who drives what: SA takeoff, SB flight mode, SC/SD video
+// and pause, SE photo, SF/SG/SH the C1/C2/C3 buttons, SI the R1/R2/R3 buttons, SJ the
+// L1/L2/L3 buttons.
 void requestSwitch(int index, int8_t state);
 
 // ---------------------------------------------------------------- startup ----
@@ -95,5 +96,11 @@ void setStateDir(const char* dir);
 // simuInit() and simuStart(); they survive the boot's own switch reset because
 // simu::setSwitch() keeps a copy in the library (see its boardInitSwitches()).
 void restoreSwitches();
+
+// The last position this module saw for a switch: <0 up, 0 middle, >0 down, and 0 when
+// nothing has moved it yet. Read from DjiMsdkBridge.toggleSwitch() so a Java-driven
+// button flips the switch from where it really is: the R1/R2/R3 keys and a restart both
+// move it without Java seeing.
+int switchState(int index);
 
 }  // namespace joystick

@@ -329,40 +329,45 @@ std::string prepare_sd_root(const char* filesDir, const char* externalFilesDir) 
 
 // ------------------------------------------------------- switch types --------
 //
-// Four of the switches this port drives do not match what the board's own default
-// radio.yml declares:
+// The switches this port drives do not all match what the board's own default radio.yml
+// declares:
 //
-//   SI  the R3 button (see joystick.cpp: kSwitchKeys)          the board leaves it unset
-//   SJ  the aircraft's arm state                               the board leaves it unset
+//   SI  the R1/R2/R3 three-position switch (see joystick.cpp: kPositionKeys)
+//                                                              the board leaves it unset
+//   SJ  the L1/L2/L3 three-position switch                     the board leaves it unset
 //   SE  the shutter button (DjiMsdkBridge.setShutterPosition)  the board calls it
 //       three-position, while the button only has two ends: every press steps it to the
 //       other one, and no middle position is ever reported
 //   SF  the same button again on the RC Pro, which is the other remote this port runs on:
 //       there the photo button drives SF (the round button drives SE) and it has two ends
-//       just the same. On the RC Plus 2 SF is where its C1/C2/C3 buttons pick one of three
-//       positions, so there it keeps the board's 3POS - which is why the table below can
-//       name a remote.
+//       just the same. On the RC Plus 2 SF is C1's switch now, and it keeps the board's
+//       3POS - which is why the table below can name a remote.
 //
 // A switch with no type is missing from the Hardware page and cannot be used as a mixer
 // source, and a three-position switch whose middle never happens is a middle position
-// waiting to be picked. All four are two-ended controls, so 2POS is what they get.
+// waiting to be picked. SI and SJ are three-ended controls and get 3POS; SE and the RC Pro's
+// SF have only two, so 2POS is what they get.
+//
+// Cards written by an older build of this port still carry SI as 2POS (the type it used to
+// fill in), so that value is upgraded as well - the R2 button now has a middle to give.
 //
 // The host cannot set the type through the firmware. The firmware reads radio.yml in
 // its own boot (storageReadAll() in edgetx.cpp) and only ever writes its settings from
 // its own thread, so by the time the host can call anything the radio is already
 // running on what it loaded. The file is therefore put right before the firmware reads
-// it - and only where the type is still the board default, i.e. for as long as the user
-// has not picked one in the Hardware page. Nothing else in the file is touched.
+// it - and only where the type is still a value this port wrote, i.e. for as long as the
+// user has not picked one in the Hardware page. Nothing else in the file is touched.
 struct SwitchTypeDefault {
     const char* name;
-    const char* board;   // the type the board's own default radio.yml carries
+    const char* board;   // the type the file carries now (board default, or an older port one)
     const char* type;    // what the control behind it actually is
     const char* device;  // the remote it applies to, or nullptr for every remote
 };
 
 constexpr SwitchTypeDefault kSwitchTypeDefaults[] = {
-    {"SI", "NONE", "2POS", nullptr},
-    {"SJ", "NONE", "2POS", nullptr},
+    {"SI", "NONE", "3POS", nullptr},
+    {"SI", "2POS", "3POS", nullptr},   // written by an older build of this port
+    {"SJ", "NONE", "3POS", nullptr},
     {"SE", "3POS", "2POS", nullptr},
     {"SF", "3POS", "2POS", "rm510"},   // RC Pro only: see the note above
 };

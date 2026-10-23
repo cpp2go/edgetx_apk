@@ -130,11 +130,10 @@ struct KeyChoice {
 // DjiMsdkBridge -> nativeOnDjiButton), because the RC firmware never dispatches
 // their events to apps.
 //
-// L1/L2/L3 are deliberately not keys: they pick the position of the 3-position
-// switch SJ, the same way C1/C2/C3 pick SF on the RC Pro (see kPositionKeys).
-// That is why the SYS/MDL/TELE shortcuts a hardware TX16S has on its own buttons
-// are not on this remote any more - one button cannot be both a page key and a
-// third of a switch.
+// L1/L2/L3 and R1/R2/R3 are deliberately not keys: they pick the position of the
+// 3-position switches SJ and SI (see kPositionKeys). That is why the SYS/MDL/TELE
+// shortcuts a hardware TX16S has on its own buttons are not on this remote any more -
+// one button cannot be both a page key and a third of a switch.
 const KeyChoice kKeyMap[] = {
     {AKEYCODE_BACK, kKeyExit},            // the remote's RTN (return) button
     {AKEYCODE_BUTTON_THUMBL, kKeyEnter},  // 5-way centre press
@@ -780,26 +779,30 @@ std::chrono::steady_clock::time_point g_thumbLAt{};
 bool g_thumbLSeen = false;
 constexpr auto kThumbLDedup = std::chrono::milliseconds(500);
 
-// The RC's R1/R2/R3 buttons arrive as plain Android key codes F4..F6 (measured - the SDK's
-// own boolean button keys are all silent for them) and each drives one momentary EdgeTX
-// switch: pressed = down, released = up. They are SG/SH/SI, the switches the RC's C1/C2/C3
-// buttons used to drive; C1/C2/C3 now pick the position of the 3-position switch SF
-// instead, and they can do that from the DJI SDK (see DjiMsdkBridge.listenPositionButton) -
-// which is also why SF is the switch that keeps being usable with the UI closed.
+// The L1/L2/L3 (F1..F3) and R1/R2/R3 (F4..F6) buttons pick a position of a 3-position
+// EdgeTX switch and leave it there:
 //
-// The L1/L2/L3 buttons (F1..F3) pick the position of the 3-position switch SJ - up,
-// middle, down - and leave it there, exactly like C1/C2/C3 do for SF on the RC Pro (see
-// kPositionKeys above). They used to be EdgeTX keys that opened the SYS/MDL/TELE pages.
+//   L1/L2/L3 -> SJ up/middle/down
+//   R1/R2/R3 -> SI up/middle/down
 //
-// Android only delivers key events to the window that has focus, so these three - and
-// with them L1/L2/L3 (F1..F3), R1/R2/R3 (F4..F6) and the RC's RTN button (BACK) - stop
-// arriving as soon as the UI is gone (the app swiped away; RcLinkService keeps the
-// *firmware* running, but there is no window left to receive keys). Everything the DJI SDK
-// reports keeps coming: the sticks, the dials and the switches DjiMsdkBridge drives
-// (SA/SD/SE/SF/SC). SJ therefore cannot be moved while no window exists - it keeps the
-// position it was left in. There is no way around it from here: the kernel's input node is
-// root:input 0660 and the only permission that grants that group is signature-level, so a
-// switch that has to be usable with the UI closed has to come from the SDK.
+// Only the press matters - the release is dropped, otherwise the switch would spring back
+// and the model would see two moves per press. Both sets used to be EdgeTX keys that opened
+// the SYS/MDL/TELE pages; they are switch positions now and the pages are reached from the
+// radio's own screens.
+//
+// SG and SH are no longer driven from these keys. On the RC Pro its C1/C2 still drive them
+// through the DJI SDK (see DjiMsdkBridge.listenButtonKeys); on the RC Plus 2 nothing does,
+// which is the price of having three positions on SI.
+//
+// Android only delivers key events to the window that has focus, so these six - and with
+// them the RC's RTN button (BACK) - stop arriving as soon as the UI is gone (the app swiped
+// away; RcLinkService keeps the *firmware* running, but there is no window left to receive
+// keys). Everything the DJI SDK reports keeps coming: the sticks, the dials and the switches
+// DjiMsdkBridge drives (SA/SC/SD/SE/SF). SJ and SI therefore cannot be moved while no
+// window exists - they keep the position they were left in. There is no way around it from
+// here: the kernel's input node is root:input 0660 and the only permission that grants that
+// group is signature-level, so a switch that has to be usable with the UI closed has to
+// come from the SDK.
 //
 // The photo, video and pause buttons are NOT here: their kernel key codes never
 // reach an app (the RC's own dpad service consumes them, and pause is not in the
@@ -807,33 +810,7 @@ constexpr auto kThumbLDedup = std::chrono::milliseconds(500);
 // see DjiMsdkBridge.listenButtonKeys().
 //
 // A key code listed in joystick.keys wins, which is how any of these can be made
-// an EdgeTX key instead - L1/L2/L3 (F1..F3) are mapped that way above, so they
-// open the SYS/MODEL/TELE pages.
-struct SwitchKey {
-    int32_t keycode;
-    uint8_t index;
-    int8_t  state;   // the position the switch takes while the button is held
-};
-
-// Board switch table (tx16smk3.json): 6 = SG, 7 = SH, 8 = SI. All three are momentary, so
-// the release puts them back up.
-const SwitchKey kSwitchKeys[] = {
-    {AKEYCODE_F4, 6, 1},  // R1 -> SG down while held
-    {AKEYCODE_F5, 7, 1},  // R2 -> SH down while held
-    {AKEYCODE_F6, 8, 1},  // R3 -> SI down while held
-};
-
-// A button that selects one position of a switch, which then stays there until another of
-// its buttons is pressed. Only the press matters - the release is dropped, otherwise the
-// switch would spring back and the model would see two moves per press.
-//
-// This is SJ: L1 up, L2 middle, L3 down. It mirrors what C1/C2/C3 do to SF on the RC Pro
-// (DjiMsdkBridge.listenPositionButton), except that these buttons only reach an app through
-// Android's key codes - so like every Android-delivered button they stop arriving once the
-// window is gone (see the note above).
-//
-// These three are only switch positions now. They used to open the SYS/MODEL/TELE pages and
-// no longer do: the pages are reached from the radio's own screens.
+// an EdgeTX key instead.
 struct PositionKey {
     int32_t keycode;
     uint8_t index;
@@ -844,9 +821,10 @@ const PositionKey kPositionKeys[] = {
     {AKEYCODE_F1, 9, -1},  // L1 -> SJ up
     {AKEYCODE_F2, 9,  0},  // L2 -> SJ middle
     {AKEYCODE_F3, 9,  1},  // L3 -> SJ down
+    {AKEYCODE_F4, 8, -1},  // R1 -> SI up
+    {AKEYCODE_F5, 8,  0},  // R2 -> SI middle
+    {AKEYCODE_F6, 8,  1},  // R3 -> SI down
 };
-
-std::vector<int32_t> g_loggedSwitchKeys;
 
 const char* switch_name(uint8_t index) {
     static char buf[4];
@@ -854,17 +832,7 @@ const char* switch_name(uint8_t index) {
     return buf;
 }
 
-void log_switch_key_once(int32_t keycode, uint8_t index, int8_t state) {
-    if (std::find(g_loggedSwitchKeys.begin(), g_loggedSwitchKeys.end(), keycode) !=
-        g_loggedSwitchKeys.end()) {
-        return;
-    }
-    g_loggedSwitchKeys.push_back(keycode);
-    LOGI("joystick: button keycode %d (%s) -> EdgeTX switch %s position %d", keycode,
-         key_name(keycode), switch_name(index), (int)state);
-}
-
-std::vector<int32_t> g_loggedPositionKeys;
+std::vector<int32_t> g_loggedPositionKeys;  // one "button -> switch" line per key, ever
 
 void log_position_key_once(int32_t keycode, uint8_t index, int8_t position) {
     if (std::find(g_loggedPositionKeys.begin(), g_loggedPositionKeys.end(), keycode) !=
@@ -1083,18 +1051,8 @@ bool handleKeyCode(int32_t keycode, bool down) {
         return true;
     }
 
-    // Not remapped, so fall back to the built-in role of these buttons. They are
-    // momentary switches: the switch follows the button, so both edges matter.
-    for (const SwitchKey& entry : kSwitchKeys) {
-        if (entry.keycode == keycode) {
-            const int8_t state = down ? entry.state : static_cast<int8_t>(-entry.state);
-            log_switch_key_once(keycode, entry.index, state);
-            requestSwitch(entry.index, state);
-            return true;
-        }
-    }
-
-    // A position button sets its switch and leaves it there: the release is swallowed here.
+    // Not remapped, so fall back to the built-in role of these buttons: one switch position
+    // each (L1/L2/L3 -> SJ, R1/R2/R3 -> SI), set by the press and left alone by the release.
     for (const PositionKey& entry : kPositionKeys) {
         if (entry.keycode != keycode) continue;
         if (down) {
@@ -1192,10 +1150,13 @@ constexpr int32_t kDjiStickRange = 660;
 //   1    flight-mode switch             (DJI SDK, three-position)
 //   2-4  video, pause, photo            (DJI SDK / raw report; which slot is which depends on
 //                                        the remote, see SLOT_* in DjiMsdkBridge)
-//   5-8  C1, C2, C3, C4/round button    (DJI SDK; on the RC Pro SF/SG/SH/SI, see SLOT_*)
-//   6-8  R1, R2, R3                     (RC Plus 2 only, Android key codes, see kSwitchKeys)
-//   9    L1, L2, L3 as one 3-position switch, up/middle/down (RC Plus 2, Android key codes,
-//        see kPositionKeys; it stays where it was put, so it is also the persisted one)
+//   5    SF                             (C1 on the RC Plus 2, the photo slot on the RC Pro)
+//   6    SG                             (C2 on the RC Plus 2, C1 on the RC Pro)
+//   7    SH                             (C3 on the RC Plus 2, C2 on the RC Pro)
+//   8    SI                             (RC Plus 2: R1/R2/R3 pick up/middle/down, see
+//                                        kPositionKeys)
+//   9    SJ                             (RC Plus 2: L1/L2/L3 pick up/middle/down, see
+//                                        kPositionKeys)
 constexpr int kSwitchCount = 10;
 
 std::mutex g_switchMutex;
@@ -1392,32 +1353,38 @@ void requestScrollWheel(int32_t steps) {
 
 // ---- switch positions across restarts ---------------------------------------
 //
-// The RC's latching switches stay where the user put them while the app is not
-// looking: the takeoff button latches in the remote's own hardware, and the pause
-// button works the same way for whoever is pressing it. The DJI SDK
-// only ever reports a press, never the latched level, so the position has to be
-// remembered here - and remembered across a restart, because EdgeTX reads its switch
-// positions once while booting and warns about every one that is not where the model
-// expects it.
+// Some of the RC's switches latch in the remote's own hardware (the takeoff button,
+// the pause button); the rest are momentary buttons that the app makes latch, one
+// press at a time. Either way the DJI SDK and Android's key events only ever report a
+// press, never the latched level, so the position has to be remembered here - and
+// remembered across a restart, because EdgeTX reads its switch positions once while
+// booting and warns about every one that is not where the model expects it.
 //
-// Only the latch that this module is the only witness of is kept here:
+// Every switch driven by a button is kept here:
 //
-//   5  SF  C1/C2/C3     (DJI SDK, see DjiMsdkBridge.listenPositionButton)
-//   9  SJ  L1/L2/L3     (Android key codes F1..F3, see kPositionKeys)
+//   4  SE  photo on the RC Plus 2, round button on the RC Pro
+//   5  SF  C1 on the RC Plus 2, photo on the RC Pro
+//   6  SG  C2 on the RC Plus 2, C1 on the RC Pro
+//   7  SH  C3 on the RC Plus 2, C2 on the RC Pro
+//   8  SI  R1/R2/R3 pick its position (Android key codes F4..F6, see kPositionKeys)
+//   9  SJ  L1/L2/L3 pick its position (Android key codes F1..F3, see kPositionKeys)
 //
-// SA (takeoff), SD (pause) and SE (photo) latch in exactly the same way, but they come
-// from DjiMsdkBridge.java, which keeps their positions itself: the SDK's registration is
-// what first makes them known, and Java can read its own store before that, whereas a
-// call into here would race with this file being loaded (link_start() does that, which
-// runs after Application.onCreate has already called the bridge).
+// SB is the flight-mode switch: a real three-position switch that reports where it stands,
+// so there is nothing to remember.
 //
-// The momentary ones (SC/SG/SH from the buttons, SI from C3) are back where they
-// belong as soon as nothing is held.
+// SA (takeoff), SC (video) and SD (pause) are remembered too, but on the Java side (see
+// DjiMsdkBridge.restoreLatchedSwitches): their buttons latch in the remote's own hardware,
+// and Java has to know those positions before the SDK registration - earlier than this file
+// is opened.
+//
+// The RC Pro drives SF, SG, SH and SE from DjiMsdkBridge.java instead of these keys, and
+// that side restores its toggle state with the rest, so its first press after a restart is
+// the right one.
 //
 // Caveat, and it cannot be fixed from here: the remote's latch moves even while the app
 // is dead, and a press made in that window is invisible. The restored position is
 // therefore the app's best guess, and the next press puts both sides back in step.
-constexpr uint8_t kPersistedSwitches[] = {5, 9};
+constexpr uint8_t kPersistedSwitches[] = {4, 5, 6, 7, 8, 9};
 
 bool is_latching_switch(int index) {
     for (uint8_t persisted : kPersistedSwitches) {
@@ -1437,7 +1404,7 @@ std::string g_statePath;                 // empty until setStateDir() has run
 int8_t g_stateValue[kSwitchCount] = {};  // last position seen, per switch
 bool g_stateKnown[kSwitchCount] = {};    // false = never seen, i.e. nothing saved
 
-// The whole table is rewritten on every change: it holds at most four lines, and a
+// The whole table is rewritten on every change: it holds at most six lines, and a
 // rewrite cannot leave a half-applied one behind.
 void save_switch_state_locked() {
     if (g_statePath.empty()) return;
@@ -1463,8 +1430,7 @@ void requestSwitch(int index, int8_t state) {
         g_switchQueued[index] = true;
     }
 
-    // The switch this module alone sees is remembered for the next run - see
-    // kPersistedSwitches.
+    // Every button-driven switch is remembered for the next run - see kPersistedSwitches.
     if (!is_latching_switch(index)) return;
 
     std::lock_guard<std::mutex> lock(g_stateMutex);
@@ -1889,6 +1855,17 @@ Java_com_edgetx_droidui_DjiMsdkBridge_nativeOnDjiSwitch(JNIEnv* env, jclass claz
     (void)env;
     (void)clazz;
     requestSwitch(index, static_cast<int8_t>(state));
+}
+
+// Called from DjiMsdkBridge.java before it flips a switch from one of its own buttons.
+// The switch may have been moved by the R1/R2/R3 keys or restored from joystick.switches
+// since Java last sent it a value, so Java's own copy cannot be trusted for the flip.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_edgetx_droidui_DjiMsdkBridge_nativeSwitchState(JNIEnv* env, jclass clazz,
+                                                        jint index) {
+    (void)env;
+    (void)clazz;
+    return switchState(index);
 }
 
 }  // namespace joystick
