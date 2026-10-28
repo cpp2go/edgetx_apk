@@ -50,7 +50,7 @@ only attaches a window to it while it is on screen. See *Link lifetime* below.
 | Python                | 3.11+ with `pydantic`, `clang`, `libclang`       |
 
 The Python interpreter is used by EdgeTX's build-time code generators. Point at
-a prepared virtualenv with `-Pedgetx.python=...` (see *Configuration* below).
+a prepared virtualenv with `-Pedgetx.python=...`.
 
 ## Building
 
@@ -75,40 +75,6 @@ adb shell am start -n com.edgetx.droidui/android.app.NativeActivity
 the EdgeTX CMake project, strips the result and stages it at
 `app/build/edgetx-libs/<abi>/libedgetx-st16mk3-simulator.so`, which is wired in
 as a `jniLibs` source directory.
-
-### Configuration
-
-| Gradle property      | Default                       | Meaning                                   |
-|----------------------|-------------------------------|-------------------------------------------|
-| `edgetx.dir`         | `E:/develop/dev/edgetx_esp32` | EdgeTX checkout to build                  |
-| `edgetx.pcb`         | `TX16SMK3`                    | EdgeTX `PCB` (the 800×480 target)         |
-| `edgetx.simuName`    | `st16mk3`                     | Library name suffix                       |
-| `edgetx.abis`        | `armeabi-v7a,arm64-v8a,x86_64`| ABIs to build                             |
-| `edgetx.python`      | `<edgetx.dir>/.venv/...`      | Python interpreter for the code generators|
-| `edgetx.skipBuild`   | `false`                       | Package the libraries already staged in `app/build/edgetx-libs/` instead of building them |
-
-`-Pedgetx.skipBuild=true` is what a machine without the patched EdgeTX checkout
-uses: build or copy `libedgetx-st16mk3-simulator.so` into
-`app/build/edgetx-libs/<abi>/` once, then build the APK from it.
-
-In PowerShell, **quote** Gradle properties, otherwise the value is parsed as a
-task name: `.\gradlew.bat :app:assembleRelease "-Pedgetx.abis=x86_64"`.
-
-## Required patches to the EdgeTX tree
-
-The port needs five changes in the EdgeTX checkout. The last two fix genuine
-upstream bugs that affect **every** non-ESP target, not just Android.
-
-| # | File | Change |
-|---|------|--------|
-| 1 | `radio/src/targets/simu/CMakeLists.txt` | Add an `elseif(ANDROID)` branch that builds the simu core as a `SHARED` library instead of the SDL/ImGui executable. |
-| 2 | `radio/src/targets/simu/android_host.cpp` | **New file.** Implements the host imports (`simuGetAnalog`, `simuTrace`, `simuLcdNotify`, `simuQueueAudio`). Android's linker rejects a shared library with unresolved symbols, so they have to live inside the `.so`. Also exports the analog-injection hook used by the app. |
-| 3 | `cmake/Macros.cmake` | `GenerateDatacopy()` runs libclang over the sources; pass `--sysroot`, `-resource-dir` and `-target` from the NDK, otherwise the generator fails with `inttypes.h file not found`. Do **not** add `-isystem usr/include` — it breaks libc++'s `include_next` ordering. |
-| 4 | `radio/src/gui/colorlcd/bitmaps.cpp` | `ICON_RADIO_WIFI` is unconditional in the `EdgeTxIcon` enum but `#if defined(ESP_PLATFORM)`-guarded in the `_builtinIcons[]` table, so on any non-ESP build the table is one entry short and the trailing icons (including `ICON_TOP_LOGO`) read out of bounds → NULL dereference in `_decompressed_mask()` when the QuickMenu opens. Keep the slot with an `#else` placeholder. |
-| 5 | `radio/src/gui/colorlcd/lcd.cpp` | `char LVGL_MEM_BUFFER[...] __SDRAM __ALIGNED(16)` — `__ALIGNED(x)` expands to **nothing** in simulator builds (`definitions.h`), so the pool is only 1-byte aligned. LVGL's TLSF rejects a mis-aligned pool (`lv_tlsf_create()` returns NULL) and the first `lv_mem_alloc()` then crashes. Use an explicit `__attribute__((aligned(16)))`. |
-
-Patch 5 only *appeared* to work on x86_64 because the linker happened to place
-the array on an aligned address; on arm64 it landed on an odd one.
 
 ## Input
 
@@ -144,6 +110,78 @@ input device 4: "fts" sources=0x00001002  axes=[X,Y,...]
 
 If a remote controller's sticks do not show up there with a `JOYSTICK` marker,
 Android never sees them — a vendor SDK would be needed instead.
+
+### Remote-controller buttons
+
+Which switch a button drives is a property of the remote, not of the button:
+the same C1 is `SF` on one remote and `SG` on another, the photo button steps
+`SE` on one and `SF` on the next, and the go-home button is either a switch of
+its own or the modifier that makes the 5-way trim a stick. Every remote this
+port has been run on therefore has a row in
+[`RcModel.java`](app/src/main/java/com/edgetx/droidui/RcModel.java) (which
+row the SDK buttons use, and how its data behaves) and in
+[`rc_model.h`](app/src/main/cpp/rc_model.h) (the switch types written into
+`radio.yml`). Both read `Build.DEVICE`, so they cannot disagree.
+
+| Remote | `Build.DEVICE` | video / pause / photo | C1 / C2 / C3 | round | go-home | flight mode top |
+|--------|----------------|-----------------------|--------------|-------|---------|-----------------|
+| RC Plus 2 | `rc701` | SC / SD / SE | SF / SG / SH | — | 5-way trim modifier (H) | `SWITCH_TWO` |
+| RC Pro | `rm510`, `rm510b`, `rm510bv` | SD / SC / SF | SG / SH / SI | SE | switch SA | `SWITCH_ONE` |
+| RC Plus | `rm700`, `rm700_enterprise` | SC / SD / SE | SF / SG / SH | — | switch SA | `SWITCH_TWO` |
+| RC Pro 2 | `rc520` | SD / SC / SF | SG / SH / SI | — | switch SA | `SWITCH_TWO` |
+
+Anything else keeps the RC Plus 2's row and says so in the log. The two rows
+for the RC Pro and the RC Plus 2 were settled by pressing every button on the
+remote; the RC Plus and RC Pro 2 rows are their family's layout and are the
+first thing to check on the hardware.
+
+The six side buttons L1/L2/L3/R1/R2/R3 are not in the DJI SDK at all — the
+only supported way to read them is Android key events
+([dji-sdk/Mobile-SDK-Android-V5#704](https://github.com/dji-sdk/Mobile-SDK-Android-V5/issues/704)),
+which is what `joystick.cpp: kPositionKeys` does: `F1..F3` pick the positions
+of `SJ`, `F4..F6` those of `SI`.
+
+At startup the app logs the remote and the whole layout, so a button on the
+wrong switch is distinguishable from a button that never arrived:
+
+```
+dji: remote RC Pro (rm510 / DJI RC Pro): video SD, pause SC, photo SF, C1 SG, C2 SH, C3 SI (log only), round SE; go-home switch SA; flight mode top = SWITCH_ONE; the remote's log may move switches
+```
+
+Then it asks the SDK which of its keys this remote actually has, and logs the
+answer as one line (`+` has it, `-` does not) plus a second line naming the keys
+that exist here but have no switch on this model (an RC Pro 2 in this example):
+
+```
+dji: this remote's SDK keys (+ has it, - does not): record+ shutter+ shutterLongPress- pause+ goHome+ takeoff+ C1+ C2+ C3+ C4- playback- rcSwitch- rightWheel+ scrollWheel+ leftDial+ rightDial+ fiveWay+ flightMode+ softSwitchMode- transform-
+dji: this remote has keys with no EdgeTX switch here: rightWheel - see RcModel if one of them should drive something
+dji: the SDK reports remote controller type RC_PRO
+```
+
+That is what makes a remote this port has never been measured on workable
+without pressing every button by hand: what it has is reported by the SDK, and
+what it drives comes from its row in `RcModel`. A key that exists but has no
+switch is listened to anyway and says so once when it is pressed, which is the
+difference between "the button is dead" and "nothing here is wired to it":
+
+```
+dji: 'rightWheel' fired - this remote has that key and the app has no EdgeTX switch for it yet (see RcModel)
+```
+
+Two things the SDK documentation settles, and this app follows:
+
+* The L/R row of six buttons is **not** in the SDK. DJI's article *How to listen
+  the L/R series button on RC Plus* says they are Android buttons whose key codes
+  are `F1`..`F6`, read with `onKeyDown`/`onKeyUp` — which is `joystick.cpp`:
+  `kPositionKeys`. `KeyRCSwitchButtonDown` is the *photo/video mode* switch, not
+  one of them.
+* MSDK v5 does **not** support the RC Pro 2 (DJI's answer to dji-sdk/Mobile-SDK-Android-V5#561),
+  so on that remote the SDK reports little or nothing and the button paths that
+  matter are Android key events and the remote's own log — both are in place.
+
+Every button the app does not map is logged once (`unmapped button keycode 131
+(F5)`, `the remote logged an unknown button 'PLAYBACK'`), which is how a new
+remote's row is filled in.
 
 ## RF modules
 
@@ -339,19 +377,17 @@ launchers shrink into the safe zone and wrap in their own shape.
 ## Troubleshooting
 
 * **The UI is blank / the process dies right after launch.** Look for a
-  tombstone first: `adb logcat -b crash`. A NULL dereference inside
-  `lv_tlsf_malloc` means patch 5 is missing.
-* **Tapping the EdgeTX logo crashes.** Patch 4 is missing.
+  tombstone first: `adb logcat -b crash`.
 * **`Gradle requires JVM 17 or later`.** Set `JAVA_HOME` (see *Building*).
 * **`EdgeTX simulator library not found`** while configuring the app module —
   the staging directory has no library for an ABI listed in `abiFilters`.
   Build every ABI you ship, or drop the extra ABI.
 * **Link errors on `simuSetSplashStartup`, `edgetxAndroidTakeAudio`,
   `edgetxAndroidSetAuxSerialSink`, or `simuStart(bool)`.** The `.so` that was
-  built is not from the patched EdgeTX checkout: check `CMAKE_HOME_DIRECTORY` in
-  `app/build/edgetx-build/<abi>/CMakeCache.txt`, and pass the right tree with
-  `-Pedgetx.dir=...`. A CMake build directory remembers its source tree, so
-  delete `app/build/edgetx-build/<abi>` when switching trees.
+  built is not from the same EdgeTX checkout as the sources: check
+  `CMAKE_HOME_DIRECTORY` in `app/build/edgetx-build/<abi>/CMakeCache.txt`, and
+  pass the right tree with `-Pedgetx.dir=...`. A CMake build directory remembers
+  its source tree, so delete `app/build/edgetx-build/<abi>` when switching trees.
 * Log tags: `EdgeTXUI` (host), `EdgeTXSim` (firmware `TRACE()` output).
 
 ## License
