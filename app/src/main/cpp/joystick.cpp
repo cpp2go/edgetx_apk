@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "log.h"
+#include "rc_model.h"
 #include "simu_host.h"
 
 namespace joystick {
@@ -208,6 +209,12 @@ const char* key_name(int32_t keycode) {
         case AKEYCODE_VOLUME_UP: return "VOLUME_UP";
         case AKEYCODE_VOLUME_DOWN: return "VOLUME_DOWN";
         case AKEYCODE_CAMERA: return "CAMERA";
+        // The RC's own key layout uses these two names for buttons that are otherwise
+        // nameless in a log line (the joystick device declares KEY_SYSRQ, for one). Neither is
+        // mapped: they show up as "unmapped button keycode N (SYSRQ/FUNCTION)" until a remote
+        // says which physical button they are.
+        case AKEYCODE_SYSRQ: return "SYSRQ";
+        case AKEYCODE_FUNCTION: return "FUNCTION";
         case AKEYCODE_F1: return "F1";
         case AKEYCODE_F2: return "F2";
         case AKEYCODE_F3: return "F3";
@@ -785,14 +792,20 @@ constexpr auto kThumbLDedup = std::chrono::milliseconds(500);
 //   L1/L2/L3 -> SJ up/middle/down
 //   R1/R2/R3 -> SI up/middle/down
 //
+// The MSDK has no key for these six at all - DJI's own answer for the RC Plus is to read
+// them as Android key events (dji-sdk/Mobile-SDK-Android-V5#704) - so they arrive through
+// the same path as any other key and are the one part of the layout that is the same on
+// every remote that has them. The RC Pro has no such buttons, which is why SJ and SI are
+// free there (see RcModel).
+//
 // Only the press matters - the release is dropped, otherwise the switch would spring back
 // and the model would see two moves per press. Both sets used to be EdgeTX keys that opened
 // the SYS/MDL/TELE pages; they are switch positions now and the pages are reached from the
 // radio's own screens.
 //
-// SG and SH are no longer driven from these keys. On the RC Pro its C1/C2 still drive them
-// through the DJI SDK (see DjiMsdkBridge.listenButtonKeys); on the RC Plus 2 nothing does,
-// which is the price of having three positions on SI.
+// SG and SH are not driven from these keys. On the Plus family C2/C3 drive them through the
+// DJI SDK (see DjiMsdkBridge.listenButtonKeys); nothing else does, which is the price of
+// having three positions on SI.
 //
 // Android only delivers key events to the window that has focus, so these six - and with
 // them the RC's RTN button (BACK) - stop arriving as soon as the UI is gone (the app swiped
@@ -922,15 +935,10 @@ int g_exitClickCount = 0;
 // One press of the trim-mode button, defined with the trim mode further down.
 void requestTrimModePress();
 
-// The remote this build runs on, from the same property DjiMsdkBridge.isRcPro() reads
-// (Build.DEVICE), so the two sides cannot disagree.
+// The remote this build runs on, from the same property and the same list DjiMsdkBridge's
+// RcModel reads (rc_model.h), so the two sides cannot disagree.
 bool is_rc_pro() {
-    static const bool rcPro = [] {
-        char value[PROP_VALUE_MAX] = {0};
-        __system_property_get("ro.product.device", value);
-        return std::string(value) == "rm510";
-    }();
-    return rcPro;
+    return remote_model() == RemoteModel::RcPro;
 }
 
 // The RC Pro's return button carries the gesture the RC Plus 2's landing (H) button carries
@@ -946,6 +954,11 @@ bool is_rc_pro() {
 //
 // The count is not the trim counter's yet: nothing is forwarded from here, see
 // settle_exit_clicks for why.
+//
+// Only the RC Pro takes this path. The RC Plus and the RC Pro 2 keep the Plus family's
+// double-click-to-long-press instead (handle_exit_click below): their return button has not
+// been measured, and turning a double click into a long press is harmless where a real hold
+// does arrive, while a trim mode that arms itself on two quick presses of a menu key is not.
 bool handle_exit_click_rc_pro(bool down) {
     const auto now = std::chrono::steady_clock::now();
 
@@ -1150,13 +1163,12 @@ constexpr int32_t kDjiStickRange = 660;
 //   1    flight-mode switch             (DJI SDK, three-position)
 //   2-4  video, pause, photo            (DJI SDK / raw report; which slot is which depends on
 //                                        the remote, see SLOT_* in DjiMsdkBridge)
-//   5    SF                             (C1 on the RC Plus 2, the photo slot on the RC Pro)
-//   6    SG                             (C2 on the RC Plus 2, C1 on the RC Pro)
-//   7    SH                             (C3 on the RC Plus 2, C2 on the RC Pro)
-//   8    SI                             (RC Plus 2: R1/R2/R3 pick up/middle/down, see
-//                                        kPositionKeys)
-//   9    SJ                             (RC Plus 2: L1/L2/L3 pick up/middle/down, see
-//                                        kPositionKeys)
+//   5    SF                             (C1 on the Plus family, the photo slot on the Pro family)
+//   6    SG                             (C2 on the Plus family, C1 on the Pro family)
+//   7    SH                             (C3 on the Plus family, C2 on the Pro family)
+//   8    SI                             (whoever has R1/R2/R3: they pick up/middle/down, see
+//                                        kPositionKeys; the Pro family's C3 on the RC Pro)
+//   9    SJ                             (L1/L2/L3 pick up/middle/down, see kPositionKeys)
 constexpr int kSwitchCount = 10;
 
 std::mutex g_switchMutex;
@@ -1362,10 +1374,10 @@ void requestScrollWheel(int32_t steps) {
 //
 // Every switch driven by a button is kept here:
 //
-//   4  SE  photo on the RC Plus 2, round button on the RC Pro
-//   5  SF  C1 on the RC Plus 2, photo on the RC Pro
-//   6  SG  C2 on the RC Plus 2, C1 on the RC Pro
-//   7  SH  C3 on the RC Plus 2, C2 on the RC Pro
+//   4  SE  photo (Plus family), round button (RC Pro)
+//   5  SF  C1 (Plus family), photo (Pro family)
+//   6  SG  C2 (Plus family), C1 (Pro family)
+//   7  SH  C3 (Plus family), C2 (Pro family)
 //   8  SI  R1/R2/R3 pick its position (Android key codes F4..F6, see kPositionKeys)
 //   9  SJ  L1/L2/L3 pick its position (Android key codes F1..F3, see kPositionKeys)
 //
@@ -1377,7 +1389,7 @@ void requestScrollWheel(int32_t steps) {
 // and Java has to know those positions before the SDK registration - earlier than this file
 // is opened.
 //
-// The RC Pro drives SF, SG, SH and SE from DjiMsdkBridge.java instead of these keys, and
+// The Pro family drives SF, SG, SH and SI from DjiMsdkBridge.java instead of these keys, and
 // that side restores its toggle state with the rest, so its first press after a restart is
 // the right one.
 //
