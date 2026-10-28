@@ -90,7 +90,7 @@ final class RcModel {
             new RcModel(new String[] {"rm510"}, "RC Pro",
                     SD,   SC,   SF,   SG, SH, SI, SE,        false, true,  true,   true),
             new RcModel(new String[] {"rm700"}, "RC Plus",
-                    SC,   SD,   SE,   SF, SG, SH, NO_SWITCH, true,  true,  true,   false),
+                    SC,   SD,   SE,   SF, SG, SH, NO_SWITCH, true,  false, false,  false),
             new RcModel(new String[] {"rc520"}, "RC Pro 2",
                     SD,   SC,   SF,   SG, SH, SI, NO_SWITCH, true,  true,  true,   false),
     };
