@@ -18,6 +18,7 @@ import android.os.PowerManager;
 import android.util.Log;
 
 import java.io.File;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Keeps the EdgeTX link alive after the UI goes away.
@@ -51,6 +52,8 @@ import java.io.File;
  *       and a service has no window. Stick data that comes that way stops at the
  *       last value the firmware saw.
  *   <li>Touch, and the UI itself, obviously stop until the activity is back.
+ *   <li>The ongoing notification is the way back in: tapping it reopens the UI, and
+ *       its "Stop EdgeTX" action is the one way to end the link on purpose.
  * </ul>
  *
  * <p>Reopening the app does not restart anything: the activity attaches to the
@@ -96,9 +99,6 @@ public final class RcLinkService extends Service {
     /** Stops the firmware and gives up the process's reason to stay alive. */
     private static native void nativeStopLink();
 
-    /** True while the firmware is up. */
-    private static native boolean nativeLinkRunning();
-
     /**
      * Holds the firmware back (or releases it). The activity's own native loop starts the
      * firmware whenever it finds it stopped - that is the fallback that keeps a UI without a
@@ -120,16 +120,20 @@ public final class RcLinkService extends Service {
     private final Handler mHandler = new Handler(Looper.getMainLooper());
     private int mDjiStopRequests;
     private boolean mExitProcessOnDestroy;
+    /** Set once the service is being stopped on purpose: the DJI Fly killer has nothing left to do. */
+    private volatile boolean mStopRequested;
+    /** Set when the service stops but the firmware has to keep running (see promoteToForeground). */
+    private boolean mKeepFirmwareOnStop;
+    /** True while a start is in flight, so a redelivered start command does not spawn a second one. */
+    private final AtomicBoolean mStartRequested = new AtomicBoolean();
     private final Runnable mDjiFlyGuard = new Runnable() {
         @Override
         public void run() {
-            if (EdgeTxApplication.isManuallyClosed(RcLinkService.this)) {
+            if (mStopRequested) {
                 return;
             }
             stopDjiFlyInBackground();
-            if (!EdgeTxApplication.isManuallyClosed(RcLinkService.this)) {
-                mHandler.postDelayed(this, DJI_FLY_CHECK_MS);
-            }
+            mHandler.postDelayed(this, DJI_FLY_CHECK_MS);
         }
     };
 
@@ -163,15 +167,6 @@ public final class RcLinkService extends Service {
         }
     }
 
-    static void stopForManualHandoff(Context context) {
-        final Intent intent = new Intent(context, RcLinkService.class).setAction(ACTION_STOP_LINK);
-        try {
-            context.startService(intent);
-        } catch (Throwable t) {
-            Log.w(TAG, "link: could not stop for manual handoff", t);
-        }
-    }
-
     @Override
     public IBinder onBind(Intent intent) {
         return null;
@@ -194,17 +189,19 @@ public final class RcLinkService extends Service {
             Log.i(TAG, "link: explicit stop requested; DJI Fly monitor stopped");
             EdgeTxApplication.setManuallyClosed(this, true);
             mExitProcessOnDestroy = true;
+            mStopRequested = true;
             mHandler.removeCallbacks(mDjiFlyGuard);
-            stopForeground(true);
+            stopForegroundNow();
             stopSelf(startId);
             return START_NOT_STICKY;
         }
 
         if (EdgeTxApplication.isManuallyClosed(this)) {
             Log.i(TAG, "link: ignoring automatic service restart after manual close");
-            mHandler.removeCallbacks(mDjiFlyGuard);
             mExitProcessOnDestroy = true;
-            stopForeground(true);
+            mStopRequested = true;
+            mHandler.removeCallbacks(mDjiFlyGuard);
+            stopForegroundNow();
             stopSelf(startId);
             return START_NOT_STICKY;
         }
@@ -212,9 +209,14 @@ public final class RcLinkService extends Service {
         // Booting the firmware seeds the simulated SD card first, which takes
         // seconds on the very first run: keep that off the main thread, where the
         // notification and the activity's lifecycle are handled.
-        final Thread starter = new Thread(this::startLink, "rc-link-start");
-        starter.setDaemon(true);
-        starter.start();
+        //
+        // One start is enough: link_start() is idempotent, so a second thread would
+        // only queue up on the lock the first one holds while it seeds the card.
+        if (mStartRequested.compareAndSet(false, true)) {
+            final Thread starter = new Thread(this::startLink, "rc-link-start");
+            starter.setDaemon(true);
+            starter.start();
+        }
 
         // Let Android restart the service (and with it the link) after a crash or
         // a low-memory kill.
@@ -231,37 +233,62 @@ public final class RcLinkService extends Service {
     @Override
     public void onDestroy() {
         Log.i(TAG, "link: service destroyed");
+        mStopRequested = true;
         mHandler.removeCallbacks(mDjiFlyGuard);
-        try {
-            nativeStopLink();
-        } catch (Throwable t) {
-            Log.w(TAG, "link: could not stop the firmware", t);
-        }
         releaseWakeLock();
-        super.onDestroy();
-        if (mExitProcessOnDestroy) {
-            mHandler.postDelayed(() -> {
+
+        final boolean stopFirmware = !mKeepFirmwareOnStop;
+        final boolean exitProcess = mExitProcessOnDestroy;
+        // link_stop() takes the same lock link_start() holds while it waits for the RC's
+        // controls and seeds the card, and then joins the link thread: seconds of work,
+        // none of it on the main thread.
+        final Thread stopper = new Thread(() -> {
+            if (stopFirmware) {
+                try {
+                    nativeStopLink();
+                } catch (Throwable t) {
+                    Log.w(TAG, "link: could not stop the firmware", t);
+                }
+            }
+            if (exitProcess) {
+                try {
+                    // The notification goes away as part of this teardown; give the
+                    // system that moment before the process disappears.
+                    Thread.sleep(250);
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
                 Log.i(TAG, "link: stopping the EdgeTX process to release the DJI SDK");
                 android.os.Process.killProcess(android.os.Process.myPid());
-            }, 250);
-        }
+            }
+        }, "rc-link-stop");
+        stopper.setDaemon(true);
+        stopper.start();
+
+        super.onDestroy();
     }
 
     // ---------------------------------------------------------------- helpers --
 
     private void startLink() {
+        boolean ok = false;
         try {
             // The card goes to the external files directory when the device has
             // one: /sdcard/Android/data/<pkg>/files/sdcard. No permission is
             // needed for it, and it can be edited over adb:
             //   adb push main.lua /sdcard/Android/data/com.edgetx.droidui/files/sdcard/SCRIPTS/
             final File external = getExternalFilesDir(null);
-            final boolean ok = nativeStartLink(getFilesDir().getAbsolutePath(),
+            ok = nativeStartLink(getFilesDir().getAbsolutePath(),
                     external != null ? external.getAbsolutePath() : null, getAssets());
             Log.i(TAG, "link: service start, firmware "
                     + (ok ? "running" : "FAILED to start"));
         } catch (Throwable t) {
             Log.w(TAG, "link: native start failed", t);
+        }
+        if (!ok) {
+            // Nothing came up: let the next start command (a sticky redelivery, or the
+            // activity's fallback) try again instead of being swallowed as a duplicate.
+            mStartRequested.set(false);
         }
     }
 
@@ -294,9 +321,20 @@ public final class RcLinkService extends Service {
 
         try {
             startForeground(NOTIFICATION_ID, notification);
+            return;
         } catch (Throwable t) {
             Log.w(TAG, "link: startForeground failed", t);
         }
+
+        // Started by startForegroundService() and never made foreground is the one state
+        // the platform does not tolerate: the timeout that follows throws in this process
+        // and the catches above cannot prevent it. Stopping the service removes the record
+        // that timeout waits on. The firmware is left running on purpose - stopping it
+        // would leave the activity with a simulator that cannot be started a second time
+        // in the same process - so the activity's own native loop owns it from here, which
+        // is exactly how the app worked before this service existed.
+        mKeepFirmwareOnStop = true;
+        stopSelf();
     }
 
     private Notification buildNotification() {
@@ -307,17 +345,32 @@ public final class RcLinkService extends Service {
 
         builder.setSmallIcon(R.drawable.ic_rc_link)
                 .setContentTitle("EdgeTX link running")
-            .setContentText("Sticks and switches keep going to the RF module")
+                .setContentText("Sticks and switches keep going to the RF module")
                 .setOngoing(true)
                 .setShowWhen(false);
+
+        // Tapping the notification is the way back into the UI while the link keeps
+        // running: the activity attaches to the firmware that is already up.
+        final Intent open = new Intent(this, EdgeTxActivity.class)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        builder.setContentIntent(PendingIntent.getActivity(this, 0, open,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE));
+
         final Intent stop = new Intent(this, RcLinkService.class).setAction(ACTION_STOP_LINK);
-        int stopFlags = PendingIntent.FLAG_UPDATE_CURRENT;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            stopFlags |= PendingIntent.FLAG_IMMUTABLE;
-        }
-        final PendingIntent stopIntent = PendingIntent.getService(this, 1, stop, stopFlags);
+        final PendingIntent stopIntent = PendingIntent.getService(this, 1, stop,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         builder.addAction(R.drawable.ic_rc_link, "Stop EdgeTX", stopIntent);
         return builder.build();
+    }
+
+    /** Drops the ongoing notification; the flag is only spelled differently before API 33. */
+    @SuppressWarnings("deprecation")
+    private void stopForegroundNow() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            stopForeground(STOP_FOREGROUND_REMOVE);
+        } else {
+            stopForeground(true);
+        }
     }
 
     private void stopDjiFlyInBackground() {

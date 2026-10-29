@@ -1353,11 +1353,6 @@ Java_com_edgetx_droidui_RcLinkService_nativeStopLink(JNIEnv*, jclass) {
     link_stop();
 }
 
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_edgetx_droidui_RcLinkService_nativeLinkRunning(JNIEnv*, jclass) {
-    return link_running() ? JNI_TRUE : JNI_FALSE;
-}
-
 // Called from RcLinkService.java: holds the firmware back until the simulated SD card has
 // a directory the user can reach (see g_linkHeld).
 extern "C" JNIEXPORT void JNICALL
