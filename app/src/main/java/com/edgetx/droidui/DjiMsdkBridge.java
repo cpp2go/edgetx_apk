@@ -67,13 +67,24 @@ public final class DjiMsdkBridge {
      * never arrive from an RC Pro at all. With the trigger file {@link #PROBE_TRIGGER} next
      * to the app's external files every button key the SDK has is listened to and logged, so
      * a new remote can be identified by pressing one control at a time and reading which key
-     * answered. Nothing else changes while it is off, and no probe listener is installed.
+     * answered. On top of that every key {@link DJIRemoteControllerKey} defines - including
+     * the ones nothing here uses yet - is asked whether this remote has it, and the answer is
+     * logged as one matrix (see {@link #probeEveryRemoteControllerKey}). Nothing else changes
+     * while it is off, and no probe listener is installed.
      */
     private static final String PROBE_TRIGGER = "hid_probe";
     private static volatile boolean sProbe;
 
     /** A separate owner, so a probed key can also be one the normal code listens to. */
     private static final Object PROBE_OWNER = new Object();
+
+    /**
+     * The keys {@link #probe} already listens to. Only the sweep needs it: it walks the whole
+     * key class, which includes the ones probed by name, and subscribing twice would log every
+     * change of those twice.
+     */
+    private static final java.util.Set<DJIKeyInfo<?>> sProbedKeys =
+            java.util.Collections.synchronizedSet(new java.util.HashSet<DJIKeyInfo<?>>());
 
     static {
         // libedgetx_ui.so is normally loaded by NativeActivity, which registers it
@@ -447,8 +458,9 @@ public final class DjiMsdkBridge {
     }
 
     /**
-     * Every button key the SDK has, logged as it changes. Only ever installed while the
-     * trigger file exists - see {@link #PROBE_TRIGGER}. The names are the key names with the
+     * Every button key the SDK has, logged as it changes, plus the sweep that asks this remote
+     * about the whole key class. Only ever installed while the trigger file exists - see
+     * {@link #PROBE_TRIGGER}. The names are the key names with the
      * {@code Key...Down} noise removed, because a name like {@code goHome} that never fires
      * while the physical button works is exactly the answer this probe is after.
      */
@@ -490,6 +502,14 @@ public final class DjiMsdkBridge {
         reportSupport("fcSwitchMode", DJIFlightControllerKey.KeyFCRemoteControllerSwitchMode);
         reportSupport("fcFlightMode", DJIFlightControllerKey.KeyFCFlightMode);
         reportSupport("rcShake", DJIRemoteControllerKey.KeyRcShakeMotor);
+
+        // Everything the class defines, not only the keys listed above: this is the sweep
+        // that answers "which keys does this remote have at all", including the ones nothing
+        // in the app uses yet. On its own thread - see probeEveryRemoteControllerKey().
+        final Thread sweep = new Thread(DjiMsdkBridge::probeEveryRemoteControllerKey,
+                "dji-key-sweep");
+        sweep.setDaemon(true);
+        sweep.start();
     }
 
     /**
@@ -511,6 +531,7 @@ public final class DjiMsdkBridge {
 
     /** One probed key: every callback, initial snapshot included. */
     private static <T> void probe(String name, DJIKeyInfo<T> info) {
+        sProbedKeys.add(info);
         try {
             KeyManager.getInstance().listen(KeyTools.createKey(info), PROBE_OWNER,
                     new CommonCallbacks.KeyListener<T>() {
@@ -523,6 +544,138 @@ public final class DjiMsdkBridge {
         } catch (Throwable t) {
             Log.w(TAG, "dji: probe " + name + " could not listen", t);
         }
+    }
+
+    /**
+     * Every key {@link DJIRemoteControllerKey} defines, asked once: whether this remote has it,
+     * and what the key itself says it is for.
+     *
+     * <p>The point is the eighty-odd keys nothing here uses yet. "Does this remote have
+     * {@code KeyRcUpgradeVoiceEnable}?" cannot be answered by pressing anything, and it is
+     * exactly what decides whether a key is worth wiring up. The other half comes from
+     * {@link DJIKeyInfo} itself: {@code isCanListen()} false means the key is a set or an
+     * action, so it is reported and never subscribed - nothing in this sweep writes to the
+     * remote or performs anything on it.
+     *
+     * <p>Reflected rather than listed: the class has 117 fields today, and a hand-written copy
+     * here would be the one place that silently goes stale when the SDK adds one. It runs on
+     * its own thread because every {@link KeyManager#isKeySupported} is a call into the SDK,
+     * and a hundred of those do not belong on the thread the activity's lifecycle is on.
+     */
+    private static void probeEveryRemoteControllerKey() {
+        final StringBuilder supported = new StringBuilder();
+        final StringBuilder missing = new StringBuilder();
+        final StringBuilder writeOnly = new StringBuilder();
+        final StringBuilder unwatched = new StringBuilder();
+        final StringBuilder watched = new StringBuilder();
+        int total = 0;
+        int found = 0;
+        int listening = 0;
+        for (java.lang.reflect.Field field : DJIRemoteControllerKey.class.getFields()) {
+            if (!java.lang.reflect.Modifier.isStatic(field.getModifiers())) continue;
+            if (!DJIKeyInfo.class.isAssignableFrom(field.getType())) continue;
+
+            final DJIKeyInfo<?> info;
+            try {
+                final Object value = field.get(null);
+                if (!(value instanceof DJIKeyInfo)) continue;
+                info = (DJIKeyInfo<?>) value;
+            } catch (Throwable t) {
+                continue;
+            }
+
+            total++;
+            if (!supportedKey(info)) {
+                appendName(missing, field.getName());
+                continue;
+            }
+            found++;
+            appendName(supported, field.getName());
+
+            if (!info.isCanListen()) {
+                appendName(writeOnly, field.getName());
+                continue;
+            }
+            // Reading the RC's password out of the remote and into logcat is not a diagnostic.
+            if (PASSWORD_KEY.equals(field.getName())) continue;
+            if (alreadyListened(info) || sProbedKeys.contains(info)
+                    || !worthWatching(field.getName())) {
+                appendName(unwatched, field.getName());
+                continue;
+            }
+            probeKey(field.getName(), info);
+            appendName(watched, field.getName());
+            listening++;
+        }
+
+        Log.i(TAG, "dji: key sweep " + found + "/" + total
+                + " keys of DJIRemoteControllerKey are supported here");
+        Log.i(TAG, "dji: key sweep supported: " + supported);
+        Log.i(TAG, "dji: key sweep not supported: " + missing);
+        if (writeOnly.length() > 0) {
+            Log.i(TAG, "dji: key sweep supported but set/action only, left alone: " + writeOnly);
+        }
+        if (unwatched.length() > 0) {
+            Log.i(TAG, "dji: key sweep supported, not watched (levels, or probed above): "
+                    + unwatched);
+        }
+        Log.i(TAG, "dji: key sweep now listening to " + listening + " more key(s): " + watched);
+    }
+
+    /** The one key whose value is a credential rather than a diagnostic. */
+    private static final String PASSWORD_KEY = "KeyRcPassword";
+
+    /**
+     * Keys the app already listens to at the rate they report - the four stick axes and the two
+     * dials. A second listener on those would double every line of a stream that is already
+     * counted, and their values are not what a probe is for.
+     */
+    private static final DJIKeyInfo<?>[] ALREADY_LISTENED = {
+            DJIRemoteControllerKey.KeyStickLeftHorizontal,
+            DJIRemoteControllerKey.KeyStickLeftVertical,
+            DJIRemoteControllerKey.KeyStickRightHorizontal,
+            DJIRemoteControllerKey.KeyStickRightVertical,
+            DJIRemoteControllerKey.KeyLeftDial,
+            DJIRemoteControllerKey.KeyRightDial,
+    };
+
+    private static boolean alreadyListened(DJIKeyInfo<?> info) {
+        for (DJIKeyInfo<?> listened : ALREADY_LISTENED) {
+            if (listened == info) return true;
+        }
+        return false;
+    }
+
+    /** Whether this remote publishes a key at all; false when the question itself fails. */
+    private static boolean supportedKey(DJIKeyInfo<?> info) {
+        try {
+            return KeyManager.getInstance().isKeySupported(createKeyOf(info));
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * Keys worth watching for changes during a probe: the ones whose name says they are a
+     * control. The rest of the class is levels and one-off messages - serial numbers,
+     * calibration results, multi-RC bookkeeping - and a listener on those would fill logcat
+     * without answering what the probe asks (which key does pressing this button fire).
+     */
+    private static boolean worthWatching(String name) {
+        return name.endsWith("Down") || name.contains("Button") || name.contains("Switch")
+                || name.contains("Wheel") || name.contains("Dial") || name.contains("Stick")
+                || name.contains("FiveDimension");
+    }
+
+    private static void appendName(StringBuilder sb, String name) {
+        if (sb.length() > 0) sb.append(", ");
+        sb.append(name);
+    }
+
+    /** The sweep reaches the key through reflection, so its type is only known at run time. */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static void probeKey(String name, DJIKeyInfo info) {
+        probe(name, info);
     }
 
     /**
