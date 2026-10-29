@@ -214,8 +214,8 @@ public class EdgeTxApplication extends Application {
 
     /** True in the process that exists only to carry the USB device filter. */
     private boolean inUsbAttachProcess() {
-        // API 28 has the process name; the RC is Android 11, and an older device that
-        // still installs this app simply starts normally.
+        // API 28 has the process name; the remotes run Android 10 or later, and an older
+        // device that still installs this app simply starts normally.
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return false;
 
         // getProcessName() returns the *full* name - "com.edgetx.droidui:usbattach" -

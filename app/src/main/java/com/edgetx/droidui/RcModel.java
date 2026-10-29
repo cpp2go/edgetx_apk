@@ -18,11 +18,11 @@ import android.util.Log;
  * outside this class decides anything per remote. An unrecognised remote still gets the RC
  * Plus 2's row - the layout the app started with - and says so in the log.
  *
- * <p>A row is a measurement, not a preference. The two rows marked "measured" were settled by
- * pressing the buttons on the remote and reading the log; the other two are the family layout
- * their remote belongs to (the Plus 2's for the RC Plus, the RC Pro's for the RC Pro 2), which
- * is what the physical button sets suggest and what the first run has to confirm. Changing one
- * value here is how a measurement is applied - nothing else has to move.
+ * <p>A row is a measurement, not a preference. The rows for the RC Pro and the RC Plus 2 were
+ * settled by pressing the buttons on the remote and reading the log; the RC Plus carries the
+ * RC Plus 2's row, and the RC Pro 2 row is its family's layout and the first thing to check on
+ * the hardware. Changing one value here is how a measurement is applied - nothing else has to
+ * move.
  */
 final class RcModel {
 
@@ -65,15 +65,14 @@ final class RcModel {
      *       SWITCH_ONE at the top rather than SWITCH_TWO.</li>
      * </ul>
      *
-     * Inherited rows (the family layout, to be confirmed on the hardware):
+     * The other rows:
      *
      * <ul>
-     *   <li><b>RC Plus (rm700, rm700_enterprise)</b>: the Plus family - the same button set as
-     *       the RC Plus 2 (C1..C3, shutter, record, pause, L1..R3) on the same Android 11 base,
-     *       so its slot table is the RC Plus 2's. Its go-home button is the real return-to-home
-     *       key, not the H key that arms a trim mode on the RC Plus 2, so it drives SA like the
-     *       RC Pro's landing button. Its log is read as a second reader for the buttons the SDK
-     *       drops, as on the RC Pro.</li>
+     *   <li><b>RC Plus (rm700, rm700_enterprise)</b>: the RC Plus 2's button map, unchanged - the
+     *       same buttons on the same switches, read by the same readers. Nothing else about the
+     *       remote is shared: it runs Android 10 like the RC Pro, so its SD card is the
+     *       {@code WRITE_EXTERNAL_STORAGE} grant rather than "All files access", and that is
+     *       decided from the API level, not from this class.</li>
      *   <li><b>RC Pro 2 (rc520)</b>: the Pro family - video/pause and photo swapped like the RC
      *       Pro, C1/C2/C3 on SG/SH/SI and no round button beside the screen. DJI's own list of
      *       what can be customised on it names C1, C2, the 5-way and the right wheel, so its C3

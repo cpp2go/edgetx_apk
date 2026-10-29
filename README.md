@@ -127,13 +127,14 @@ row the SDK buttons use, and how its data behaves) and in
 |--------|----------------|-----------------------|--------------|-------|---------|-----------------|
 | RC Plus 2 | `rc701` | SC / SD / SE | SF / SG / SH | — | 5-way trim modifier (H) | `SWITCH_TWO` |
 | RC Pro | `rm510`, `rm510b`, `rm510bv` | SD / SC / SF | SG / SH / SI | SE | switch SA | `SWITCH_ONE` |
-| RC Plus | `rm700`, `rm700_enterprise` | SC / SD / SE | SF / SG / SH | — | switch SA | `SWITCH_TWO` |
+| RC Plus | `rm700`, `rm700_enterprise` | SC / SD / SE | SF / SG / SH | — | 5-way trim modifier (H) | `SWITCH_TWO` |
 | RC Pro 2 | `rc520` | SD / SC / SF | SG / SH / SI | — | switch SA | `SWITCH_TWO` |
 
-Anything else keeps the RC Plus 2's row and says so in the log. The two rows
-for the RC Pro and the RC Plus 2 were settled by pressing every button on the
-remote; the RC Plus and RC Pro 2 rows are their family's layout and are the
-first thing to check on the hardware.
+Anything else keeps the RC Plus 2's row and says so in the log. The rows for
+the RC Pro and the RC Plus 2 were settled by pressing every button on the
+remote; the RC Plus uses the RC Plus 2's button map unchanged, and the RC Pro 2
+row is its family's layout. Only the buttons are shared, though - the RC Plus
+runs Android 10, so the grant its SD card needs is its own (see below).
 
 The six side buttons L1/L2/L3/R1/R2/R3 are not in the DJI SDK at all — the
 only supported way to read them is Android key events
@@ -320,8 +321,8 @@ to another one afterwards):
 
 | Remote | Android | Grant |
 |---|---|---|
-| RC Pro | 10 | `WRITE_EXTERNAL_STORAGE`, a runtime dialog the app raises at start-up |
-| RC Plus / RC Plus 2 | 11 | "All files access" (`MANAGE_EXTERNAL_STORAGE`), a system settings page the app opens at start-up |
+| RC Pro / RC Plus | 10 | `WRITE_EXTERNAL_STORAGE`, a runtime dialog the app raises at start-up |
+| RC Plus 2 | 11 | "All files access" (`MANAGE_EXTERNAL_STORAGE`), a system settings page the app opens at start-up |
 
 The app asks once per launch until the grant exists, and boots with the card in
 its own directory if it is never given. Grant it from the shell instead:

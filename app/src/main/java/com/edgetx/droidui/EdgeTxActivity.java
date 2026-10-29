@@ -25,11 +25,12 @@ import android.widget.Toast;
  * and everything after that (lib_name meta-data, the callbacks) is inherited.
  *
  * <p>The simulated card in {@code /storage/emulated/0/EdgeTX} is why most of this exists, and
- * every supported remote needs a different grant to write there. The RC Pro (Android 10) has
- * {@code WRITE_EXTERNAL_STORAGE}, a runtime dialog that only an activity can raise. The RC Plus and
- * RC Plus 2 (Android 11) have "All files access" ({@code MANAGE_EXTERNAL_STORAGE}), which has no
- * dialog at all - the only way to it is a system settings page, put up from here rather than from
- * the Application because a background activity start would be refused without showing anything.
+ * every supported remote needs a different grant to write there. The RC Pro and the RC Plus
+ * (Android 10) have {@code WRITE_EXTERNAL_STORAGE}, a runtime dialog that only an activity can
+ * raise. The RC Plus 2 (Android 11) has "All files access" ({@code MANAGE_EXTERNAL_STORAGE}),
+ * which has no dialog at all - the only way to it is a system settings page, put up from here
+ * rather than from the Application because a background activity start would be refused without
+ * showing anything.
  * Without the grant the firmware keeps the card in the app's own directory, where no file manager
  * can reach it ("after a fresh install there is no EdgeTX folder"), so both are asked for again on
  * later launches until they are given.
@@ -85,11 +86,11 @@ public class EdgeTxActivity extends NativeActivity {
      * supported ones need this:
      *
      * <ul>
-     *   <li>RC Pro (Android 10) - {@code WRITE_EXTERNAL_STORAGE}, a normal runtime dialog, asked
-     *       for in {@code onCreate}; when it is denied for good only the app's own permission
-     *       page can turn it back on.
-     *   <li>RC Plus and RC Plus 2 (Android 11) - {@code MANAGE_EXTERNAL_STORAGE} ("All files
-     *       access"), which has no dialog at all: only a system settings page grants it.
+     *   <li>RC Pro and RC Plus (Android 10) - {@code WRITE_EXTERNAL_STORAGE}, a normal runtime
+     *       dialog, asked for in {@code onCreate}; when it is denied for good only the app's own
+     *       permission page can turn it back on.
+     *   <li>RC Plus 2 (Android 11) - {@code MANAGE_EXTERNAL_STORAGE} ("All files access"), which
+     *       has no dialog at all: only a system settings page grants it.
      * </ul>
      *
      * <p>Without the grant the firmware keeps the card in the app's own directory, where no file

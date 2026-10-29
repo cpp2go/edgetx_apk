@@ -10,14 +10,18 @@ import java.lang.reflect.Method;
  * Drives the RC's RGB indicator - the red/green light on the takeoff button.
  *
  * <p>There is no DJI Mobile SDK key for it (every LED key in MSDK 5.18 is on the
- * aircraft, camera or gimbal), and the framework route is closed as well: the RC runs
- * Android 11, where {@code android.hardware.lights.LightsManager} is still a system
- * API, and asking the running lights service for the light list is refused with
- * <i>getLights requires CONTROL_DEVICE_LIGHTS_PERMISSION</i> - a signature|privileged
+ * aircraft, camera or gimbal), and the framework route is closed as well: on Android 11
+ * {@code android.hardware.lights.LightsManager} is still a system API, and on Android 10 it is
+ * not present at all - and asking the running lights service for the light list is refused with
+ * <i>getLights requires CONTROL_DEVICE_LIGHTS_PERMISSION</i>, a signature|privileged
  * permission this app cannot hold.
  *
  * <p>The permission check lives in the framework service rather than in the HAL, so the
- * light HAL is addressed directly. Its AIDL stub class cannot be loaded by name (it is
+ * light HAL is addressed directly. That HAL is Android 11's AIDL interface, so on Android 10
+ * the lookup is expected to fail and the light is simply left alone - which is why every step
+ * here is best-effort.
+ *
+ * <p>Its AIDL stub class cannot be loaded by name (it is
  * a hidden system API), hence the parcel is built by hand. Measured layout, confirmed
  * against the vendor HAL's own log line and by reading the kernel LED nodes back:
  *

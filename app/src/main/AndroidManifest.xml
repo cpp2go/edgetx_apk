@@ -65,8 +65,9 @@
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
     <!-- Android 10 has no "All files access" at all (MANAGE_EXTERNAL_STORAGE starts at
-         API 30), and the RC Pro is Android 10: there the same card is written with the
-         legacy permission instead, which is why it is declared for API 29 and below only.
+         API 30), and the RC Pro and the RC Plus are Android 10: there the same card is written
+         with the legacy permission instead, which is why it is declared for API 29 and below
+         only.
          requestLegacyExternalStorage on the application is the other half: an app
          targeting 30+ is otherwise put into scoped storage on Android 10 as well, and
          "/storage/emulated/0/EdgeTX" would not be writable even with this permission. -->
