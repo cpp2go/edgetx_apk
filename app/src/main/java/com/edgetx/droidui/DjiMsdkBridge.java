@@ -323,9 +323,22 @@ public final class DjiMsdkBridge {
                                     + " c2=" + newValue.getIsC2Click()
                                     + " c3=" + newValue.getIsC3Click()
                                     + " c4=" + newValue.getIsC4Click());
-                            // Diagnostic only. The 5-way switch is driven by
-                            // KeyFiveDimensionPressedStatus below; acting on this
-                            // event as well would fire every press twice.
+                            // The C1..C4 flags are a press-only reader for those four buttons -
+                            // see customButtonPress, which is what uses them on a remote whose
+                            // Boolean key for the button never answers. The 5-way is not taken
+                            // from here: KeyFiveDimensionPressedStatus and KeyRcHardwareState
+                            // below drive it, and acting on this event as well would fire every
+                            // press twice.
+                            customButtonPress(SLOT_C1, "C1",
+                                    keyDelivering("C1", "C1", true), newValue.getIsC1Click());
+                            customButtonPress(SLOT_C2, "C2",
+                                    keyDelivering("C2", "C2", true), newValue.getIsC2Click());
+                            customButtonPress(SLOT_C3, "C3",
+                                    keyDelivering("C3", "C3", REMOTE.c3OnSdk),
+                                    newValue.getIsC3Click());
+                            customButtonPress(SLOT_ROUND, "round button",
+                                    keyDelivering("C4", "round button", SLOT_ROUND >= 0),
+                                    newValue.getIsC4Click());
                         }
                     });
             listenFiveDimension();
@@ -387,6 +400,9 @@ public final class DjiMsdkBridge {
         support("flightMode", DJIRemoteControllerKey.KeyFlightModeSwitchState);
         support("softSwitchMode", DJIRemoteControllerKey.KeySoftSwitchMode);
         support("transform", DJIRemoteControllerKey.KeyRCTransformationSwitchState);
+        // Not buttons of their own: the two keys the C1..C4 fallback readers come from.
+        support("buttonEventPro", DJIRemoteControllerKey.KeyRcButtonEventPro);
+        support("hardwareState", DJIRemoteControllerKey.KeyRcHardwareState);
     }
 
     /** One of those keys, whether this remote has it; false when the question itself fails. */
@@ -730,6 +746,18 @@ public final class DjiMsdkBridge {
                                 sLastHardwareState = state;
                             }
                             Log.i(TAG, "dji: rc hardware " + state);
+                            // ... and the same four flags as a level, which is the only place
+                            // some remotes show a custom button at all: see customButtonLevel.
+                            customButtonLevel(SLOT_C1, "C1",
+                                    keyDelivering("C1", "C1", true), newValue.getIsC1Click());
+                            customButtonLevel(SLOT_C2, "C2",
+                                    keyDelivering("C2", "C2", true), newValue.getIsC2Click());
+                            customButtonLevel(SLOT_C3, "C3",
+                                    keyDelivering("C3", "C3", REMOTE.c3OnSdk),
+                                    newValue.getIsC3Click());
+                            customButtonLevel(SLOT_ROUND, "round button",
+                                    keyDelivering("C4", "round button", SLOT_ROUND >= 0),
+                                    newValue.getIsC4Click());
                             dispatchFiveDimension(newValue.getFiveDimensionPressStatus());
                         }
                     });
@@ -842,10 +870,14 @@ public final class DjiMsdkBridge {
                     KeyTools.createKey(DJIRemoteControllerKey.KeyShutterButtonDown);
             KeyManager.getInstance().listen(key, OWNER,
                     new CommonCallbacks.KeyListener<Boolean>() {
+                        /** True until the SDK's first callback for this key, which is a snapshot. */
+                        private boolean first = true;
+
                         @Override
                         public void onValueChange(Boolean oldValue, Boolean newValue) {
                             Log.i(TAG, "dji: shutter " + oldValue + " -> " + newValue);
-                            if (oldValue == null) {
+                            if (first) {
+                                first = false;
                                 return;   // the SDK's initial snapshot, not a release
                             }
                             shutterEdge(Boolean.TRUE.equals(newValue), RcButtons.SOURCE_SDK);
@@ -1219,6 +1251,80 @@ public final class DjiMsdkBridge {
                 + " one");
     }
 
+    // ------------------------------------------------- C1..C4, the second readers --
+    //
+    // KeyCustomButton1..3Down (and KeyRCCustomButton4Down for the round button) are the exact
+    // readers: one callback per edge, at the moment of the press. They are not always there,
+    // though - the SDK drops its keys to null in waves, and on some remotes the key for a
+    // button never answers at all - and for C1..C3, pause and takeoff there is then no other
+    // reader but the remote's log, which needs READ_LOGS. The SDK has two more places the same
+    // four buttons show up, and MSDK names both for exactly this:
+    //
+    //     KeyRcButtonEventPro  RcCustomButtonEvent.isC1Click .. isC4Click   one event per press
+    //     KeyRcHardwareState   RcCustomButtonHardwareStatus.isC1Click ..     a level, pushed
+    //                                                                      every few hundred ms
+    //
+    // Both are used only while the Boolean key is not delivering (see keyDelivering): when
+    // it is, it is both faster and exact, and a copy from these would be that same press counted
+    // twice - which is the one thing RcButtons exists to prevent.
+
+    /** Last level seen for each switch in KeyRcHardwareState, so only a change is an edge. */
+    private static final boolean[] sHardwareHeld = new boolean[SWITCH_COUNT];
+
+    /**
+     * Whether this remote's own Boolean key for a button is delivering right now: it exists
+     * here, this app listens to it, and it is not in one of the SDK's silent waves.
+     *
+     * @param sdkKey  the key's name in the support matrix (see probeKeySupport)
+     * @param watched the name the listener reports its silences under; the round button's
+     *                listener calls itself "round button", its key is "C4"
+     * @param listened false for a key this app deliberately does not subscribe to - the RC Pro's
+     *                C3, which fires whenever the return button is pressed (RcModel.c3OnSdk)
+     */
+    private static boolean keyDelivering(String sdkKey, String watched, boolean listened) {
+        return listened && has(sdkKey) && !SILENT_SINCE.containsKey(watched);
+    }
+
+    /**
+     * One press of C1..C4 from {@code KeyRcButtonEventPro} - an event, with no release behind
+     * it, so it is merged the way the remote's own log is (see RcButtons.tap).
+     */
+    private static void customButtonPress(int index, String label, boolean primaryDelivering,
+                                          Integer clicked) {
+        if (index < 0 || clicked == null || clicked == 0 || primaryDelivering) {
+            return;
+        }
+        if (RcButtons.tap(index, RcButtons.SOURCE_EVENT) != RcButtons.PRESS) {
+            logMerged(label, RcButtons.SOURCE_EVENT, index);
+            return;
+        }
+        Log.i(TAG, "dji: " + label + " from the button event - its own SDK key is not "
+                + "delivering on this remote");
+        toggleSwitch(index, label, RcButtons.SOURCE_EVENT);
+    }
+
+    /**
+     * One level change of C1..C4 from {@code KeyRcHardwareState}, the SDK's periodic push. A
+     * level rather than an event, so the press steps the switch and the release is passed on to
+     * close it; RcButtons gives this reader the wider merge window it needs.
+     */
+    private static void customButtonLevel(int index, String label, boolean primaryDelivering,
+                                          Boolean clicked) {
+        if (index < 0) {
+            return;
+        }
+        final boolean down = Boolean.TRUE.equals(clicked);
+        final boolean changed;
+        synchronized (DjiMsdkBridge.class) {
+            changed = sHardwareHeld[index] != down;
+            sHardwareHeld[index] = down;
+        }
+        if (!changed || primaryDelivering) {
+            return;
+        }
+        buttonEdge(index, label, RcButtons.SOURCE_HW, down);
+    }
+
     /**
      * Position of the photo switch (SE) from the last press, which is also where a
      * restart picks it up again (see {@link #restoreLatchedSwitches}).
@@ -1326,18 +1432,26 @@ public final class DjiMsdkBridge {
             final DJIKey<Boolean> key = KeyTools.createKey(info);
             final CommonCallbacks.KeyListener<Boolean> listener =
                     new CommonCallbacks.KeyListener<Boolean>() {
+                        /** True until the SDK's first callback for this key, which is a snapshot. */
+                        private boolean first = true;
+
                         @Override
                         public void onValueChange(Boolean oldValue, Boolean newValue) {
                             noteKeyValue(label, newValue);
-                            if (oldValue == null) {
+                            if (first) {
                                 // A snapshot, not a press: see the note above - this is the
                                 // measurement, not a decision.
+                                first = false;
                                 Log.i(TAG, "dji: " + label + " initial snapshot " + newValue);
                                 return;
                             }
-                            // Which reader gets to count this press is RcButtons' business: this
-                            // reader may be the raw report's copy of the same press, or it may
-                            // be the only one that saw it at all - and that is the point.
+                            // Every callback after the first is an edge, including the one that
+                            // follows a silent wave. The SDK drops a key to null and re-delivers
+                            // it later with a null oldValue, so "oldValue == null means snapshot"
+                            // also meant "the first press after every wave is a snapshot" - and
+                            // the buttons that had no other reader (pause, C1..C3, takeoff) then
+                            // looked dead for as long as the waves lasted. A null newValue is a
+                            // release, which this reader ignores anyway.
                             buttonEdge(index, label, RcButtons.SOURCE_SDK,
                                     Boolean.TRUE.equals(newValue));
                         }

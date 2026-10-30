@@ -180,6 +180,27 @@ Two things the SDK documentation settles, and this app follows:
   so on that remote the SDK reports little or nothing and the button paths that
   matter are Android key events and the remote's own log — both are in place.
 
+MSDK 5.18 carries the same four custom buttons in two more keys, and both are
+watched because a remote's own key for one of them is not always there:
+
+* `KeyRcButtonEventPro` (`RcCustomButtonEvent.isC1Click`..`isC4Click`) is one event
+  per press, merged the way the remote's log is.
+* `KeyRcHardwareState` (`RcCustomButtonHardwareStatus.isC1Click`..) is a level
+  pushed every few hundred milliseconds, merged over a wider window because its
+  copy of a press can land after the exact readers have pressed *and* released.
+
+Both are acted on only while that button's own key is absent, not subscribed to
+(the RC Pro's C3) or in one of the SDK's silent waves, so a press the exact
+reader delivers is never counted twice. That is what gives C1/C2/C3 a reader on a
+remote whose Boolean keys never answer, without the `READ_LOGS` grant the log
+path needs.
+
+The SDK's snapshot is the **first** callback of a listener, not every callback
+whose old value is null: the SDK drops a key to null in a wave and re-delivers it
+with a null old value, and reading that as a snapshot swallowed the first press
+after every wave — which is exactly what the buttons no other reader covers
+(pause, C1..C3, takeoff) looked like while it happened.
+
 Every button the app does not map is logged once (`unmapped button keycode 131
 (F5)`, `the remote logged an unknown button 'PLAYBACK'`), which is how a new
 remote's row is filled in.

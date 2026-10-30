@@ -16,7 +16,11 @@ import android.os.SystemClock;
  *       on and is immune to those waves, but reading it needs {@code READ_LOGS}, a hand grant
  *       that a reinstall takes away;</li>
  *   <li>the joystick's <b>raw USB reports</b> ({@link RcRawJoystick}) are the fastest and the
- *       most reliable of the three, and carry only the four buttons that are in that report.</li>
+ *       most reliable of the three, and carry only the four buttons that are in that report;</li>
+ *   <li>the SDK's <b>button event</b> ({@code KeyRcButtonEventPro}, {@link #SOURCE_EVENT}) and
+ *       its periodic <b>hardware state</b> ({@code KeyRcHardwareState}, {@link #SOURCE_HW})
+ *       name C1..C4 where a remote's Boolean key for them never answers at all - they are only
+ *       used while that key is absent or in a wave, see DjiMsdkBridge.customButtonPress.</li>
  * </ul>
  *
  * <p>Before this class each button was wired to one or two of those readers by hand, with a rule
@@ -36,12 +40,15 @@ import android.os.SystemClock;
  *                                   and so a whole press duration after the SDK's press
  * </pre>
  *
- * <p>Which gives the three rules this class is:
+ * <p>Which gives the rules this class is:
  *
  * <pre>
  *   press from a reader that reports both edges (SDK, raw)
  *       dropped when the same reader's level is still down (its own repeat push), and when
  *       another reader counted a press less than MERGE_MS ago (that same press)
+ *   press from the hardware state (a level pushed every few hundred milliseconds)
+ *       the same, over SLOW_MERGE_MS - its copy of a press can arrive after the exact readers
+ *       have pressed *and* released, so the release has to be covered as well
  *   release from such a reader
  *       closes the press; never moves a switch itself
  *   press from a reader with no release to give (the remote's log)
@@ -62,6 +69,10 @@ final class RcButtons {
     static final int SOURCE_RAW = 1;
     /** The remote's own button log - see RcDpadLog. */
     static final int SOURCE_LOG = 2;
+    /** The SDK's button event, {@code KeyRcButtonEventPro} - one event per press. */
+    static final int SOURCE_EVENT = 3;
+    /** The SDK's periodic hardware state, {@code KeyRcHardwareState} - a level, not an edge. */
+    static final int SOURCE_HW = 4;
 
     /** The edge is news: the caller acts on it. */
     static final int PRESS = 0;
@@ -72,6 +83,16 @@ final class RcButtons {
 
     /** Two edges closer together than this are one physical press, not two. */
     private static final long MERGE_MS = 120;
+
+    /**
+     * The same, for the one reader that cannot say when a press happened: the hardware state is
+     * pushed every few hundred milliseconds, so its copy of a press can land after the readers
+     * that report both edges have pressed <em>and</em> released it. Covering one press interval
+     * is what keeps that copy from stepping the switch a second time - and it costs nothing
+     * where the hardware state is the only reader, because then there is no other copy to merge
+     * with and a press is counted as it arrives.
+     */
+    private static final long SLOW_MERGE_MS = 600;
 
     /**
      * How long a press from the remote's log keeps other readers from counting their own copy of
@@ -100,6 +121,8 @@ final class RcButtons {
         switch (source) {
             case SOURCE_RAW: return "raw";
             case SOURCE_LOG: return "log";
+            case SOURCE_EVENT: return "event";
+            case SOURCE_HW: return "hw";
             default: return "sdk";
         }
     }
@@ -141,7 +164,14 @@ final class RcButtons {
             }
             sHeld[index] |= bit;
 
-            if (sPressAt[index] != 0 && now - sPressAt[index] < MERGE_MS) {
+            // The hardware state is a level pushed every few hundred milliseconds, so its copy
+            // of a press can be later than the exact readers' whole press: see SLOW_MERGE_MS.
+            final long window = source == SOURCE_HW ? SLOW_MERGE_MS : MERGE_MS;
+            if (sPressAt[index] != 0 && now - sPressAt[index] < window) {
+                return MERGED;
+            }
+            if (source == SOURCE_HW && sReleaseAt[index] != 0
+                    && now - sReleaseAt[index] < SLOW_MERGE_MS) {
                 return MERGED;
             }
             sPressAt[index] = now;
