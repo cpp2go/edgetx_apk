@@ -29,9 +29,11 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -226,14 +228,35 @@ final class RcModuleSerial {
     private static UsbManager sUsbManager;
 
     /**
-     * USB devices the user has already been asked about, and when. Not a permanent list: a
-     * dialog that was dismissed, or a grant broadcast that never arrived, used to leave that
-     * module dead for the rest of the session - the slot was never opened again until the app
-     * was restarted. Asking again after a cooldown, and immediately whenever the model switches
-     * to that slot, is what makes "internal off, external on" work without a restart.
+     * What the user answered for a USB device, per vendor:product - not per
+     * /dev/bus/usb/001/004, which changes every time the module re-enumerates, and
+     * re-enumeration is exactly when the same dialog used to come back.
+     *
+     * <p>The dialog is put up once per device. "OK" is remembered for good (see
+     * {@link EdgeTxApplication#rememberUsbDeviceAllowed}), "Cancel" only until the app is
+     * restarted: a device the user allowed is never put in front of them again, while a device
+     * they refused is asked about once on the next launch. Asking a second time inside the same
+     * launch - what the cooldown and the clear-on-slot-switch used to do - is what made the
+     * "Allow EdgeTX to access USB Serial?" dialog come back after it had been answered.
+     *
+     * <p>The one exception is a saved "OK" the system no longer backs (a reboot without the
+     * "always open" tick, or the module re-enumerating): the permission cannot be re-granted by
+     * the app, so the choice is between one more dialog and a slot that stays silent for the
+     * rest of the session. {@link #sReaskedAfterAllow} makes that one more dialog happen at most
+     * once, with a hint that names the tick that makes it permanent.
      */
+    private static final Map<String, Boolean> sPermissionAnswers = new HashMap<>();
+    /** Devices a dialog is up for right now, so one device never gets two of them. */
+    private static final Set<String> sPermissionPending = new HashSet<>();
+    /** Devices whose saved "OK" the system no longer backs, and for which it was re-asked. */
+    private static final Set<String> sReaskedAfterAllow = new HashSet<>();
+    /** When a dialog was last raised per device, so a re-enumeration storm cannot stack them. */
     private static final Map<String, Long> sPermissionAskedAt = new HashMap<>();
-    private static final long PERMISSION_REASK_MS = 30_000;
+    private static final long PERMISSION_REASK_MS = 15_000;
+    /** Guards the three maps above: the monitor asks from its own thread, the answer arrives on main. */
+    private static final Object sPermissionLock = new Object();
+    /** Throttle for "a dialog needs a window and there is none", which the monitor retries. */
+    private static long sNoWindowLoggedAt;
 
     /** One module slot and the USB serial device that carries it. */
     private static final class Link {
@@ -376,12 +399,31 @@ final class RcModuleSerial {
                     intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
             final boolean granted =
                     intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false);
-            logi("module: USB permission "
-                    + (granted ? "granted" : "denied") + " for " + describe(device));
-            // Either answer settles the question for now; a later slot switch asks again.
-            if (device != null && device.getDeviceName() != null) {
-                sPermissionAskedAt.remove(device.getDeviceName());
+            // The user has chosen: this device is never asked about again in this run. Unless it
+            // is gone already - unplugged while the dialog was up, which makes the system answer
+            // "denied" on the user's behalf (UsbPermissionActivity finishes on disconnect), so
+            // that answer is not theirs and is not recorded.
+            boolean answered = true;
+            if (device != null) {
+                final String key = identity(device);
+                answered = isAttached(key);
+                synchronized (sPermissionLock) {
+                    sPermissionPending.remove(key);
+                    if (answered) {
+                        sPermissionAnswers.put(key, granted);
+                    }
+                }
+                if (answered && granted) {
+                    // "OK" is the answer that stops the dialog for good, so it is the one saved.
+                    EdgeTxApplication.rememberUsbDeviceAllowed(appContext(), key);
+                }
             }
+            final String note = !answered
+                    ? " - the device went away while the dialog was up; not taken as an answer"
+                    : granted ? "" : " - not asking again; the slot stays silent until the app"
+                            + " is restarted";
+            logi("module: USB permission " + (granted ? "granted" : "denied") + " for "
+                    + describe(device) + note);
             if (granted) {
                 for (Link link : sLinks) {
                     openWhenAvailable(link);
@@ -396,6 +438,15 @@ final class RcModuleSerial {
             final UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
             final String name = device != null ? device.getDeviceName() : null;
             logi("module: USB device detached: " + describe(device));
+            if (device != null) {
+                // The answer itself is kept: an allowed device is saved (and so is never asked
+                // about again, not even when it is plugged back in), and a refused one stays
+                // refused until the app is restarted. Only the "a dialog is up" mark goes.
+                final String key = identity(device);
+                synchronized (sPermissionLock) {
+                    sPermissionPending.remove(key);
+                }
+            }
             // Close only the link whose device went away: the other module keeps running.
             for (Link link : sLinks) {
                 if (name == null || (link.deviceName != null && link.deviceName.equals(name))) {
@@ -566,19 +617,62 @@ final class RcModuleSerial {
     }
 
     private static void requestPermission(Link link, UsbDevice device) {
-        final String name = device.getDeviceName();
-        final long now = System.currentTimeMillis();
-        if (name != null) {
-            final Long askedAt = sPermissionAskedAt.get(name);
-            if (askedAt != null && now - askedAt < PERMISSION_REASK_MS) {
-                return;  // asked a moment ago; waiting for the user
+        if (!EdgeTxApplication.isUiVisible()) {
+            // The dialog is an activity of the system's, put up over this app's window: asked
+            // for while there is no window, the system refuses the request without ever showing
+            // it, and the refusal would look like the user's own answer. The monitor calls here
+            // again, so the question goes up as soon as the firmware is on screen.
+            final long now = System.currentTimeMillis();
+            if (now - sNoWindowLoggedAt > 60_000) {
+                sNoWindowLoggedAt = now;
+                logi(link.role + ": USB permission needed for " + describe(device)
+                        + ", waiting for the UI to ask (a dialog needs a window)");
             }
-            sPermissionAskedAt.put(name, now);
+            return;
         }
 
-        logi(link.role + ": requesting USB permission for " + describe(device));
-        hint("请允许 USB 设备访问（" + (link.internal ? "内部" : "外部")
-                + "高频头），否则模块无法通信");
+        final String key = identity(device);
+        final long now = System.currentTimeMillis();
+        final boolean allowedEarlier = wasAllowedBefore(key);
+        // A saved "OK" is only a note to ourselves - the system still hands out no permission for
+        // this attach (a reboot without the "always open" tick, or the module re-enumerating), and
+        // there is no way to grant one silently. Staying quiet would leave the slot dead for the
+        // whole session, so it is asked once more per run, never more than that.
+        if (allowedEarlier) {
+            synchronized (sPermissionLock) {
+                if (sReaskedAfterAllow.contains(key)) {
+                    return;
+                }
+            }
+        }
+        synchronized (sPermissionLock) {
+            if (sPermissionAnswers.containsKey(key)) {
+                return;  // the user has already answered for this device
+            }
+            if (!sPermissionPending.add(key)) {
+                return;  // its dialog is up right now
+            }
+            final Long askedAt = sPermissionAskedAt.get(key);
+            if (askedAt != null && now - askedAt < PERMISSION_REASK_MS) {
+                sPermissionPending.remove(key);  // asked a moment ago; do not stack a second one
+                return;
+            }
+            sPermissionAskedAt.put(key, now);
+            if (allowedEarlier) {
+                sReaskedAfterAllow.add(key);  // the one re-ask this run gets
+            }
+        }
+
+        logi(link.role + ": requesting USB permission for " + describe(device)
+                + (allowedEarlier ? " (allowed on an earlier launch, but the system has no"
+                        + " permission for this attach - asking once more)" : ""));
+        final String module = link.internal ? "内部" : "外部";
+        hint(allowedEarlier
+                // The answer was given before, so say why it is being asked again and what
+                // makes it stop: the tick, which has the system grant the device on every attach.
+                ? "系统未保留 USB 授权（" + module + "高频头），请再次允许并勾选\"一律打开\"，"
+                        + "否则模块无法通信"
+                : "请允许 USB 设备访问（" + module + "高频头），否则模块无法通信");
 
         final Intent intent = new Intent(ACTION_USB_PERMISSION);
         intent.setPackage(deviceName());
@@ -593,8 +687,45 @@ final class RcModuleSerial {
             sUsbManager.requestPermission(device,
                     PendingIntent.getBroadcast(appContext(), 0, intent, flags));
         } catch (Throwable t) {
+            // No dialog went up, so the device is not waiting for an answer: free it again.
+            synchronized (sPermissionLock) {
+                sPermissionPending.remove(key);
+                if (allowedEarlier) {
+                    sReaskedAfterAllow.remove(key);
+                }
+            }
             Log.w(TAG, "module: requestPermission failed", t);
         }
+    }
+
+    /** One USB device, named the way the answer map keys it: stable across re-enumeration. */
+    private static String identity(UsbDevice device) {
+        return String.format(Locale.US, "%04x:%04x",
+                device.getVendorId(), device.getProductId());
+    }
+
+    /** Whether this device identity was allowed in an earlier launch, so it is never asked again. */
+    private static boolean wasAllowedBefore(String key) {
+        final Context context = appContext();
+        return context != null && EdgeTxApplication.isUsbDeviceAllowed(context, key);
+    }
+
+    /** Whether a device with that identity is attached right now. */
+    private static boolean isAttached(String key) {
+        if (sUsbManager == null) {
+            return true;
+        }
+        try {
+            for (UsbDevice attached : sUsbManager.getDeviceList().values()) {
+                if (key.equals(identity(attached))) {
+                    return true;
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "module: could not list the USB devices", t);
+            return true;  // never discard an answer because of an exception
+        }
+        return false;
     }
 
     private static void open(Link link, UsbSerialDriver driver) {
@@ -858,9 +989,8 @@ final class RcModuleSerial {
 
         if (active != sActiveLink) {
             sActiveLink = active;
-            // The model just switched slots: whatever was answered for the other module says
-            // nothing about this one, and its device may never have been asked about at all.
-            sPermissionAskedAt.clear();
+            // Nothing is cleared here on purpose: the answers are per device, so switching back
+            // to a slot whose module was already answered for cannot put a dialog back up.
             if (active != null) {
                 active.lastOpenAttemptMs = 0;  // open it now, not one throttle later
             }

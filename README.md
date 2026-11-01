@@ -233,6 +233,27 @@ into a slot.
 `external slot`) and mirrors the log into `module_link.txt` in the app's external
 files directory.
 
+**The USB permission dialog.** Android asks before letting an app open a USB
+device, and the same goes for the RC's own joystick. Both dialogs are shown **once
+per device per answer**:
+
+* **确定** (OK) is remembered for good - it is saved per `vendor:product`, so this
+  dialog never comes back on later launches either. Ticking *连接…后一律打开* in the
+  dialog additionally makes the system itself grant the device on every attach.
+* **取消** (Cancel) is honoured for the rest of that launch and **asked again on the
+  next one**, so a refused module is not dead forever.
+* The one exception to "OK is not asked again": a saved OK the system no longer backs
+  with a permission (a reboot without the *一律打开* tick, or a module that
+  re-enumerated). Android cannot re-grant that silently, so the dialog comes back
+  **once per launch**, with a hint to tick *一律打开* - better than a module that
+  stays silent with no way back.
+* A dialog is only raised while the EdgeTX window is on screen: asked for from the
+  background, Android refuses the request without ever showing it, and that refusal
+  would look like the user's own answer.
+
+The saved answers live in the app's `usb` preferences; clearing the app's data
+makes both devices ask again.
+
 **Power.** A bus-powered USB hub may not be able to feed the C3 and an external
 module at the same time. Both devices sit behind the same hub here, and with the
 external module - a transmitter with a PA - on it the hub reset itself every 20 to
