@@ -127,14 +127,20 @@ row the SDK buttons use, and how its data behaves) and in
 |--------|----------------|-----------------------|--------------|-------|---------|-----------------|
 | RC Plus 2 | `rc701` | SC / SD / SE | SF / SG / SH | — | 5-way trim modifier (H) | `SWITCH_TWO` |
 | RC Pro | `rm510`, `rm510b`, `rm510bv` | SD / SC / SF | SG / SH / SI | SE | switch SA | `SWITCH_ONE` |
-| RC Plus | `rm700`, `rm700_enterprise` | SC / SD / SE | SF / SG / SH | — | 5-way trim modifier (H) | `SWITCH_TWO` |
+| RC Plus | `rm700`, `rm700_enterprise` | SC / SD / SE | SF / SG / SH | — | 5-way trim modifier (return-home) | `SWITCH_TWO` |
 | RC Pro 2 | `rc520` | SD / SC / SF | SG / SH / SI | — | switch SA | `SWITCH_TWO` |
 
 Anything else keeps the RC Plus 2's row and says so in the log. The rows for
-the RC Pro and the RC Plus 2 were settled by pressing every button on the
-remote; the RC Plus uses the RC Plus 2's button map unchanged, and the RC Pro 2
-row is its family's layout. Only the buttons are shared, though - the RC Plus
-runs Android 10, so the grant its SD card needs is its own (see below).
+the RC Pro, the RC Plus 2 and the RC Plus were settled by pressing every button
+on the remote; the RC Pro 2 row is its family's layout. The RC Plus shares the
+RC Plus 2's switches but **not** its readers: its C1/C2/C3 never arrive from the
+SDK, only from the remote's own log, so
+`adb shell pm grant com.edgetx.droidui android.permission.READ_LOGS` is what
+makes those three custom buttons work there (the app says so on screen when the
+grant is missing). Its flight-mode switch and pause stay on the SDK and answer a
+moment late - they have no second reader. Only the buttons are shared otherwise:
+the RC Plus runs Android 10, so the grant its SD card needs is its own (see
+below).
 
 The six side buttons L1/L2/L3/R1/R2/R3 are not in the DJI SDK at all — the
 only supported way to read them is Android key events
@@ -182,7 +188,9 @@ Two things the SDK documentation settles, and this app follows:
 
 Every button the app does not map is logged once (`unmapped button keycode 131
 (F5)`, `the remote logged an unknown button 'PLAYBACK'`), which is how a new
-remote's row is filled in.
+remote's row is filled in; a name that comes from the remote's own log is also
+shown on the screen once, so a button that does nothing says what it is called
+without adb.
 
 ## RF modules
 

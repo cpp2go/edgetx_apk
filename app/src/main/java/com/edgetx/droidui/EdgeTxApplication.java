@@ -13,6 +13,7 @@ import android.os.Build;
 import android.os.Environment;
 import android.provider.Settings;
 import android.util.Log;
+import android.widget.Toast;
 
 import java.io.File;
 
@@ -206,10 +207,19 @@ public class EdgeTxApplication extends Application {
         // position every 2.5 ms. The SDK stays as the fallback, see RcRawJoystick.
         RcRawJoystick.start(this);
 
-        // The buttons the remote's own handler logs, which on the RC Pro is the reliable
-        // source for the pause, landing and custom buttons. Inert without READ_LOGS, see
-        // RcDpadLog - the SDK paths then behave exactly as they did before.
+        // The buttons the remote's own handler logs, which on the RC Pro and the RC Plus is the
+        // reliable source for the pause, landing and custom buttons. Inert without READ_LOGS,
+        // see RcDpadLog - and on a remote whose switches that log is the only reader for, the
+        // missing grant is a button that does nothing, so it says so on the screen:
+        // nobody guesses a signature-level permission from a dead button.
         RcDpadLog.start(this);
+        if (RcModel.CURRENT.logDrivesSwitches && !RcDpadLog.granted(this)) {
+            Log.i(TAG, "rc: " + RcModel.CURRENT.label + " needs READ_LOGS for its C buttons");
+            Toast.makeText(this,
+                    "缺少按键日志授权：C1/C2/C3 可能没反应。请连接电脑执行 "
+                            + "adb shell pm grant com.edgetx.droidui android.permission.READ_LOGS",
+                    Toast.LENGTH_LONG).show();
+        }
     }
 
     /** True in the process that exists only to carry the USB device filter. */

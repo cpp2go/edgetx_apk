@@ -9,6 +9,7 @@ import android.os.Looper;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.util.Log;
+import android.widget.Toast;
 
 import dji.sdk.keyvalue.key.DJIFlightControllerKey;
 import dji.sdk.keyvalue.key.DJIKey;
@@ -232,6 +233,9 @@ public final class DjiMsdkBridge {
     }
 
     public static void init(Application app) {
+        // For the one-off messages that have to be read on the remote itself - see
+        // announceDpad.
+        sApp = app;
         // Before anything is dispatched: where the latching switches were left.
         sPrefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         restoreLatchedSwitches();
@@ -963,8 +967,8 @@ public final class DjiMsdkBridge {
      * it, on the other hand, is that remote's stand-in for a long press of the return button - see
      * {@link #HOLD_FOR_EXIT_MS}.
      *
-     * <p>On every other remote this port runs on it is the landing / return-to-home button, and
-     * it is a switch: the user drives SA with it, so neither of the two above applies there
+     * <p>On the RC Pro and the RC Pro 2 it is the landing / return-to-home button, and it is a
+     * switch: the user drives SA with it, so neither of the two above applies there
      * ({@link RcModel#goHomeLands}). Both are left off there on purpose - the trim count would
      * put the 5-way into a trim mode after two presses of a switch the user toggles freely, and
      * a slightly slow press of it would close the page (or kill a running Lua script) as a
@@ -2186,11 +2190,18 @@ public final class DjiMsdkBridge {
         final String label;
         switch (name) {
             case "PAUSE":  index = SLOT_PAUSE; label = "pause"; break;
-            // The remote's own landing / return-to-home button. It is the reader that keeps
-            // arriving while the SDK's keys are silent (see listenGoHome for the other one) and
-            // the only source left on a remote where the takeoff button does not exist. The two
-            // are merged now, so a press lands whichever of them is having a good day.
-            case "GOHOME": index = SW_SA;    label = "landing"; break;
+            // The remote's own landing / return-to-home button. Where it IS a switch (RcModel
+            // .goHomeLands) the log is the reader that keeps arriving while the SDK's keys are
+            // silent (see listenGoHome for the other one), and the two are merged, so a press
+            // lands whichever of them is having a good day. Where it is the 5-way's trim
+            // modifier instead - the RC Plus 2's H key and, since it is the same button here,
+            // the RC Plus's return-home button - nothing may move SA: the SDK is what counts
+            // those presses (nativeOnDjiGoHome), and counting the log's copy as well would arm
+            // the trim mode on half the clicks it takes. SA is the takeoff button there, and
+            // the log has no name for that one.
+            case "GOHOME":
+                if (!REMOTE.goHomeLands) return;
+                index = SW_SA;    label = "landing"; break;
             case "C1":     index = SLOT_C1;  label = "C1"; break;
             case "C2":     index = SLOT_C2;  label = "C2"; break;
             case "C3":     index = SLOT_C3;  label = "C3"; break;
@@ -2224,13 +2235,39 @@ public final class DjiMsdkBridge {
     /** One log line the first time each unknown action turns up. */
     private static final java.util.Set<String> sDpadSeen = new java.util.HashSet<>();
 
-    private static void announceDpad(String name) {
+    /** Kept for {@link #announceDpad}: a Toast needs a context, the reader has none. */
+    private static Application sApp;
+
+    /**
+     * The first press of a button this app has no mapping for: one line in the log, and - because
+     * this runs on the remote and a dead button is otherwise indistinguishable from a button with
+     * no name here - the same sentence on the screen, once per name. That is how a remote whose
+     * buttons are only in its own log gets its names written down without adb.
+     */
+    private static void announceDpad(final String name) {
         synchronized (DjiMsdkBridge.class) {
-            if (sDpadSeen.add(name)) {
-                Log.i(TAG, "dji: the remote logged an unknown button '" + name
-                        + "' - it has no EdgeTX mapping yet");
+            if (!sDpadSeen.add(name)) {
+                return;
             }
+            Log.i(TAG, "dji: the remote logged an unknown button '" + name
+                    + "' - it has no EdgeTX mapping yet");
         }
+
+        final Application app = sApp;
+        if (app == null) {
+            return;
+        }
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Toast.makeText(app, "遥控器按键 '" + name + "' 还没映射到 EdgeTX 开关",
+                            Toast.LENGTH_LONG).show();
+                } catch (Throwable t) {
+                    Log.w(TAG, "dji: could not show '" + name + "'", t);
+                }
+            }
+        });
     }
 
     private static String describe(FiveDimensionPressedStatus status) {

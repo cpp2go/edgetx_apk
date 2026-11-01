@@ -1802,9 +1802,10 @@ Java_com_edgetx_droidui_DjiMsdkBridge_nativeOnDjiButton(JNIEnv* env, jclass claz
 // This is the only way to get the sticks: the RC firmware never dispatches
 // their MotionEvents to Android, and this process may not open
 // /dev/input/event4 (root:input, mode 0660) to read them from the kernel.
-// The RC Plus 2's go-home (H) button, one call per press. It only changes what the 5-way
-// does, see the trim mode above. The RC Pro has the same key on its landing button, which
-// drives a switch of its own there, so DjiMsdkBridge does not call this on that remote.
+// The RC Plus 2's go-home (H) button, one call per press - and the RC Plus's return-home
+// button, which is the same kind of button there. It only changes what the 5-way does, see
+// the trim mode above. On the RC Pro and the RC Pro 2 the same key sits on a landing button,
+// which drives a switch of its own there, so DjiMsdkBridge does not call this on those.
 extern "C" JNIEXPORT void JNICALL
 Java_com_edgetx_droidui_DjiMsdkBridge_nativeOnDjiGoHome(JNIEnv* env, jclass clazz) {
     (void)env;
@@ -1812,8 +1813,9 @@ Java_com_edgetx_droidui_DjiMsdkBridge_nativeOnDjiGoHome(JNIEnv* env, jclass claz
     requestTrimModePress();
 }
 
-// Called from DjiMsdkBridge.java when the RC Plus 2's H (go-home) button was *held*, not
-// tapped; the RC Pro's landing button does not call this, see nativeOnDjiGoHome above.
+// Called from DjiMsdkBridge.java when the RC Plus 2's H (go-home) button - or the RC Plus's
+// return-home button, which behaves the same - was *held*, not tapped; the RC Pro's landing
+// button does not call this, see nativeOnDjiGoHome above.
 //
 // H is the stand-in for a long press of the return button, which no source can deliver: the
 // return button arrives as an 8 ms tap however long it is pressed (measured by writing a

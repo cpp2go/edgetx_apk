@@ -68,9 +68,17 @@ final class RcModel {
      * The other rows:
      *
      * <ul>
-     *   <li><b>RC Plus (rm700, rm700_enterprise)</b>: the RC Plus 2's button map, unchanged - the
-     *       same buttons on the same switches, read by the same readers. Nothing else about the
-     *       remote is shared: it runs Android 10 like the RC Pro, so its SD card is the
+     *   <li><b>RC Plus (rm700, rm700_enterprise)</b>: the RC Plus 2's switches, but not its
+     *       readers. Settled by pressing the buttons on the remote: C1/C2/C3 did nothing at all,
+     *       while the flight-mode switch and pause answered a noticeable moment late. The SDK
+     *       carries no press for the three custom buttons on this remote, so with the log only
+     *       merging those presses went nowhere - {@code logDrivesSwitches} is on here, which is
+     *       what makes C1/C2/C3 (and a second reader for pause) work. {@code goHomeLands} stays
+     *       off: the user's return-home button is the 5-way's trim modifier on this remote just
+     *       as the H key is on the RC Plus 2, and SA stays the takeoff button with the LED
+     *       ({@code KeyRCAuthLedButtonDown}), which no log line names. Flight mode and pause stay
+     *       on the SDK, which is where their delay comes from.
+     *       It runs Android 10 like the RC Pro, so its SD card is the
      *       {@code WRITE_EXTERNAL_STORAGE} grant rather than "All files access", and that is
      *       decided from the API level, not from this class.</li>
      *   <li><b>RC Pro 2 (rc520)</b>: the Pro family - video/pause and photo swapped like the RC
@@ -89,7 +97,7 @@ final class RcModel {
             new RcModel(new String[] {"rm510"}, "RC Pro",
                     SD,   SC,   SF,   SG, SH, SI, SE,        false, true,  true,   true),
             new RcModel(new String[] {"rm700"}, "RC Plus",
-                    SC,   SD,   SE,   SF, SG, SH, NO_SWITCH, true,  false, false,  false),
+                    SC,   SD,   SE,   SF, SG, SH, NO_SWITCH, true,  true,  false,  false),
             new RcModel(new String[] {"rc520"}, "RC Pro 2",
                     SD,   SC,   SF,   SG, SH, SI, NO_SWITCH, true,  true,  true,   false),
     };
@@ -134,8 +142,9 @@ final class RcModel {
      * Whether the go-home button is a switch (SA) rather than the RC Plus 2's H key. The H key
      * is a modifier for the 5-way - one press puts it back to normal, two make it trim the left
      * stick, three the right one - and holding it stands in for a long press of the return
-     * button. On the RC Pro (landing button), the RC Plus (return-to-home key) and the RC Pro 2
-     * it is a button the user drives a switch with instead.
+     * button. On the RC Pro (landing button) and the RC Pro 2 it is a button the user drives a
+     * switch with instead; the RC Plus's return-home key is the same kind of button as the H
+     * key, so it keeps the H key's behaviour and SA stays the takeoff button with the LED.
      */
     final boolean goHomeLands;
 

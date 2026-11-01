@@ -68,8 +68,7 @@ final class RcDpadLog {
 
     /** Called from {@code EdgeTxApplication.onCreate}. */
     static void start(Context context) {
-        if (context.checkSelfPermission(Manifest.permission.READ_LOGS)
-                != PackageManager.PERMISSION_GRANTED) {
+        if (!granted(context)) {
             // Signature-level, so it is either granted by hand or not there at all: say so
             // once rather than start a logcat that would only print nothing.
             Log.i(TAG, "rc: no READ_LOGS, the remote's button log stays unread");
@@ -78,6 +77,16 @@ final class RcDpadLog {
         final Thread thread = new Thread(RcDpadLog::read, "rc-dpad-log");
         thread.setDaemon(true);
         thread.start();
+    }
+
+    /**
+     * Whether this app may read the remote's own log. The grant is signature-level and only
+     * survives until the app is reinstalled, so both the reader and the screen that asks for
+     * it read it from here.
+     */
+    static boolean granted(Context context) {
+        return context.checkSelfPermission(Manifest.permission.READ_LOGS)
+                == PackageManager.PERMISSION_GRANTED;
     }
 
     /**
