@@ -164,6 +164,23 @@ final class RcRawJoystick {
     /** How long to wait before asking again: the answer normally takes a couple of seconds. */
     private static final int ASK_AGAIN_MS = 5000;
 
+    /**
+     * The user's answer to the permission dialog, null until they have chosen.
+     *
+     * <p>Once it is set the dialog is never raised again in this run: asking a second time after
+     * the user had already answered is what made the same dialog reappear on every resume, and on
+     * every eighth second while the UI stayed up. "OK" is then also saved for good - see
+     * {@link EdgeTxApplication#rememberUsbDeviceAllowed} - while "Cancel" is asked about once on
+     * the next launch.
+     */
+    private static volatile Boolean sAnswer;
+
+    /**
+     * Set the first time a saved "OK" is found without the system permission behind it, so the
+     * dialog is raised for that case once per run and no more.
+     */
+    private static volatile boolean sReaskedAfterAllow;
+
     /** Verbose flag, decided once at start. */
     private static volatile boolean sVerbose;
 
@@ -198,9 +215,10 @@ final class RcRawJoystick {
      * up - is refused by the system without ever being shown. Measured on the RC Pro after a
      * fresh install: "asking for permission for /dev/bus/usb/001/007" 6 s before "activity
      * started", then "USB permission denied" 1.5 s later, and with the raw reports gone the
-     * photo and record buttons went with them. Asked again once the window is there, the dialog
-     * appears and the answer is real. A denied answer is simply asked again on the next resume,
-     * spaced out so a dialog cannot pile up.
+     * photo and record buttons went with them. So the request is only ever made while the
+     * launcher activity is on screen (see {@code EdgeTxApplication.isUiVisible}), where the
+     * dialog is real, and the answer the user gives - allowed or refused - is kept for the rest
+     * of the run: the same dialog is never put up twice.
      */
     static void start(Context context) {
         try {
@@ -229,11 +247,36 @@ final class RcRawJoystick {
                 return;
             }
 
+            if (sAnswer != null) {
+                // The user answered in this run; the dialog is not put up a second time.
+                return;
+            }
+            if (!EdgeTxApplication.isUiVisible()) {
+                // The dialog is a system activity shown over this app's window. Asked for from
+                // the Application - before any window is up - the request is refused without
+                // ever being shown, which would look like an answer the user never gave. The
+                // launcher activity asks from onResume, where the dialog is real.
+                Log.i(TAG, "raw joystick: no window yet, the dialog is asked for once it is up");
+                return;
+            }
+
             final Context app = context.getApplicationContext();
             registerPermissionReceiver(app);
 
             if (System.currentTimeMillis() - sAskedAt < ASK_AGAIN_MS) {
                 return;
+            }
+
+            if (wasAllowedBefore(context, device)) {
+                if (sReaskedAfterAllow) {
+                    return;
+                }
+                // Allowed on an earlier launch, but the system hands out no permission for this
+                // one - the grant cannot be restored without a dialog, and the alternative is a
+                // joystick that stays silent. Asked once more, and not again after that.
+                sReaskedAfterAllow = true;
+                Log.i(TAG, "raw joystick: allowed earlier but the system has no permission for"
+                        + " it - asking once more");
             }
             sAskedAt = System.currentTimeMillis();
 
@@ -266,16 +309,22 @@ final class RcRawJoystick {
                 }
                 final boolean granted =
                         intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false);
-                Log.i(TAG, "raw joystick: USB permission " + (granted ? "granted" : "denied"));
+                sAnswer = granted;
+                final UsbDevice answeredFor = deviceFrom(intent);
+                if (granted && answeredFor != null) {
+                    // Saved, so this dialog does not come back on the next launch either.
+                    EdgeTxApplication.rememberUsbDeviceAllowed(app, identity(answeredFor));
+                }
+                Log.i(TAG, "raw joystick: USB permission " + (granted ? "granted - not asking"
+                        + " again" : "denied - asked again on the next launch"));
                 if (!granted) {
                     // Never fatal: this class only carries the reports the SDK cannot, so a
                     // refusal leaves the app working with the buttons the SDK does deliver.
-                    sAskedAt = 0;
                     return;
                 }
                 final UsbManager manager =
                         (UsbManager) app.getSystemService(Context.USB_SERVICE);
-                final UsbDevice permitted = deviceFrom(intent);
+                final UsbDevice permitted = answeredFor != null ? answeredFor : deviceFrom(intent);
                 if (manager != null && permitted != null && !sReaderStarted) {
                     readInBackground(manager, permitted);
                 }
@@ -291,6 +340,11 @@ final class RcRawJoystick {
      */
     static boolean ownsInputs() {
         return sOwned;
+    }
+
+    /** True once the user has answered the USB permission dialog, either way. */
+    static boolean hasAnswer() {
+        return sAnswer != null;
     }
 
     /** One stick value from the SDK: recorded, and compared in the verbose log. */
@@ -798,6 +852,17 @@ final class RcRawJoystick {
         } catch (Throwable t) {
             Log.w(TAG, "raw joystick: could not list the input devices", t);
         }
+    }
+
+    /** The joystick named the way the saved permission answers are keyed. */
+    private static String identity(UsbDevice device) {
+        return String.format(Locale.US, "%04x:%04x",
+                device.getVendorId(), device.getProductId());
+    }
+
+    /** Whether this joystick was allowed in an earlier launch, so the dialog is never raised again. */
+    private static boolean wasAllowedBefore(Context context, UsbDevice device) {
+        return EdgeTxApplication.isUsbDeviceAllowed(context, identity(device));
     }
 
     private static UsbDevice findJoystick(UsbManager manager) {

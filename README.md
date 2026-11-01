@@ -186,6 +186,27 @@ Two things the SDK documentation settles, and this app follows:
   so on that remote the SDK reports little or nothing and the button paths that
   matter are Android key events and the remote's own log — both are in place.
 
+MSDK 5.18 carries the same four custom buttons in two more keys, and both are
+watched because a remote's own key for one of them is not always there:
+
+* `KeyRcButtonEventPro` (`RcCustomButtonEvent.isC1Click`..`isC4Click`) is one event
+  per press, merged the way the remote's log is.
+* `KeyRcHardwareState` (`RcCustomButtonHardwareStatus.isC1Click`..) is a level
+  pushed every few hundred milliseconds, merged over a wider window because its
+  copy of a press can land after the exact readers have pressed *and* released.
+
+Both are acted on only while that button's own key is absent, not subscribed to
+(the RC Pro's C3) or in one of the SDK's silent waves, so a press the exact
+reader delivers is never counted twice. That is what gives C1/C2/C3 a reader on a
+remote whose Boolean keys never answer, without the `READ_LOGS` grant the log
+path needs.
+
+The SDK's snapshot is the **first** callback of a listener, not every callback
+whose old value is null: the SDK drops a key to null in a wave and re-delivers it
+with a null old value, and reading that as a snapshot swallowed the first press
+after every wave — which is exactly what the buttons no other reader covers
+(pause, C1..C3, takeoff) looked like while it happened.
+
 Every button the app does not map is logged once (`unmapped button keycode 131
 (F5)`, `the remote logged an unknown button 'PLAYBACK'`), which is how a new
 remote's row is filled in; a name that comes from the remote's own log is also
@@ -219,6 +240,27 @@ into a slot.
 `RcModuleSerial` logs every transition with the slot's name (`internal slot` /
 `external slot`) and mirrors the log into `module_link.txt` in the app's external
 files directory.
+
+**The USB permission dialog.** Android asks before letting an app open a USB
+device, and the same goes for the RC's own joystick. Both dialogs are shown **once
+per device per answer**:
+
+* **确定** (OK) is remembered for good - it is saved per `vendor:product`, so this
+  dialog never comes back on later launches either. Ticking *连接…后一律打开* in the
+  dialog additionally makes the system itself grant the device on every attach.
+* **取消** (Cancel) is honoured for the rest of that launch and **asked again on the
+  next one**, so a refused module is not dead forever.
+* The one exception to "OK is not asked again": a saved OK the system no longer backs
+  with a permission (a reboot without the *一律打开* tick, or a module that
+  re-enumerated). Android cannot re-grant that silently, so the dialog comes back
+  **once per launch**, with a hint to tick *一律打开* - better than a module that
+  stays silent with no way back.
+* A dialog is only raised while the EdgeTX window is on screen: asked for from the
+  background, Android refuses the request without ever showing it, and that refusal
+  would look like the user's own answer.
+
+The saved answers live in the app's `usb` preferences; clearing the app's data
+makes both devices ask again.
 
 **Power.** A bus-powered USB hub may not be able to feed the C3 and an external
 module at the same time. Both devices sit behind the same hub here, and with the

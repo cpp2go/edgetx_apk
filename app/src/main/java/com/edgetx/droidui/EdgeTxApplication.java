@@ -33,6 +33,10 @@ public class EdgeTxApplication extends Application {
     private static final String LINK_PREFS = "link";
     private static final String PREF_MANUAL_CLOSED = "manualClosed";
 
+    /** Where the USB permission answers that outlive a launch are kept. */
+    private static final String USB_PREFS = "usb";
+    private static final String PREF_ALLOWED_PREFIX = "allowed:";
+
     /** The notification that leads to the "All files access" page. */
     private static final int SD_ACCESS_NOTIFICATION_ID = 1;
 
@@ -43,6 +47,18 @@ public class EdgeTxApplication extends Application {
      * activity clears it once the grant is there (or once the user has said no).
      */
     private static boolean sWaitingForCardAccess;
+
+    /**
+     * True while the launcher activity is on screen.
+     *
+     * <p>That is the only state in which Android puts a USB permission dialog up for this app:
+     * the dialog is an activity of the system's shown over the requesting app's window, and a
+     * request made from a process with no window - at start-up, or while only the link service
+     * lives - is refused without ever being shown. The USB questions (see
+     * {@link RcModuleSerial} and {@link RcRawJoystick}) are held back until this is true, so
+     * that a refusal always means the user themselves said no.
+     */
+    private static volatile boolean sUiVisible;
 
     @Override
     protected void attachBaseContext(Context base) {
@@ -130,6 +146,38 @@ public class EdgeTxApplication extends Application {
     /** True while the firmware is held back waiting for the card permission. */
     static boolean isWaitingForCardAccess() {
         return sWaitingForCardAccess;
+    }
+
+    /** Whether the launcher activity is on screen, see {@link #sUiVisible}. */
+    static boolean isUiVisible() {
+        return sUiVisible;
+    }
+
+    static void setUiVisible(boolean visible) {
+        sUiVisible = visible;
+    }
+
+    /**
+     * Whether this USB device was allowed in the permission dialog on an earlier launch.
+     *
+     * <p>Only a yes is kept. "Cancel" is not: it is honoured for the rest of that launch, and
+     * then asked again on the next one. A device that was allowed is not put in front of the
+     * user again - with one exception: a saved yes the system does not back with a permission
+     * on a later attach (a reboot without the "always open" tick, or a module that
+     * re-enumerated). That cannot be fixed silently, so it is asked once more per run rather
+     * than leaving the device silent for the whole session.
+     */
+    static boolean isUsbDeviceAllowed(Context context, String identity) {
+        return context.getSharedPreferences(USB_PREFS, MODE_PRIVATE)
+                .getBoolean(PREF_ALLOWED_PREFIX + identity, false);
+    }
+
+    static void rememberUsbDeviceAllowed(Context context, String identity) {
+        final boolean saved = context.getSharedPreferences(USB_PREFS, MODE_PRIVATE)
+                .edit().putBoolean(PREF_ALLOWED_PREFIX + identity, true).commit();
+        if (!saved) {
+            Log.w(TAG, "usb: could not persist the permission answer for " + identity);
+        }
     }
 
     /**

@@ -36,8 +36,8 @@ import android.widget.Toast;
  * later launches until they are given.
  *
  * <p>The other one is a permission that needs a dialog: {@code UsbManager.requestPermission},
- * asked for again below until it is granted - see {@link RcRawJoystick}. {@code READ_LOGS} is
- * signature-level and adb-only, so it is deliberately not mentioned on screen.
+ * asked for below until the user has answered it - see {@link RcRawJoystick}. {@code READ_LOGS}
+ * is signature-level and adb-only, so it is deliberately not mentioned on screen.
  */
 public class EdgeTxActivity extends NativeActivity {
 
@@ -56,9 +56,9 @@ public class EdgeTxActivity extends NativeActivity {
     private static final long SD_ACCESS_ASK_MS = 1500;
 
     /**
-     * How many times to ask before leaving it alone until the app comes to the front again. Five
-     * is enough that a dialog missed once is not the end of it, and few enough that a deliberate
-     * "no" is not answered with a dialog every eight seconds for as long as the UI is up.
+     * How many times a launch may try to put the dialog up. The request is a no-op once the user
+     * has answered (see {@link RcRawJoystick}), so these attempts only cover a request that never
+     * reached the window; five is enough for that and few enough that nothing piles up.
      */
     private static final int USB_ASKS = 5;
 
@@ -149,20 +149,20 @@ public class EdgeTxActivity extends NativeActivity {
     }
 
     /**
-     * Puts the USB permission dialog back up until the raw joystick is claimed.
+     * Puts the USB permission dialog up for the raw joystick, once.
      *
      * <p>Its reader is the only source of the 400 Hz sticks, the dials, the return button's real
      * long press, and the round and photo buttons on the RC Pro - and the permission behind it
-     * exists only as a dialog: there is no settings screen for it, and the dialog is shown once
-     * per request. Asking only from {@code onResume} therefore meant that a dialog dismissed
-     * while the firmware was on screen never came back (the user's "the virtual joystick
-     * permission only pops up when the app is installed"), and with it the reader stayed off for
-     * the rest of the session.
+     * exists only as a dialog: there is no settings screen for it. The dialog is raised again
+     * here only while the question is still open ({@link RcRawJoystick#hasAnswer()} decides):
+     * once the user has chosen, whether allowed or refused, it is not put in front of them a
+     * second time - the answer stands until the app is restarted.
      */
     private final Runnable usbAsk = new Runnable() {
         @Override
         public void run() {
-            if (RcRawJoystick.ownsInputs()) {
+            if (RcRawJoystick.ownsInputs() || RcRawJoystick.hasAnswer()) {
+                // Answered: the dialog is not put up again, so there is nothing left to ask.
                 return;
             }
             if (usbAsks >= USB_ASKS) {
@@ -219,6 +219,8 @@ public class EdgeTxActivity extends NativeActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        // The window is the precondition for every USB permission dialog this app raises.
+        EdgeTxApplication.setUiVisible(true);
         // The raw joystick reports need a USB permission, and that one can only be granted
         // through a dialog: asked for from the Application, before any window exists, the
         // system refuses it without showing anything (measured on the RC Pro, where the
@@ -266,6 +268,7 @@ public class EdgeTxActivity extends NativeActivity {
     @Override
     protected void onPause() {
         super.onPause();
+        EdgeTxApplication.setUiVisible(false);
         // A request made without a window is refused without a dialog, so do not ask while the
         // firmware is not the thing on screen; onResume starts the asking again.
         handler.removeCallbacks(usbAsk);
