@@ -136,8 +136,8 @@ on the remote; the RC Pro 2 row is its family's layout. The RC Plus shares the
 RC Plus 2's switches but **not** its readers: its C1/C2/C3 never arrive from the
 SDK, only from the remote's own log, so
 `adb shell pm grant com.edgetx.droidui android.permission.READ_LOGS` is what
-makes those three custom buttons work there (the app says so on screen when the
-grant is missing). Its flight-mode switch and pause stay on the SDK and answer a
+makes those three custom buttons work there (the app logs it when the grant is
+missing). Its flight-mode switch and pause stay on the SDK and answer a
 moment late - they have no second reader. Only the buttons are shared otherwise:
 the RC Plus runs Android 10, so the grant its SD card needs is its own (see
 below).

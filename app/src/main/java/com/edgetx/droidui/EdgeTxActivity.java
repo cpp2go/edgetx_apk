@@ -12,12 +12,11 @@ import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
 import android.util.Log;
-import android.widget.Toast;
 
 /**
  * The launcher activity: Android's {@link NativeActivity}, plus the two things that can only be
- * done from an activity - asking for a permission that needs a dialog, and telling the user what
- * a permission it cannot ask for is costing.
+ * done from an activity - asking for a permission that needs a dialog, and opening the settings
+ * page for the one that has no dialog.
  *
  * <p>The app itself still runs from NativeActivity - this subclass only adds {@code onCreate},
  * {@code onResume}, {@code onPause} and {@code onRequestPermissionsResult} - so nothing about the
@@ -110,17 +109,15 @@ public class EdgeTxActivity extends NativeActivity {
             }
             sdAccessAskedAt = now;
             try {
-                Toast.makeText(EdgeTxActivity.this, Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
-                                ? "请允许\"所有文件访问\"，EdgeTX 目录才会出现在 /storage/emulated/0/EdgeTX"
-                                : "请允许存储权限，EdgeTX 目录才会出现在 /storage/emulated/0/EdgeTX",
-                        Toast.LENGTH_LONG).show();
-
                 final Intent page = (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R)
                         ? EdgeTxApplication.sdAccessSettings(EdgeTxActivity.this)
                         : new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                                 Uri.parse("package:" + getPackageName()));
                 startActivity(page);
-                Log.i(TAG, "sdcard: showing the page that grants the card directory");
+                Log.i(TAG, "sdcard: showing the page that grants the card directory"
+                        + (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+                                ? " (all-files access)"
+                                : " (storage permission)"));
             } catch (Throwable t) {
                 // Some vendor builds have no such page; the firmware then keeps the card in
                 // the app's own directory, which still works.
@@ -295,8 +292,6 @@ public class EdgeTxActivity extends NativeActivity {
                     // Do not put the settings page on top of the dialog just answered: give it
                     // a few minutes, or the next launch.
                     sdAccessAskedAt = System.currentTimeMillis();
-                    Toast.makeText(this, "存储权限被拒绝，EdgeTX 目录无法创建；可在应用权限中开启",
-                            Toast.LENGTH_LONG).show();
                 }
                 // The firmware was held back until this answer (see EdgeTxApplication): boot
                 // now, with the card in the user directory if the grant arrived.

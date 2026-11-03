@@ -10,10 +10,7 @@ import android.hardware.usb.UsbDeviceConnection;
 import android.hardware.usb.UsbInterface;
 import android.hardware.usb.UsbManager;
 import android.os.Build;
-import android.os.Handler;
-import android.os.Looper;
 import android.util.Log;
-import android.widget.Toast;
 
 import com.hoho.android.usbserial.driver.Ch34xSerialDriver;
 import com.hoho.android.usbserial.driver.ProbeTable;
@@ -243,7 +240,7 @@ final class RcModuleSerial {
      * "always open" tick, or the module re-enumerating): the permission cannot be re-granted by
      * the app, so the choice is between one more dialog and a slot that stays silent for the
      * rest of the session. {@link #sReaskedAfterAllow} makes that one more dialog happen at most
-     * once, with a hint that names the tick that makes it permanent.
+     * once, with a log line that names the tick that makes it permanent.
      */
     private static final Map<String, Boolean> sPermissionAnswers = new HashMap<>();
     /** Devices a dialog is up for right now, so one device never gets two of them. */
@@ -666,13 +663,12 @@ final class RcModuleSerial {
         logi(link.role + ": requesting USB permission for " + describe(device)
                 + (allowedEarlier ? " (allowed on an earlier launch, but the system has no"
                         + " permission for this attach - asking once more)" : ""));
-        final String module = link.internal ? "内部" : "外部";
-        hint(allowedEarlier
-                // The answer was given before, so say why it is being asked again and what
-                // makes it stop: the tick, which has the system grant the device on every attach.
-                ? "系统未保留 USB 授权（" + module + "高频头），请再次允许并勾选\"一律打开\"，"
-                        + "否则模块无法通信"
-                : "请允许 USB 设备访问（" + module + "高频头），否则模块无法通信");
+        if (allowedEarlier) {
+            // The answer was given before, so the log says why it is being asked again and what
+            // makes it stop: the tick, which has the system grant the device on every attach.
+            logi(link.role + ": the system did not keep the earlier USB grant - allow it again at"
+                    + " the dialog and tick \"always open\", or the module cannot talk");
+        }
 
         final Intent intent = new Intent(ACTION_USB_PERMISSION);
         intent.setPackage(deviceName());
@@ -1504,25 +1500,6 @@ final class RcModuleSerial {
 
     private static Context appContext() {
         return sAppContext;
-    }
-
-    /**
-     * Says something on the screen. The module monitor and the USB read/write threads are not
-     * on the main thread, where a Toast has to be shown from.
-     */
-    private static void hint(final String message) {
-        final Context context = sAppContext;
-        if (context == null) return;
-        try {
-            new Handler(Looper.getMainLooper()).post(new Runnable() {
-                @Override
-                public void run() {
-                    Toast.makeText(context, message, Toast.LENGTH_LONG).show();
-                }
-            });
-        } catch (Throwable t) {
-            Log.w(TAG, "module: could not show the hint", t);
-        }
     }
 
     private static String deviceName() {
