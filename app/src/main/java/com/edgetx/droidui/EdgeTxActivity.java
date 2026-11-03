@@ -158,8 +158,16 @@ public class EdgeTxActivity extends NativeActivity {
     private final Runnable usbAsk = new Runnable() {
         @Override
         public void run() {
-            if (RcRawJoystick.ownsInputs() || RcRawJoystick.hasAnswer()) {
-                // Answered: the dialog is not put up again, so there is nothing left to ask.
+            if (RcRawJoystick.ownsInputs()) {
+                // Feeding the sticks: there is nothing left to ask or to restart.
+                return;
+            }
+            if (RcRawJoystick.hasAnswer()) {
+                // Answered: the dialog is not put up again, so there is nothing left to ask -
+                // but the reader itself can have stopped (the joystick taken away from it, see
+                // RcRawJoystick), and start() is what puts it back. It never raises the dialog
+                // once the answer is known.
+                RcRawJoystick.start(EdgeTxActivity.this);
                 return;
             }
             if (usbAsks >= USB_ASKS) {

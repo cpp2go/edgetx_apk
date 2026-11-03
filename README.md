@@ -111,6 +111,40 @@ input device 4: "fts" sources=0x00001002  axes=[X,Y,...]
 If a remote controller's sticks do not show up there with a `JOYSTICK` marker,
 Android never sees them — a vendor SDK would be needed instead.
 
+### Sticks on a DJI remote
+
+A DJI remote's own joystick is not dispatched as `MotionEvent`s at all, so the
+path above never sees it. Its sticks are read twice, and the reader that matters
+is the raw one:
+
+* the DJI SDK publishes a stick position only while it moves, 8-14 new values a
+  second (`DjiMsdkBridge`);
+* the joystick's USB interface ("DJI Virtual Joystick", `2ca3:1501`) produces a
+  new report every 2.5 ms, and `RcRawJoystick` takes that interface away from the
+  kernel driver and reads it - 400 reports a second.
+
+While that reader is running the SDK's copies of the same axes are ignored, and
+everything the reports do not carry (the flight-mode switch, the C buttons, the
+remote's log) still comes from the SDK and Android.
+
+The reader is restarted by the app itself when it stops. That is what keeps the
+sticks alive when **DJI Fly is started**: while `dji.go.v5` runs in the
+background it subscribes to the same remote through the same SDK, and the SDK's
+keys arrive late or not at all (see the silence notes in `DjiMsdkBridge`). The
+raw reader does not go through the SDK, so it is the one source that keeps
+working, and it now claims its interface back a second after a stream that broke
+off (backing off to one attempt every 15 s while the device cannot be claimed):
+
+```
+raw joystick: claimed /dev/bus/usb/001/007 interface 0 (quiet)
+raw joystick: the reader stopped after 184703 report(s); restarting it in 1000 ms
+raw joystick: the sticks, dials and buttons now come from the raw reports
+```
+
+That reader exists only with the USB permission for the joystick, which the app
+asks for while its window is up and remembers once it is granted. Without it the
+sticks come from the SDK alone - and while DJI Fly is running, they stop with it.
+
 ### Remote-controller buttons
 
 Which switch a button drives is a property of the remote, not of the button:
@@ -427,6 +461,11 @@ launchers shrink into the safe zone and wrap in their own shape.
 
 ## Troubleshooting
 
+* **The sticks stop after DJI Fly was started.** They come from the joystick's raw USB
+  reports (see *Sticks on a DJI remote*), and `raw joystick: the reader stopped after … report(s);
+  restarting it in 1000 ms` followed by `claimed` is the app putting that reader back. Without
+  that permission they come from the SDK alone, which DJI Fly starves while it runs - so the USB
+  dialog for "DJI Virtual Joystick" must be allowed, not refused.
 * **The UI is blank / the process dies right after launch.** Look for a
   tombstone first: `adb logcat -b crash`.
 * **`Gradle requires JVM 17 or later`.** Set `JAVA_HOME` (see *Building*).

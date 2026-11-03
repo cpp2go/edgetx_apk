@@ -13,6 +13,8 @@ import android.hardware.usb.UsbInterface;
 import android.hardware.usb.UsbManager;
 import android.hardware.usb.UsbRequest;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 import android.view.InputDevice;
 import android.view.KeyEvent;
@@ -74,6 +76,16 @@ import java.util.concurrent.TimeoutException;
  * reader ever stops - the device taken away, the app moved to the background and killed -
  * the SDK takes them back without a restart. Everything the reports do not carry is
  * unaffected either way.
+ *
+ * <p><b>A reader that stops is put back.</b> The report stream is not guaranteed - the reader
+ * gives the interface back when nothing arrives for {@link #SILENT_LIMIT} - and what a user
+ * reports as "after DJI Fly is started, the sticks do nothing" is exactly that state: the raw
+ * reports gone, and the SDK fallback unable to cover them, because DJI's own app
+ * ({@code dji.go.v5}) starves the SDK of the same remote. Nothing used to restart the reader
+ * in that state, so the sticks stayed dead for the rest of the process; the supervisor in this
+ * class now does. What the joystick itself does while DJI Fly runs has not been measured - the
+ * reader's own lines ("no reports for 4000 ms", a claim that fails, or the restart that
+ * follows) are what a report of this needs next.
  *
  * <p>Verbose logging (one line per change in a frame, plus the SDK-versus-raw comparison)
  * is enabled only while the trigger file {@code hid_probe} exists next to the app's
@@ -155,6 +167,34 @@ final class RcRawJoystick {
      */
     private static volatile boolean sReaderStarted;
 
+    /**
+     * Set once a reader has run, and never cleared: from then on a reader that stops is this
+     * app's job to put back. It is also what bounds the retries below - a device that never
+     * yielded a reader (no joystick at all) is never retried.
+     */
+    private static volatile boolean sWanted;
+
+    /** The application context, kept for the restarts: a reader outlives the activity. */
+    private static volatile Context sApp;
+
+    /**
+     * How long the supervisor below waits before putting a reader back, and how far the wait
+     * grows while it keeps failing.
+     *
+     * <p>The interface can be taken away from this reader at runtime, and until now nothing
+     * gave it back: the reader noticed the silence, released the interface and returned, and
+     * the only caller of {@link #start} left that could restart it was the activity's resume -
+     * which is not reached while the app stays in front, and which stopped calling at all once
+     * the USB dialog had been answered. So a member whose report stream stopped stayed on the
+     * SDK for the rest of the process, and the SDK is exactly what DJI's own app
+     * ({@code dji.go.v5}) starves - "after DJI Fly is started, the sticks do nothing".
+     */
+    private static final int RESTART_MIN_MS = 1000;
+    private static final int RESTART_MAX_MS = 15000;
+    private static int sRestartDelayMs = RESTART_MIN_MS;
+    private static int sRestarts;
+    private static Handler sRestartHandler;
+
     /** The permission receiver is registered once, however often {@link #start} is called. */
     private static volatile boolean sReceiverRegistered;
 
@@ -171,13 +211,16 @@ final class RcRawJoystick {
      * the user had already answered is what made the same dialog reappear on every resume, and on
      * every eighth second while the UI stayed up. "OK" is then also saved for good - see
      * {@link EdgeTxApplication#rememberUsbDeviceAllowed} - while "Cancel" is asked about once on
-     * the next launch.
+     * the next launch. The one exception is a reader that was running and lost its grant with the
+     * device (see {@link #sReaskedAfterAllow}): that is asked about once more, because without a
+     * dialog the grant never comes back.
      */
     private static volatile Boolean sAnswer;
 
     /**
-     * Set the first time a saved "OK" is found without the system permission behind it, so the
-     * dialog is raised for that case once per run and no more.
+     * Set the first time a saved "OK" is found without the system permission behind it - or a
+     * reader that was running finds the device back without its grant - so the dialog is raised
+     * for that case once per run and no more.
      */
     private static volatile boolean sReaskedAfterAllow;
 
@@ -222,6 +265,7 @@ final class RcRawJoystick {
      */
     static void start(Context context) {
         try {
+            sApp = context.getApplicationContext();
             sVerbose = new File(context.getExternalFilesDir(null), TRIGGER).isFile();
 
             final UsbManager manager = (UsbManager) context.getSystemService(Context.USB_SERVICE);
@@ -247,9 +291,17 @@ final class RcRawJoystick {
                 return;
             }
 
+            boolean reask = false;
             if (sAnswer != null) {
-                // The user answered in this run; the dialog is not put up a second time.
-                return;
+                if (!sWanted || sReaskedAfterAllow) {
+                    // The user answered in this run; the dialog is not put up a second time.
+                    return;
+                }
+                // A reader was running and the device came back without its grant: a
+                // re-enumeration hands out a new device node, and the answer does not follow
+                // it. Android cannot restore a grant without a dialog, so it is asked once
+                // more - and once only, which is what sReaskedAfterAllow says afterwards.
+                reask = true;
             }
             if (!EdgeTxApplication.isUiVisible()) {
                 // The dialog is a system activity shown over this app's window. Asked for from
@@ -267,16 +319,21 @@ final class RcRawJoystick {
                 return;
             }
 
-            if (wasAllowedBefore(context, device)) {
+            if (!reask && sAnswer == null && wasAllowedBefore(context, device)) {
                 if (sReaskedAfterAllow) {
                     return;
                 }
                 // Allowed on an earlier launch, but the system hands out no permission for this
                 // one - the grant cannot be restored without a dialog, and the alternative is a
                 // joystick that stays silent. Asked once more, and not again after that.
+                reask = true;
+            }
+            if (reask) {
                 sReaskedAfterAllow = true;
-                Log.i(TAG, "raw joystick: allowed earlier but the system has no permission for"
-                        + " it - asking once more");
+                Log.i(TAG, "raw joystick: " + (sAnswer != null
+                        ? "the joystick came back without its permission"
+                        : "allowed earlier but the system grants nothing now")
+                        + " - asking once more");
             }
             sAskedAt = System.currentTimeMillis();
 
@@ -372,36 +429,148 @@ final class RcRawJoystick {
 
     // ---- the reader ---------------------------------------------------------
 
+    /**
+     * Puts a reader back after one has stopped, and keeps trying while it cannot.
+     *
+     * <p>Until this existed, nothing did. The reader gives the interface back when no report
+     * arrives for {@link #SILENT_LIMIT}, and the only callers of {@link #start} were the
+     * application (once per process) and the launcher activity's resume - which also stopped
+     * calling once the USB dialog had been answered. So a report stream that stopped stayed
+     * stopped for the rest of the process.
+     *
+     * <p>That is what a user reports as "after DJI Fly is started, the sticks do nothing": the
+     * SDK fallback cannot cover such a gap, because DJI's own app ({@code dji.go.v5}) starves
+     * the SDK of the same remote (see the silence notes in {@link DjiMsdkBridge}). The reader is
+     * the source that does not depend on the SDK, so it is the one that has to come back.
+     *
+     * <p>One second after a reader that did deliver - the device is there and merely has to be
+     * claimed again. A device that cannot be claimed at all backs off to one attempt every
+     * {@link #RESTART_MAX_MS}, so a remote in a mode where the joystick is genuinely gone is not
+     * hammered, and every attempt is logged only while it is still worth reading.
+     */
+    private static final Runnable sRestart = new Runnable() {
+        @Override
+        public void run() {
+            final Context app = sApp;
+            if (app == null || !sWanted || sReaderStarted) {
+                return;
+            }
+            final UsbManager manager =
+                    (UsbManager) app.getSystemService(Context.USB_SERVICE);
+            if (manager == null) {
+                return;
+            }
+            final UsbDevice device = findJoystick(manager);
+            if (device == null) {
+                // Gone while it re-enumerates; the next attempt may find the new node.
+                restartReader(0);
+                return;
+            }
+            if (!manager.hasPermission(device)) {
+                // The node came back without the grant. Only a dialog can give it back, and
+                // start() is where one is raised - it never asks without a window, so there is
+                // nothing to do while the UI is away.
+                if (EdgeTxApplication.isUiVisible()) {
+                    start(app);
+                }
+                restartReader(0);
+                return;
+            }
+            readInBackground(manager, device);
+        }
+    };
+
+    private static void restartReader(int reports) {
+        final Context app = sApp;
+        if (app == null || !sWanted) {
+            return;
+        }
+        final Handler handler = restartHandler();
+        if (handler == null) {
+            return;
+        }
+        final int delay;
+        synchronized (RcRawJoystick.class) {
+            if (reports > 0) {
+                sRestartDelayMs = RESTART_MIN_MS;   // it did work: get it back at once
+            }
+            delay = sRestartDelayMs;
+            sRestartDelayMs = Math.min(sRestartDelayMs * 2, RESTART_MAX_MS);
+            sRestarts++;
+            if (reports > 0) {
+                Log.i(TAG, "raw joystick: the reader stopped after " + reports + " report(s);"
+                        + " restarting it in " + delay + " ms");
+            } else if (sRestarts <= 3 || sRestarts % 20 == 0) {
+                Log.i(TAG, "raw joystick: no reader yet, trying again in " + delay + " ms"
+                        + " (attempt " + sRestarts + ")");
+            }
+        }
+        handler.removeCallbacks(sRestart);
+        handler.postDelayed(sRestart, delay);
+    }
+
+    private static Handler restartHandler() {
+        synchronized (RcRawJoystick.class) {
+            if (sRestartHandler == null) {
+                final Looper looper = Looper.getMainLooper();
+                if (looper == null) {
+                    return null;
+                }
+                sRestartHandler = new Handler(looper);
+            }
+            return sRestartHandler;
+        }
+    }
+
+    /** The reader is done feeding the sticks, whatever the reason: the SDK has them again. */
+    private static void releaseOwnership() {
+        if (!sOwned) {
+            return;
+        }
+        sOwned = false;
+        Log.i(TAG, "raw joystick: the sticks and dials are the SDK's again until the reader"
+                + " returns");
+    }
+
     private static void readInBackground(final UsbManager manager, final UsbDevice device) {
+        if (sReaderStarted) {
+            return;
+        }
         sReaderStarted = true;
+        sWanted = true;
         final Thread thread = new Thread(() -> {
+            int reports = 0;
             try {
-                read(manager, device);
+                reports = read(manager, device);
             } catch (Throwable t) {
                 Log.w(TAG, "raw joystick: reader stopped", t);
             } finally {
-                sOwned = false;
+                releaseOwnership();
                 sReaderStarted = false;
+                restartReader(reports);
             }
         }, "raw-joystick");
         thread.setDaemon(true);
         thread.start();
     }
 
-    private static void read(UsbManager manager, UsbDevice device) {
+    /** @return how many reports were delivered, so the restart can tell "taken away" from
+     *  "never worked". */
+    private static int read(UsbManager manager, UsbDevice device) {
         final UsbDeviceConnection connection = manager.openDevice(device);
         if (connection == null) {
             Log.w(TAG, "raw joystick: openDevice returned null (permission not held?)");
-            return;
+            return 0;
         }
 
         final UsbInterface iface = device.getInterface(0);
         // force = true detaches the kernel's own driver, which is the point: it is what
         // lets an app see the reports. The driver comes back when this connection closes.
         if (!connection.claimInterface(iface, true)) {
-            Log.w(TAG, "raw joystick: could not claim interface " + iface.getId());
+            Log.w(TAG, "raw joystick: could not claim interface " + iface.getId()
+                    + " (another reader holds it)");
             connection.close();
-            return;
+            return 0;
         }
         Log.i(TAG, "raw joystick: claimed " + device.getDeviceName() + " interface "
                 + iface.getId() + " (" + (sVerbose ? "verbose" : "quiet") + ")");
@@ -410,7 +579,7 @@ final class RcRawJoystick {
             final UsbEndpoint endpoint = findInEndpoint(iface);
             if (endpoint == null) {
                 Log.w(TAG, "raw joystick: no IN endpoint on interface " + iface.getId());
-                return;
+                return 0;
             }
 
             final int size = Math.max(endpoint.getMaxPacketSize(), 16);
@@ -459,7 +628,14 @@ final class RcRawJoystick {
                         continue;
                     }
                     if (done != request) {
-                        continue;   // a different request completed
+                        // A different request completed. Nothing came to us, so this counts as
+                        // silence like a timeout does - otherwise a stream that stopped would
+                        // spin here for ever and never reach the restart that follows a stop.
+                        if (System.currentTimeMillis() - lastReportMs > SILENT_LIMIT) {
+                            Log.w(TAG, "raw joystick: no reports for " + SILENT_LIMIT + " ms");
+                            break;
+                        }
+                        continue;
                     }
                     length = buffer.position();
                     System.arraycopy(buffer.array(), 0, frame, 0, Math.min(length, frame.length));
@@ -503,8 +679,9 @@ final class RcRawJoystick {
             }
 
             Log.i(TAG, "raw joystick: stopped after " + reports + " report(s)");
+            return reports;
         } finally {
-            sOwned = false;
+            releaseOwnership();
             connection.releaseInterface(iface);
             connection.close();
             if (sVerbose) {
@@ -543,6 +720,10 @@ final class RcRawJoystick {
 
         if (!sOwned) {
             sOwned = true;
+            synchronized (RcRawJoystick.class) {
+                sRestarts = 0;
+                sRestartDelayMs = RESTART_MIN_MS;
+            }
             Log.i(TAG, "raw joystick: the sticks, dials and buttons now come from the "
                     + "raw reports");
         }
