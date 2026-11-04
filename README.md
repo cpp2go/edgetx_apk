@@ -250,11 +250,27 @@ reader delivers is never counted twice. That is what gives C1/C2/C3 a reader on 
 remote whose Boolean keys never answer, without the `READ_LOGS` grant the log
 path needs.
 
-The SDK's snapshot is the **first** callback of a listener, not every callback
-whose old value is null: the SDK drops a key to null in a wave and re-delivers it
-with a null old value, and reading that as a snapshot swallowed the first press
-after every wave — which is exactly what the buttons no other reader covers
-(pause, C1..C3, takeoff) looked like while it happened.
+The edge is what a listener acts on, not the position of the callback: a press
+is `true` after anything but `true`, and it counts even as a key's *first*
+callback. The SDK drops a key to null in a wave and re-delivers it with a null
+old value (`true` after null is a press, not a snapshot), and a key that has no
+cached value to open the subscription with used to have its first press swallowed
+as the snapshot it never was — which is one of the two ways the takeoff button
+could look dead.
+
+The takeoff button — the one with the red/green LED — is `SA` on the Plus family.
+On the RC Plus 2 the SDK publishes it as `KeyRCAuthLedButtonDown` (one ~200 ms
+pulse per press). The RC Plus has not been seen to answer that key, so the same
+switch is read three ways there: the listener, the SDK's cached value (polled
+with the sticks, one key per 200 ms) and a name in the remote's own log that
+reads like takeoff (`TAKEOFF`, `TAKEOFF_LANDING`, `ONEKEYTAKEOFF`, `AUTHLED`…) —
+that log is already the reader for its C1/C2/C3. The name that matched is logged
+the first time, so one run says which one it was:
+
+```
+dji: the remote's own log calls the takeoff button 'TAKEOFF_LANDING'
+dji: switch 0 (takeoff) -> high [from log]
+```
 
 Every button the app does not map is logged once (`unmapped button keycode 131
 (F5)`, `the remote logged an unknown button 'PLAYBACK'`), which is how a new

@@ -1443,21 +1443,29 @@ public final class DjiMsdkBridge {
                         public void onValueChange(Boolean oldValue, Boolean newValue) {
                             noteKeyValue(label, newValue);
                             if (first) {
-                                // A snapshot, not a press: see the note above - this is the
-                                // measurement, not a decision.
+                                // The SDK usually opens a subscription with the cached value -
+                                // see the note above. Logged, but not acted on by itself: the
+                                // edge test below decides, so a snapshot of "not pressed" does
+                                // nothing while one of "pressed" counts, and a key that has no
+                                // cached value to deliver at all does not lose its first press
+                                // as the snapshot it never was.
                                 first = false;
                                 Log.i(TAG, "dji: " + label + " initial snapshot " + newValue);
-                                return;
                             }
-                            // Every callback after the first is an edge, including the one that
-                            // follows a silent wave. The SDK drops a key to null and re-delivers
-                            // it later with a null oldValue, so "oldValue == null means snapshot"
-                            // also meant "the first press after every wave is a snapshot" - and
-                            // the buttons that had no other reader (pause, C1..C3, takeoff) then
-                            // looked dead for as long as the waves lasted. A null newValue is a
-                            // release, which this reader ignores anyway.
-                            buttonEdge(index, label, RcButtons.SOURCE_SDK,
-                                    Boolean.TRUE.equals(newValue));
+                            // The edge is a change to "pressed", not "the first callback after
+                            // the snapshot": a key that never pushes a snapshot used to have its
+                            // very first press swallowed as one - which is what a takeoff button
+                            // that does nothing on the RC Plus looks like. A null oldValue comes
+                            // back after a silent wave (the key was dropped and re-delivered), and
+                            // a press there is still a press. A null newValue is a release, which
+                            // this reader ignores anyway.
+                            if (Boolean.TRUE.equals(newValue)) {
+                                if (!Boolean.TRUE.equals(oldValue)) {
+                                    buttonEdge(index, label, RcButtons.SOURCE_SDK, true);
+                                }
+                            } else if (oldValue != null) {
+                                buttonEdge(index, label, RcButtons.SOURCE_SDK, false);
+                            }
                         }
                     };
             KeyManager.getInstance().listen(key, OWNER, listener);
@@ -1465,6 +1473,22 @@ public final class DjiMsdkBridge {
         } catch (Throwable t) {
             Log.w(TAG, "dji: " + label + " listen failed", t);
         }
+    }
+
+    /**
+     * One press of the takeoff button seen through the SDK's cached value - see the poll in
+     * {@link #pollLoop}. The cache says "pressed" now and "not pressed" again a moment later;
+     * only the first half is acted on, as a tap with no release behind it (the same shape the
+     * remote's own log has), so a value that sticks at "pressed" costs one toggle rather than a
+     * switch that stays down - and a copy of the very same press arriving from the listener is
+     * merged instead of toggling SA twice.
+     */
+    private static void takeoffPressed(int source, String how) {
+        if (RcButtons.tap(SW_SA, source) != RcButtons.PRESS) {
+            return;
+        }
+        Log.i(TAG, "dji: takeoff pressed (seen by the " + how + ")");
+        toggleSwitch(SW_SA, "takeoff", source);
     }
 
     /**
@@ -1963,9 +1987,24 @@ public final class DjiMsdkBridge {
         // The buttons are not polled: a press is an event, so the cache holds nothing to read
         // between presses, and during a wave it holds null - the log reader (RcDpadLog) is what
         // covers the buttons the SDK drops, and RcButtons merges the two where both see a press.
+        // The one exception is below: the takeoff button, which on the RC Plus has no other
+        // reader at all.
         final DJIKey<RCFlightModeSwitch> flightModeKey =
                 createKeyOf(DJIRemoteControllerKey.KeyFlightModeSwitchState);
         RCFlightModeSwitch lastFlightMode = null;
+
+        // The takeoff / LED button, polled - and only where SA is that button (see
+        // RcModel.goHomeLands). It is the one control with no second reader of its own: the
+        // raw reports do not carry it and no Android key code stands behind it, so unless the
+        // remote's own log names it (see onDpadPress) a silent listener leaves it dead. The
+        // listener subscribed in listenSwitches() is what drives SA on the RC Plus 2, but the
+        // RC Plus has not been seen to answer that key, so the cache is sampled as well - a
+        // press-only key does hold its last value there, which is what makes this worth doing.
+        // It is acted on only when the value changes to "pressed", so a cache that sticks at
+        // "pressed" costs one toggle, never a switch held down.
+        final DJIKey<Boolean> takeoffKey = REMOTE.goHomeLands
+                ? null : createKeyOf(DJIRemoteControllerKey.KeyRCAuthLedButtonDown);
+        Boolean lastTakeoff = null;
 
         // The remote's own GPS used to be listened for here as KeyRcGPSInfo, which reports as
         // supported on the RC Pro and then never delivers anything (measured with the probe, like
@@ -2015,6 +2054,20 @@ public final class DjiMsdkBridge {
                 }
             } catch (Throwable t) {
                 // A key with no handler yet: the listener will say so, once.
+            }
+
+            if (takeoffKey != null) {
+                try {
+                    final Boolean pressed = manager.getValue(takeoffKey);
+                    if (pressed != null && !pressed.equals(lastTakeoff)) {
+                        lastTakeoff = pressed;
+                        if (pressed) {
+                            takeoffPressed(RcButtons.SOURCE_HW, "poll");
+                        }
+                    }
+                } catch (Throwable t) {
+                    // No handler for this key on this remote: the listener is all there is then.
+                }
             }
             try {
                 Thread.sleep(POLL_INTERVAL_MS);
@@ -2311,8 +2364,8 @@ public final class DjiMsdkBridge {
             // modifier instead - the RC Plus 2's H key and, since it is the same button here,
             // the RC Plus's return-home button - nothing may move SA: the SDK is what counts
             // those presses (nativeOnDjiGoHome), and counting the log's copy as well would arm
-            // the trim mode on half the clicks it takes. SA is the takeoff button there, and
-            // the log has no name for that one.
+            // the trim mode on half the clicks it takes. SA is the takeoff button there, and a
+            // takeoff-shaped name for it is handled by the default branch below.
             case "GOHOME":
                 if (!REMOTE.goHomeLands) return;
                 index = SW_SA;    label = "landing"; break;
@@ -2331,6 +2384,22 @@ public final class DjiMsdkBridge {
             case "SHUTTER": case "FOCUS": case "RECORD":
                 return;
             default:
+                // The takeoff button, the one with the red/green LED. On the RC Plus 2 the SDK
+                // key for it (KeyRCAuthLedButtonDown) is what drives SA; the RC Plus has not
+                // been measured for that key, and its own log is already the reader that covers
+                // the buttons the SDK does not deliver there (C1/C2/C3), so a takeoff-shaped
+                // name in that log drives the same switch. Only where SA *is* the takeoff
+                // button: on the Pro family SA is the landing button (RcModel.goHomeLands).
+                if (!REMOTE.goHomeLands && isTakeoffName(name)) {
+                    if (sTakeoffName == null) {
+                        sTakeoffName = name;
+                        Log.i(TAG, "dji: the remote's own log calls the takeoff button '"
+                                + name + "'");
+                    }
+                    index = SW_SA;
+                    label = "takeoff";
+                    break;
+                }
                 // Something this app has never seen: worth one line, so a new control can be
                 // identified from the log rather than guessed at.
                 announceDpad(name);
@@ -2348,6 +2417,23 @@ public final class DjiMsdkBridge {
 
     /** One log line the first time each unknown action turns up. */
     private static final java.util.Set<String> sDpadSeen = new java.util.HashSet<>();
+
+    /** The name the takeoff button turned out to have in the remote's own log, once seen. */
+    private static String sTakeoffName;
+
+    /**
+     * Whether a name from the remote's own log reads like its takeoff / LED button. The log
+     * names each control with its own {@code ACTION_KEY_*} constant, and this is the one whose
+     * name is not known - the RC Plus is the remote whose SDK key for the button has not been
+     * seen to answer, and it is the only one that needs this reader. Matching on the word
+     * instead of on one exact spelling is deliberate: the constant could be TAKEOFF,
+     * TAKEOFF_LANDING or ONEKEYTAKEOFF. The name that matched is logged the first time, so a
+     * log always says which one it was.
+     */
+    private static boolean isTakeoffName(String name) {
+        return name.contains("TAKEOFF") || name.contains("TAKE_OFF")
+                || name.contains("AUTHLED") || name.contains("AUTH_LED");
+    }
 
     /** Kept for {@link #announceDpad}: a Toast needs a context, the reader has none. */
     private static Application sApp;
