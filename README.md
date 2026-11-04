@@ -145,6 +145,21 @@ That reader exists only with the USB permission for the joystick, which the app
 asks for while its window is up and remembers once it is granted. Without it the
 sticks come from the SDK alone - and while DJI Fly is running, they stop with it.
 
+Only frames that carry the six axes are used. The endpoint also delivers other
+reports, and one of those decoded as a stick position is six zeroes: -100% on all
+four stick channels, with the interface still claimed so the SDK's copies are
+ignored too. A frame is therefore used only when its payload reads like the stick
+report measured here - the full 18 bytes, with at least four of the six axis
+fields inside their travel. Anything else is logged once with its bytes and
+skipped, and the interface is given back if no stick report arrives at all:
+
+```
+raw joystick: frame 1 is not a stick report (only 0 of 6 axes read like a stick
+    (LH=0 LV=0 RH=0 RV=0 dialL=0 dialR=0, id 02 0E), ignored: 02 0E 3A 01 00 ...
+raw joystick: nothing usable for 1000 ms (240 frame(s) ignored), giving the
+    interface back
+```
+
 ### Remote-controller buttons
 
 Which switch a button drives is a property of the remote, not of the button:
@@ -466,6 +481,19 @@ launchers shrink into the safe zone and wrap in their own shape.
   restarting it in 1000 ms` followed by `claimed` is the app putting that reader back. Without
   that permission they come from the SDK alone, which DJI Fly starves while it runs - so the USB
   dialog for "DJI Virtual Joystick" must be allowed, not refused.
+* **The sticks sit at -100% and do not move.** All four stick channels at their bottom is the
+  raw reader being fed frames that are not stick positions - every frame the endpoint delivered
+  used to be decoded as one, so a status report pinned the sticks to the bottom and kept the
+  SDK's copies switched off at the same time. Such frames are now skipped, and the log says
+  what they were:
+
+  ```
+  raw joystick: frame 1 is not a stick report (only 0 of 6 axes read like a stick (...), id 02 0E), ignored: ...
+  raw joystick: nothing usable for 1000 ms (240 frame(s) ignored), giving the interface back
+  ```
+
+  If the sticks still do not move, those two lines are what a report needs: they hold the
+  bytes the device sends instead of the stick report while it is linked to an aircraft.
 * **The UI is blank / the process dies right after launch.** Look for a
   tombstone first: `adb logcat -b crash`.
 * **`Gradle requires JVM 17 or later`.** Set `JAVA_HOME` (see *Building*).

@@ -68,6 +68,14 @@ import java.util.concurrent.TimeoutException;
  *        from the SDK.
  * </pre>
  *
+ * <p><b>What is not the report is not decoded.</b> A frame is used only when its payload looks
+ * like the report measured here - the six axis fields all sitting inside their travel (see
+ * {@link #isStickReport}). The endpoint carries more than one kind of report, and a frame of
+ * another kind read as axes is six zeroes, which is -100% on all four sticks; that is the
+ * state in which the sticks "do nothing and stay at the lowest position", and it also kept
+ * the interface claimed, so the SDK could not cover for it. Frames that fail the check are
+ * logged with their bytes and skipped.
+ *
  * <p><b>How it is used.</b> The six axes are pushed into exactly the entry points the SDK
  * uses ({@link DjiMsdkBridge#nativeOnDjiStick}, {@link DjiMsdkBridge#nativeOnDjiDial}), and
  * so are the buttons the reports carry, so nothing downstream changes. The SDK keeps
@@ -111,6 +119,41 @@ final class RcRawJoystick {
 
     private static final int BUTTON_FIRST = AXIS_FIRST + AXIS_COUNT * 2;   // 16
     private static final int BUTTON_LAST = BUTTON_FIRST + 1;               // 17
+
+    /**
+     * Byte 0 and byte 1 of the report the six axes are in: 0x02 is the report id and 0x0E is
+     * the same marker in every one of the 71 847 reports measured. They do not decide whether
+     * a frame is used - the payload does, see {@link #isStickReport} - but a stick report that
+     * arrives under another id is said once in the log (see {@link #noteReportId}).
+     */
+    private static final int REPORT_ID = 0x02;
+    private static final int REPORT_MARK = 0x0E;
+
+    /**
+     * How far an axis may sit from {@link #AXIS_CENTRE} and still be a stick reading. The six
+     * axes measured exactly +-660 at full deflection; the margin is for a remote whose
+     * calibration is a little wider.
+     */
+    private static final int AXIS_TRAVEL_MAX = 900;
+
+    /**
+     * How many of the six axis fields have to read like a stick before a frame is used.
+     * Every one of them does in the report measured; the two that may be off are for a remote
+     * whose calibration is wider than {@link #AXIS_TRAVEL_MAX}, not for a frame of another
+     * kind - a frame that is not a stick report has none of them inside it.
+     */
+    private static final int AXIS_MIN_INSIDE = AXIS_COUNT - 2;
+
+    /**
+     * How long a freshly claimed interface may deliver nothing but frames this reader cannot
+     * use before it is given back. The stick report is the same stream at 400 frames a second,
+     * so a second is hundreds of frames; holding the interface longer than that for a stream
+     * that carries no stick report only keeps the remote's own readers away from it.
+     */
+    private static final int STARTUP_GRACE_MS = 1000;
+
+    /** A frame this reader cannot decode is reported once per this interval, not per frame. */
+    private static final int REJECT_LOG_MS = 10000;
 
     /**
      * Sign of each axis, in the order of the report (left H, left V, right H, right V,
@@ -230,6 +273,9 @@ final class RcRawJoystick {
     /** Last raw value per axis, so only real changes are pushed. */
     private static final int[] sRawValue = new int[AXIS_COUNT];
     private static final boolean[] sRawSeen = new boolean[AXIS_COUNT];
+
+    /** An axis whose field was outside its travel, reported once (see pushAxes). */
+    private static final boolean[] sAxisSkipped = new boolean[AXIS_COUNT];
 
     /** Last SDK value per axis, for the verbose comparison line. */
     private static final int[] sSdkValue = new int[AXIS_COUNT];
@@ -601,7 +647,7 @@ final class RcRawJoystick {
             long windowStart = start;
             int reports = 0;
             int inWindow = 0;
-            int missing = 0;
+            int ignored = 0;
             long lastReportMs = start;
             int counterBytes = 0;
 
@@ -654,7 +700,28 @@ final class RcRawJoystick {
                     continue;
                 }
 
-                missing = 0;
+                // Only a frame whose payload reads like the six stick axes is used. The device
+                // sends other reports too, and a frame of another kind read as a stick position
+                // is six zeroes - every axis below the bottom of its travel - which is what
+                // pinned all four sticks to -100% and made them look dead. See isStickReport().
+                if (!isStickReport(frame, length)) {
+                    ignored++;
+                    noteUnusable(frame, length);
+                    // A stream of frames this reader cannot use is as good as no stream: it
+                    // must reach the restart below rather than hold the interface for ever -
+                    // and while no stick report has arrived at all, it is given back after
+                    // STARTUP_GRACE_MS so the remote's own readers get the device again.
+                    final long limit = reports == 0 ? STARTUP_GRACE_MS : SILENT_LIMIT;
+                    if (System.currentTimeMillis() - lastReportMs > limit) {
+                        Log.w(TAG, "raw joystick: nothing usable for " + limit
+                                + " ms (" + ignored + " frame(s) ignored), giving the interface"
+                                + " back");
+                        break;
+                    }
+                    continue;
+                }
+
+                noteReportId(frame);
                 reports++;
                 inWindow++;
                 lastReportMs = System.currentTimeMillis();
@@ -678,7 +745,12 @@ final class RcRawJoystick {
                 }
             }
 
-            Log.i(TAG, "raw joystick: stopped after " + reports + " report(s)");
+            if (ignored > 0) {
+                Log.i(TAG, "raw joystick: stopped after " + reports + " report(s), " + ignored
+                        + " frame(s) this reader cannot decode");
+            } else {
+                Log.i(TAG, "raw joystick: stopped after " + reports + " report(s)");
+            }
             return reports;
         } finally {
             releaseOwnership();
@@ -690,6 +762,129 @@ final class RcRawJoystick {
         }
     }
 
+    /**
+     * Whether a frame carries the six axes.
+     *
+     * <p>Until this check existed every frame the endpoint delivered was decoded as if bytes
+     * 4..15 were the six axes and 16..17 the buttons, whatever kind of report it was
+     * ({@link #logFrame} keeps one record per report id, so the device does send more than
+     * one kind). A frame of another kind - a status report, or whatever the joystick sends
+     * while the remote is linked to an aircraft - has zeroes there. Zero is far below the
+     * bottom of every axis's travel, and {@link #pushAxes} turned it into -660, i.e. -100% on
+     * all four stick channels. That is the "sticks do nothing and stay at the lowest
+     * position" state: the reader kept holding the interface, so the SDK's copies of the
+     * sticks were ignored as well, and every frame pinned them to the bottom again.
+     *
+     * <p>A frame is therefore used only when its payload looks like the report measured
+     * here: the full 18 bytes, and at least {@link #AXIS_MIN_INSIDE} of the six axis fields
+     * inside their travel ({@link #AXIS_TRAVEL_MAX}). Everything else is logged with its
+     * bytes and skipped, and it does not take the sticks away from the SDK either. A single
+     * field outside its travel is not published at all - {@link #pushAxes} keeps the last
+     * position for that axis - so no frame can pin one channel to an end of its range either.
+     *
+     * <p>The check is on the payload rather than only on the report id ({@link #REPORT_ID},
+     * {@link #REPORT_MARK}) because the id is not known to survive a change of the remote's
+     * state, while the six axes are the thing this reader is after. A frame of another kind
+     * cannot pass by accident: with four 16-bit fields around 1024 and none at zero, that is
+     * a stick reading, not a status report.
+     */
+    private static boolean isStickReport(byte[] data, int length) {
+        return rejection(data, length) == null;
+    }
+
+    /** Whether a raw field reads like that axis, i.e. inside its travel (see AXIS_TRAVEL_MAX). */
+    private static boolean insideTravel(int value) {
+        return value >= AXIS_CENTRE - AXIS_TRAVEL_MAX && value <= AXIS_CENTRE + AXIS_TRAVEL_MAX;
+    }
+
+    /** Why a frame is not a stick report, or null when it is one. */
+    private static String rejection(byte[] data, int length) {
+        if (length < BUTTON_LAST + 1) {
+            return "only " + length + " byte(s)";
+        }
+        int inside = 0;
+        for (int index = 0; index < AXIS_COUNT; index++) {
+            final int offset = AXIS_FIRST + index * 2;
+            if (insideTravel((data[offset] & 0xFF) | ((data[offset + 1] & 0xFF) << 8))) {
+                inside++;
+            }
+        }
+        if (inside < AXIS_MIN_INSIDE) {
+            return "only " + inside + " of " + AXIS_COUNT + " axes read like a stick ("
+                    + describeRawAxes(data) + ", id " + hex2(data[0] & 0xFF) + ' '
+                    + hex2(data[1] & 0xFF) + ')';
+        }
+        return null;
+    }
+
+    /** The six raw axis fields of a frame, for the log. */
+    private static String describeRawAxes(byte[] data) {
+        final StringBuilder text = new StringBuilder();
+        for (int index = 0; index < AXIS_COUNT; index++) {
+            final int offset = AXIS_FIRST + index * 2;
+            if (index > 0) {
+                text.append(' ');
+            }
+            text.append(AXIS_NAMES[index]).append('=')
+                    .append((data[offset] & 0xFF) | ((data[offset + 1] & 0xFF) << 8));
+        }
+        return text.toString();
+    }
+
+    /** The report id the stick report last arrived under, so a change of it is said once. */
+    private static int sStickReportId = -1;
+
+    /**
+     * Says once when the stick report arrives under an id other than the one measured here.
+     * Nothing depends on the id - the payload is what is decoded - but a remote that changes
+     * it is a state change worth a line in the log, and the line also confirms which report is
+     * feeding the sticks when someone reports a problem.
+     */
+    private static void noteReportId(byte[] data) {
+        final int id = ((data[0] & 0xFF) << 8) | (data[1] & 0xFF);
+        synchronized (RcRawJoystick.class) {
+            if (id == sStickReportId) {
+                return;
+            }
+            sStickReportId = id;
+        }
+        final int measured = (REPORT_ID << 8) | REPORT_MARK;
+        if (id == measured) {
+            Log.i(TAG, "raw joystick: the stick report is the one measured here (id "
+                    + hex2(REPORT_ID) + ' ' + hex2(REPORT_MARK) + ')');
+        } else {
+            Log.w(TAG, "raw joystick: the stick report now arrives with id " + hex2(id >> 8) + ' '
+                    + hex2(id & 0xFF) + " instead of " + hex2(REPORT_ID) + ' '
+                    + hex2(REPORT_MARK) + " - decoded by its payload");
+        }
+    }
+
+    /** Last rejected signature logged, so a stream of foreign frames is one line, not 400 a second. */
+    private static int sRejectedSignature = -1;
+    private static long sRejectedAt;
+    private static int sRejected;
+
+    /**
+     * One line per distinct frame this reader cannot decode, with its bytes. That line is what
+     * a report of dead sticks needs to contain: it says what the device sends in that state
+     * instead of the stick report, and at which offsets.
+     */
+    private static void noteUnusable(byte[] data, int length) {
+        final int signature = ((data[0] & 0xFF) << 8) | (data[1] & 0xFF);
+        final int rejected;
+        synchronized (RcRawJoystick.class) {
+            rejected = ++sRejected;
+            final long now = System.currentTimeMillis();
+            if (signature == sRejectedSignature && now - sRejectedAt < REJECT_LOG_MS) {
+                return;
+            }
+            sRejectedSignature = signature;
+            sRejectedAt = now;
+        }
+        Log.w(TAG, "raw joystick: frame " + rejected + " is not a stick report ("
+                + rejection(data, length) + "), ignored: " + hexDump(data, length));
+    }
+
     /** Hands the six axes to the firmware - the same entry points the SDK uses. */
     private static void pushAxes(byte[] data, int length) {
         if (length < AXIS_FIRST + AXIS_COUNT * 2) {
@@ -698,6 +893,16 @@ final class RcRawJoystick {
         for (int index = 0; index < AXIS_COUNT; index++) {
             final int offset = AXIS_FIRST + index * 2;
             final int value = (data[offset] & 0xFF) | ((data[offset + 1] & 0xFF) << 8);
+            if (!insideTravel(value)) {
+                // A field that is not this axis at all: publishing it would pin the channel to
+                // an end of its range (zero is the bottom), so the last position is kept.
+                if (!sAxisSkipped[index]) {
+                    sAxisSkipped[index] = true;
+                    Log.w(TAG, "raw joystick: " + AXIS_NAMES[index] + '=' + value
+                            + " is outside its travel, keeping the last position");
+                }
+                continue;
+            }
             if (sRawSeen[index] && value == sRawValue[index]) {
                 continue;
             }
