@@ -119,7 +119,6 @@ final class RcProtocolInputs {
         if (winner == null) {
             sWinner = process;
             Log.i(TAG, "rc protocol: " + process + " is the process that answers");
-            EdgeTxApplication.announce("协议进程: " + process);
             return true;
         }
         return winner.equals(process);
@@ -242,13 +241,34 @@ final class RcProtocolInputs {
         }
         for (int axis = 0; axis < STICK_COUNT && axis < sticks.length; axis++) {
             try {
-                DjiMsdkBridge.nativeOnDjiStick(axis, sticks[axis]);
+                DjiMsdkBridge.nativeOnDjiStick(axis, sdkValue(sticks[axis]));
             } catch (Throwable t) {
                 // A missing native side must not kill the reader.
                 return;
             }
         }
     }
+
+    /**
+     * The packet's idea of full deflection in the SDK's: both come from the same hardware, but
+     * the packet reports it as 16 bits around 1024 (so -1024..1024) and the SDK as a number
+     * around zero that stops at 660 (see joystick.cpp, kDjiStickRange - the native side clamps
+     * to that, so an unscaled value would go flat over the last third of the stick's travel).
+     */
+    private static int sdkValue(int packetValue) {
+        if (packetValue > PACKET_STICK_RANGE) {
+            packetValue = PACKET_STICK_RANGE;
+        } else if (packetValue < -PACKET_STICK_RANGE) {
+            packetValue = -PACKET_STICK_RANGE;
+        }
+        return packetValue * SDK_STICK_RANGE / PACKET_STICK_RANGE;
+    }
+
+    /** Half of the packet's 16-bit axis range, so full deflection either way. */
+    private static final int PACKET_STICK_RANGE = 1024;
+
+    /** Half of the SDK's range, which is what the native side takes. */
+    private static final int SDK_STICK_RANGE = 660;
 
     /** One status line when the stream stops or comes back, so a log says which reader has it. */
     private static void watchdog() {

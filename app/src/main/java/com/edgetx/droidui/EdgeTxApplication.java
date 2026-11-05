@@ -11,12 +11,8 @@ import android.content.SharedPreferences;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
-import android.os.Handler;
-import android.os.Looper;
 import android.provider.Settings;
 import android.util.Log;
-import android.view.KeyEvent;
-import android.widget.Toast;
 
 import java.io.File;
 
@@ -63,47 +59,6 @@ public class EdgeTxApplication extends Application {
      */
     private static volatile boolean sUiVisible;
 
-    /** The Application, for the one message the native side has to put on the screen. */
-    private static volatile Context sContext;
-
-    /**
-     * One Android key code nothing is mapped to, said on the screen once per code.
-     *
-     * <p>Called from joystick.cpp, which is where an unmapped key is seen: until now it was
-     * only a log line, and a log line needs adb. This is the same sentence {@link DjiMsdkBridge}
-     * shows for a name from the remote's own log, and it exists for the same reason - a button
-     * that does nothing has to be able to say what it is called, so it can be mapped from the
-     * remote itself instead of guessed at.
-     */
-    static void onUnmappedKey(final int keycode) {
-        announce("按键 keycode " + keycode + " (" + KeyEvent.keyCodeToString(keycode)
-                + ") 还没映射到 EdgeTX");
-    }
-
-    /**
-     * One sentence on the screen, put up by a work thread and gone after a few seconds.
-     *
-     * <p>A message rather than a Toast because the callers are not always on the main thread -
-     * joystick.cpp reports an unmapped key from the input thread, and the raw USB reader from
-     * its own. Deciding what to say once per control is the caller's business.
-     */
-    static void announce(final String message) {
-        final Context context = sContext;
-        if (context == null) {
-            return;
-        }
-        new Handler(Looper.getMainLooper()).post(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    Toast.makeText(context, message, Toast.LENGTH_LONG).show();
-                } catch (Throwable t) {
-                    Log.w(TAG, "could not show '" + message + "'", t);
-                }
-            }
-        });
-    }
-
     @Override
     protected void attachBaseContext(Context base) {
         super.attachBaseContext(base);
@@ -121,8 +76,6 @@ public class EdgeTxApplication extends Application {
     @Override
     public void onCreate() {
         super.onCreate();
-
-        sContext = this;
 
         // Started because a USB device was attached (see UsbAttachActivity and the
         // device filter in the manifest): that is how Android recognises this app as

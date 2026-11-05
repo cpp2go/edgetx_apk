@@ -151,23 +151,6 @@ std::vector<int32_t> g_loggedMappedKeys;  // mapped android key codes already re
 std::vector<int32_t> g_loggedSources;  // deviceId ^ source, logged once each
 std::vector<int32_t> g_dumpedDevices;  // devices whose axes were dumped once
 
-// The one trip this side makes into Java: a key code nothing is mapped to is said on the
-// screen as well as in the log (see EdgeTxApplication.onUnmappedKey), because a button that
-// does nothing is otherwise only visible to someone with adb. Resolved once in init().
-jclass g_announceClass = nullptr;      // com/edgetx/droidui/EdgeTxApplication
-jmethodID g_announceKey = nullptr;     // static void onUnmappedKey(int keycode)
-
-void announce_key(int32_t keycode) {
-    if (g_announceClass == nullptr || g_announceKey == nullptr || g_activity == nullptr) return;
-    JNIEnv* env = nullptr;
-    if (g_activity->vm == nullptr ||
-        g_activity->vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
-        return;   // a thread that is not attached: the log line is all there is then
-    }
-    env->CallStaticVoidMethod(g_announceClass, g_announceKey, static_cast<jint>(keycode));
-    if (env->ExceptionCheck()) env->ExceptionClear();
-}
-
 bool is_joystick_source(int32_t source) {
     if ((source & AINPUT_SOURCE_CLASS_MASK) == AINPUT_SOURCE_CLASS_JOYSTICK) return true;
     // SOURCE_GAMEPAD is a multi-bit constant, so test for all of its bits.
@@ -497,7 +480,6 @@ void log_key_once(int32_t keycode) {
     if (std::find(g_loggedKeys.begin(), g_loggedKeys.end(), keycode) != g_loggedKeys.end()) return;
     g_loggedKeys.push_back(keycode);
     LOGI("joystick: unmapped button keycode %d (%s)", keycode, key_name(keycode));
-    announce_key(keycode);
 }
 
 // Mapped buttons are otherwise silent, which makes it impossible to tell from
@@ -592,23 +574,6 @@ void init(ANativeActivity* activity) {
             return;
         }
         attached = true;
-    }
-
-    // Where an unmapped key code is reported on the screen as well as in the log - see
-    // announce_key(). Cached as a global reference: the calls come from another thread.
-    if (g_announceClass == nullptr) {
-        jclass appCls = env->FindClass("com/edgetx/droidui/EdgeTxApplication");
-        if (appCls != nullptr) {
-            g_announceKey = env->GetStaticMethodID(appCls, "onUnmappedKey", "(I)V");
-            if (g_announceKey != nullptr) {
-                g_announceClass = static_cast<jclass>(env->NewGlobalRef(appCls));
-            }
-            env->DeleteLocalRef(appCls);
-        }
-        if (g_announceKey == nullptr) {
-            env->ExceptionClear();
-            LOGW("joystick: unmapped keys stay in the log only (no EdgeTxApplication hook)");
-        }
     }
 
     jclass deviceCls = env->FindClass("android/view/InputDevice");

@@ -255,13 +255,10 @@ public class RcProtocolService extends Service {
             mKeep = new Object[] {manager, filter, listener, mCreator};
             Log.i(TAG, "rc protocol: listening in " + mProcess + " (cmd " + CMD_SET + '/'
                     + CMD_ID + ')');
-            EdgeTxApplication.announce("协议监听已连上 (" + mProcess + ")");
         } catch (Throwable t) {
-            Log.w(TAG, "rc protocol: DJI's protocol library is not usable in " + mProcess
-                    + " - " + describe(t));
             final String where = dumpApi();
-            EdgeTxApplication.announce("协议不可用 (" + mProcess + "): " + describe(t)
-                    + (where == null ? "" : "\nAPI: " + where));
+            Log.w(TAG, "rc protocol: DJI's protocol library is not usable in " + mProcess
+                    + " - " + describe(t) + (where == null ? "" : " (API: " + where + ')'));
         }
     }
 
@@ -361,10 +358,8 @@ public class RcProtocolService extends Service {
         }
 
         String written = null;
-        boolean first = false;
         for (File file : targets) {
             try {
-                first = !file.exists();
                 final java.io.FileOutputStream out = new java.io.FileOutputStream(file);
                 try {
                     out.write(bytes);
@@ -378,9 +373,6 @@ public class RcProtocolService extends Service {
             } catch (Throwable t) {
                 Log.w(TAG, "rc protocol: could not write " + file + " - " + describe(t));
             }
-        }
-        if (written != null && first) {
-            EdgeTxApplication.announce("协议 API 已写入 " + written);
         }
         return written;
     }
@@ -464,7 +456,6 @@ public class RcProtocolService extends Service {
         }
 
         // Nothing usable: say what the class actually looks like, so the next build can read it.
-        EdgeTxApplication.announce("协议: " + describePack(type));
         Log.w(TAG, "rc protocol: no payload accessor - " + describePack(type));
     }
 
@@ -864,7 +855,6 @@ public class RcProtocolService extends Service {
         if (!mFirstPacket) {
             mFirstPacket = true;
             Log.i(TAG, "rc protocol: the first packet arrived in " + mProcess);
-            EdgeTxApplication.announce("协议已开始收数据 (" + mProcess + ")");
         }
         final Messenger sink = mSink;
         if (sink == null) {

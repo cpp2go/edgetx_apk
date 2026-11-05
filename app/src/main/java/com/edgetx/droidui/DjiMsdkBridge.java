@@ -1507,7 +1507,6 @@ public final class DjiMsdkBridge {
             }
         }
         Log.i(TAG, "dji: the button event names " + what);
-        EdgeTxApplication.announce("遥控器按键事件: " + what);
     }
 
     /** Distinct button actions already said, so one press says one thing. */

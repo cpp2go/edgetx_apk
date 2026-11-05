@@ -175,6 +175,10 @@ library actually looks like is written to `EdgeTX/protocol-api.txt` - SDK level,
 target SDK, the exemption's result, the class list of the copy, and every member
 of the classes involved.
 
+The packet's full deflection is 1024 either way, and the native side takes the SDK's
+660 (see `kDjiStickRange`), so the axes are scaled on the way in - unscaled they
+would go flat over the last third of the stick's travel.
+
 Only the sticks are taken over from it automatically (`RcProtocolInputs`), and only
 while the raw reports are not arriving — the raw reader stays the faster one
 whenever it is alive, and the SDK's 8-14 Hz copy stands aside for as long as these
@@ -365,9 +369,7 @@ also merges the copies it does see.
 
 Every button the app does not map is logged once (`unmapped button keycode 131
 (F5)`, `the remote logged an unknown button 'PLAYBACK'`), which is how a new
-remote's row is filled in; both of those are also shown on the screen once — the
-log name and the Android key code with its Android name — so a button that does
-nothing says what it is called without adb (`按键 keycode 120 (KEYCODE_SYSRQ) 还没映射到 EdgeTX`).
+remote's row is filled in.
 
 ## RF modules
 

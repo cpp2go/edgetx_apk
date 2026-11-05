@@ -1032,8 +1032,7 @@ final class RcRawJoystick {
      * two buttons in it that the RC Plus 2 never sets (see {@link #SHUTTER_BIT} and
      * {@link #ROUND_BIT}). A third remote can put others there, and until this was reported a
      * button that lived in one of them was simply dead - the same silence a button nothing
-     * reports at all makes. The bits go on the screen as well as in the log, so the remote can
-     * name them without adb.
+     * reports at all makes.
      */
     private static void noteUndecodedBits(int first, int second) {
         final String what = String.format(Locale.US, "byte16=0x%02X byte17=0x%02X", first, second);
@@ -1043,7 +1042,6 @@ final class RcRawJoystick {
             }
         }
         Log.i(TAG, "raw joystick: undecoded button bits " + what);
-        EdgeTxApplication.announce("遥控器原始报文里的按键位 " + what + " 还没映射到 EdgeTX");
     }
 
     /** Distinct undecoded bit combinations already reported. */
