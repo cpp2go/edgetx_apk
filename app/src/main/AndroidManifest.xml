@@ -152,6 +152,32 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Keeps an EdgeTX transmitter link to an RF module on a USB serial port" />
         </service>
+
+        <!-- The RC's own control stream (cmd 6/174), read the way DJI's apps read it and used
+             as the fallback reader for the sticks and for every button whose own reader is not
+             delivering - see RcProtocolService.
+
+             The process names are the point of these entries: DJI's protocol library only hands
+             out packets to a process named after one of DJI's own apps, and which one depends on
+             the DJI app the remote normally runs. All four are declared and the first that
+             delivers is used (see RcProtocolInputs). Nothing else runs in those processes -
+             EdgeTxApplication starts no runtime there. -->
+        <service
+            android:name=".RcProtocolService"
+            android:exported="false"
+            android:process="dji.go.v5" />
+        <service
+            android:name=".RcProtocolServiceAgras"
+            android:exported="false"
+            android:process="com.dji.agras" />
+        <service
+            android:name=".RcProtocolServiceAgrasX"
+            android:exported="false"
+            android:process="com.dji.agrasx" />
+        <service
+            android:name=".RcProtocolServiceIndustryPilot"
+            android:exported="false"
+            android:process="com.dji.industry.pilot" />
     </application>
 
 </manifest>

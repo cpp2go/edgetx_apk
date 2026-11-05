@@ -20,6 +20,7 @@ import dji.sdk.keyvalue.value.common.EmptyMsg;
 import dji.sdk.keyvalue.value.common.LocationCoordinate2D;
 import dji.sdk.keyvalue.value.remotecontroller.BatteryInfo;
 import dji.sdk.keyvalue.value.remotecontroller.FiveDimensionPressedStatus;
+import dji.sdk.keyvalue.value.remotecontroller.RcButtonAction;
 import dji.sdk.keyvalue.value.remotecontroller.RcCustomButtonEvent;
 import dji.sdk.keyvalue.value.remotecontroller.RcCustomButtonHardwareStatus;
 import dji.sdk.keyvalue.value.remotecontroller.RCFlightModeSwitch;
@@ -343,6 +344,11 @@ public final class DjiMsdkBridge {
                             customButtonPress(SLOT_ROUND, "round button",
                                     keyDelivering("C4", "round button", SLOT_ROUND >= 0),
                                     newValue.getIsC4Click());
+                            // The event also names the action the button was pressed for, which
+                            // is how a remote that publishes no takeoff key at all reports it -
+                            // see takeoffFromAction.
+                            takeoffFromAction(newValue.getValue());
+                            announceButtonAction(newValue.getValue(), action);
                         }
                     });
             listenFiveDimension();
@@ -1442,6 +1448,13 @@ public final class DjiMsdkBridge {
                         @Override
                         public void onValueChange(Boolean oldValue, Boolean newValue) {
                             noteKeyValue(label, newValue);
+                            if (newValue != null && "takeoff".equals(label)) {
+                                // The remote's own key for the takeoff button is a reader this
+                                // remote really has: whoever else reports the button (the action
+                                // event - see takeoffFromAction) then stands aside instead of
+                                // counting the same press a second time.
+                                sTakeoffKeyAlive = true;
+                            }
                             if (first) {
                                 // The SDK usually opens a subscription with the cached value -
                                 // see the note above. Logged, but not acted on by itself: the
@@ -1476,6 +1489,31 @@ public final class DjiMsdkBridge {
     }
 
     /**
+     * The button-action half of {@code KeyRcButtonEventPro}, said once per distinct value.
+     *
+     * <p>For a button whose Boolean key, Android key code and name in the remote's own log are
+     * all missing - the RC Plus's takeoff button is exactly that - this is the last channel that
+     * could carry it, and a log line is no use on a remote without adb. The name and the number
+     * a press reports are what the mapping needs, so both go on the screen.
+     */
+    private static void announceButtonAction(RcButtonAction value, Integer raw) {
+        if (value == null && (raw == null || raw == 0)) {
+            return;
+        }
+        final String what = String.valueOf(value) + " action=" + raw;
+        synchronized (DjiMsdkBridge.class) {
+            if (!sActionsAnnounced.add(what)) {
+                return;
+            }
+        }
+        Log.i(TAG, "dji: the button event names " + what);
+        EdgeTxApplication.announce("遥控器按键事件: " + what);
+    }
+
+    /** Distinct button actions already said, so one press says one thing. */
+    private static final java.util.Set<String> sActionsAnnounced = new java.util.HashSet<>();
+
+    /**
      * One press of the takeoff button seen through the SDK's cached value - see the poll in
      * {@link #pollLoop}. The cache says "pressed" now and "not pressed" again a moment later;
      * only the first half is acted on, as a tap with no release behind it (the same shape the
@@ -1489,6 +1527,50 @@ public final class DjiMsdkBridge {
         }
         Log.i(TAG, "dji: takeoff pressed (seen by the " + how + ")");
         toggleSwitch(SW_SA, "takeoff", source);
+    }
+
+    /**
+     * True once the SDK has delivered any value for the takeoff button's own key
+     * ({@code KeyRCAuthLedButtonDown}), the snapshot it opens a subscription with included.
+     * False all the way through on a remote that does not publish that key at all - the RC Plus
+     * has no such key in its product capability list - which is what makes
+     * {@link #takeoffFromAction} its reader there.
+     */
+    private static volatile boolean sTakeoffKeyAlive;
+
+    /**
+     * The takeoff / landing button as the SDK's button-action event reports it: the event names
+     * the action a button was pressed for, and the takeoff button's action is
+     * {@code ONEKEYTAKEOFFLANDING}.
+     *
+     * <p>This is the reader for the RC Plus. Its SDK publishes no {@code KeyRCAuthLedButtonDown}
+     * at all (its product capability list has no such key), so the listener there never fires -
+     * and this is the one remaining path that needs neither the remote's own log
+     * ({@code READ_LOGS}) nor a cached value the SDK never fills in. On the RC Plus 2, where
+     * that key is the reader, this copy stands aside from the moment the key first answers,
+     * rather than relying on the merge window alone.
+     *
+     * <p>Merged like the remote's log and the polled cache are, so a press two readers saw is
+     * still one movement of SA, and only where SA <em>is</em> the takeoff button (the Pro family
+     * drives SA from the go-home button, see {@link RcModel#goHomeLands}).
+     */
+    private static void takeoffFromAction(RcButtonAction action) {
+        if (action != RcButtonAction.ONEKEYTAKEOFFLANDING || REMOTE.goHomeLands) {
+            return;
+        }
+        // The remote's own key is the better reader where it works: one callback per edge and
+        // no guessing. This copy is taken over only while that key has never answered at all
+        // (the RC Plus) or is in one of the SDK's silent waves.
+        if (sTakeoffKeyAlive && keyDelivering("takeoff", "takeoff", true)) {
+            return;
+        }
+        if (RcButtons.tap(SW_SA, RcButtons.SOURCE_EVENT) != RcButtons.PRESS) {
+            logMerged("takeoff", RcButtons.SOURCE_EVENT, SW_SA);
+            return;
+        }
+        Log.i(TAG, "dji: takeoff from the button-action event - the remote's own key for that "
+                + "button is not delivering");
+        toggleSwitch(SW_SA, "takeoff", RcButtons.SOURCE_EVENT);
     }
 
     /**
@@ -2092,13 +2174,15 @@ public final class DjiMsdkBridge {
      * <p>While the raw USB reader is feeding the axes (see {@link RcRawJoystick}) this
      * copy is not pushed: it reports the same numbers but up to 90 ms older, so putting it
      * on top of a fresh one would only add jitter. It is still counted here, which is what
-     * keeps the rate line honest about what the SDK alone is doing.
+     * keeps the rate line honest about what the SDK alone is doing. The same applies while
+     * DJI's protocol stream feeds them (see {@link RcProtocolInputs}), which is the reader
+     * that covers the sticks when the raw reports are not arriving.
      */
     private static void dispatchStick(int axis, int raw) {
         noteStickChange(axis);
         markStickSeen(axis);
         RcRawJoystick.noteSdkStick(axis, raw);
-        if (RcRawJoystick.ownsInputs()) {
+        if (RcRawJoystick.ownsInputs() || RcProtocolInputs.ownsSticks()) {
             return;
         }
         try {
@@ -2332,6 +2416,127 @@ public final class DjiMsdkBridge {
         }
     }
 
+    // --------------------------------------- DJI's protocol stream, the last reader --
+    //
+    // The RC's own control packet, read in the dji.go.v5 process by RcProtocolService and handed
+    // here as its 32-bit button/switch field. It is the last reader of them all, and the only one
+    // that needs neither a permission nor the SDK: on the RC Plus the takeoff / ARM button
+    // answers nothing else at all.
+    //
+    // Every button below may move its switch only while the reader that normally delivers it is
+    // not delivering - the same rule the SDK's button event follows (see customButtonPress). That
+    // is what keeps a remote whose own keys work behaving exactly as it did, while a button that
+    // would otherwise be dead still lands.
+    //
+    // Not taken from this packet: the 5-way (the raw reports carry it at 400 Hz and the SDK
+    // behind them, and a press-only copy of a direction would step the rotary twice), the
+    // three-position switch (its two bits are not decoded against a measured position order),
+    // and focus / FN, which have no EdgeTX switch here.
+
+    private static final int PROTO_PAUSE = 1 << 4;
+    private static final int PROTO_GOHOME = 1 << 5;
+    private static final int PROTO_PHOTO = 1 << 6;
+    private static final int PROTO_RECORD = 1 << 8;
+    private static final int PROTO_ARM = 1 << 10;
+    private static final int PROTO_C1 = 1 << 18;
+    private static final int PROTO_C2 = 1 << 19;
+    private static final int PROTO_C3 = 1 << 20;
+    private static final int PROTO_C4 = 1 << 21;
+
+    /** The last button field seen, so a press is an edge and not a level. */
+    private static int sProtocolBits;
+    private static boolean sProtocolSeen;
+
+    /**
+     * One button field from DJI's protocol stream, as the RC firmware reports it.
+     *
+     * <p>The field is a level, one bit per control, refreshed with every packet; a press is the
+     * moment a bit goes from clear to set.
+     */
+    static void onProtocolBits(int bits) {
+        if (!sProtocolSeen) {
+            // The first packet is the state the remote is in, not a press.
+            sProtocolSeen = true;
+            sProtocolBits = bits;
+            return;
+        }
+        final int pressed = bits & ~sProtocolBits;
+        final int released = sProtocolBits & ~bits;
+        sProtocolBits = bits;
+        if ((pressed | released) == 0) {
+            return;
+        }
+        try {
+            dispatchProtocolBits(pressed, released);
+        } catch (Throwable t) {
+            Log.w(TAG, "dji: a protocol button could not be delivered", t);
+        }
+    }
+
+    private static void dispatchProtocolBits(int pressed, int released) {
+        // Every button here is a press-only reader, wired in the same way the remote's own log is:
+        // RcButtons merges its copy with the SDK's, the log's and the raw report's, so one
+        // physical press still moves the switch once - and a press those readers missed is
+        // exactly what this reader is for. (Gating on "is the other reader delivering" was tried
+        // first and is wrong: that state is per remote, not per press, so a single press the log
+        // missed stayed dead - which is what C1/C2/C3 "sometimes doing nothing" was.)
+        if ((pressed & PROTO_ARM) != 0 && !REMOTE.goHomeLands) {
+            takeoffPressed(RcButtons.SOURCE_PROTOCOL, "protocol stream");
+        }
+
+        if ((pressed & PROTO_PAUSE) != 0) {
+            protocolPress(SLOT_PAUSE, "pause");
+        }
+        if ((pressed & PROTO_RECORD) != 0) {
+            protocolPress(SLOT_VIDEO, "video");
+        }
+        if ((pressed & PROTO_C1) != 0) {
+            protocolPress(SLOT_C1, "C1");
+        }
+        if ((pressed & PROTO_C2) != 0) {
+            protocolPress(SLOT_C2, "C2");
+        }
+        if ((pressed & PROTO_C3) != 0) {
+            protocolPress(SLOT_C3, "C3");
+        }
+        if ((pressed & PROTO_C4) != 0) {
+            protocolPress(SLOT_ROUND, "round button");
+        }
+
+        if ((pressed & PROTO_GOHOME) != 0) {
+            if (REMOTE.goHomeLands) {
+                // The landing switch, driven the way the remote's own log drives it.
+                protocolPress(SW_SA, "landing");
+            } else {
+                // The H key: the press is counted exactly as the SDK's own callback counts it.
+                Log.i(TAG, "dji: go-home from DJI's protocol stream");
+                nativeOnDjiGoHome();
+            }
+        }
+
+        // The photo button is a switch that steps on every press and both of its edges are in
+        // this packet, so it goes through the same latch the other two readers use.
+        if ((pressed & PROTO_PHOTO) != 0) {
+            shutterEdge(true, RcButtons.SOURCE_PROTOCOL);
+        }
+        if ((released & PROTO_PHOTO) != 0) {
+            shutterEdge(false, RcButtons.SOURCE_PROTOCOL);
+        }
+    }
+
+    /** One press from DJI's protocol stream; RcButtons drops it if another reader had it too. */
+    private static void protocolPress(int index, String label) {
+        if (index < 0) {
+            return;
+        }
+        if (RcButtons.tap(index, RcButtons.SOURCE_PROTOCOL) != RcButtons.PRESS) {
+            logMerged(label, RcButtons.SOURCE_PROTOCOL, index);
+            return;
+        }
+        Log.i(TAG, "dji: " + label + " from DJI's protocol stream");
+        toggleSwitch(index, label, RcButtons.SOURCE_PROTOCOL);
+    }
+
     /**
      * One press of a button the remote reported in its own log - see RcDpadLog for why that log
      * is the reliable reader for these and not the SDK.
@@ -2343,7 +2548,24 @@ public final class DjiMsdkBridge {
      * joystick's raw USB reports, and for the two camera buttons the raw bit is the reliable
      * reader on this remote - see onRawShutter and onRawRecordButton.
      */
+    /** One log line the first time the protocol stream makes the log step aside. */
+    private static boolean sLogStoodAside;
+
     static void onDpadPress(final String name) {
+        // DJI's own protocol stream reports every one of these buttons with its real press
+        // timing (see onProtocolBits), while this log line is only written at the *release*.
+        // Where the stream is delivering there is nothing left for the log to add: its copy is a
+        // second, later press of the same button, which is what a long press turned into two
+        // toggles - the "C1/C2/C3 sometimes do nothing" report. So the log is the reader only
+        // while the protocol stream is not delivering (a remote whose library does not answer,
+        // or before the first packet).
+        if (RcProtocolInputs.delivering()) {
+            if (!sLogStoodAside) {
+                sLogStoodAside = true;
+                Log.i(TAG, "dji: the remote's own log stands aside for DJI's protocol stream");
+            }
+            return;
+        }
         // Whether this reader may move a switch at all is the remote's own business (see
         // RcModel.logDrivesSwitches). On the RC Plus 2 the SDK and Android key codes already
         // deliver every one of these buttons, so a copy from the log would only ever be a
@@ -2481,3 +2703,4 @@ public final class DjiMsdkBridge {
                 + " press=" + status.getMiddlePressed();
     }
 }
+

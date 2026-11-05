@@ -73,6 +73,8 @@ final class RcButtons {
     static final int SOURCE_EVENT = 3;
     /** The SDK's periodic hardware state, {@code KeyRcHardwareState} - a level, not an edge. */
     static final int SOURCE_HW = 4;
+    /** DJI's own protocol stream, the RC firmware's control packet - see RcProtocolService. */
+    static final int SOURCE_PROTOCOL = 5;
 
     /** The edge is news: the caller acts on it. */
     static final int PRESS = 0;
@@ -123,6 +125,7 @@ final class RcButtons {
             case SOURCE_LOG: return "log";
             case SOURCE_EVENT: return "event";
             case SOURCE_HW: return "hw";
+            case SOURCE_PROTOCOL: return "protocol";
             default: return "sdk";
         }
     }

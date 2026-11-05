@@ -145,6 +145,89 @@ That reader exists only with the USB permission for the joystick, which the app
 asks for while its window is up and remembers once it is granted. Without it the
 sticks come from the SDK alone - and while DJI Fly is running, they stop with it.
 
+A third reader covers exactly that hole: DJI's own protocol stream, the one its
+apps read the remote's controls from. `RcProtocolService` subscribes to it the way
+DJI's apps do - `ProtocolManager.getDefault()`, a pack rule for `cmd(6, 174)`, and
+a listener - and runs in a process named `dji.go.v5`, because that library only
+hands packets to a process named after one of DJI's own apps. It needs no
+permission, no SDK and no USB interface, and the 17-byte packet carries the same
+six axes (16-bit, centred on 1024) the raw report does, in its own order:
+
+```
+0-3   button/switch bits     4  status
+5-6   right horizontal       7-8   right vertical
+9-10  left vertical         11-12  left horizontal
+13-14 left wheel           15-16  right wheel
+```
+
+Those classes are not public API, and on a remote whose firmware keeps them on the
+boot class path an app targeting SDK 33 sees **every one of their members filtered
+out** of reflection: `ProtocolManager` comes back with no members at all, and
+`Pack` with nothing but its `Parcelable` overrides. DJI's own apps are not
+affected - the reference implementation targets SDK 28 - and the exemption they
+use (`VMRuntime.setHiddenApiExemptions`) cannot even be reached at 33, so the
+classes are read from a **copy of the dex they live in**: the dex containing them
+is taken out of `/system/framework/framework.jar` into the app's cache and loaded
+through a `DexClassLoader` whose parent refuses this one package, and classes
+loaded that way belong to the app's domain, where nothing is filtered. The
+firmware's own copy stays the fallback. When the subscription fails, what the
+library actually looks like is written to `EdgeTX/protocol-api.txt` - SDK level,
+target SDK, the exemption's result, the class list of the copy, and every member
+of the classes involved.
+
+Only the sticks are taken over from it automatically (`RcProtocolInputs`), and only
+while the raw reports are not arriving — the raw reader stays the faster one
+whenever it is alive, and the SDK's 8-14 Hz copy stands aside for as long as these
+packets do arrive. The dials keep the readers they had:
+
+```
+sticks: DJI's protocol stream attached as the fallback (process dji.go.v5)
+sticks: DJI's protocol stream is delivering
+sticks: the protocol stream went quiet - the sticks fall back to the raw reports
+```
+
+The packet's button field is a reader of its own for **every button the other
+readers can miss**, which is what the RC Plus's takeoff / ARM button needed —
+neither its SDK key nor the remote's own log ever answers there — and what
+C1/C2/C3 on that remote needed as well, since the log drops a press now and
+then. Bit 10 of the field is the ARM button, and the rest is laid out like this
+(measured from DJI's own parser):
+| bit | control | bit | control |
+|-----|---------|-----|---------|
+| 4 | pause | 11-15 | 5-way centre/right/left/down/up |
+| 5 | go-home | 16-17 | 3-position switch code |
+| 6 | photo | 18-21 | C1 / C2 / C3 / C4 |
+| 7 | focus | | |
+| 8 | record (video) | | |
+| 9 | FN | | |
+| **10** | **takeoff / ARM (授权灯)** | | |
+
+Each of those moves its switch only while the reader that normally delivers it is
+not delivering — the SDK key, the remote's own log while that is what moves
+switches, or the raw reports — so a remote whose own keys work keeps behaving
+exactly as it did, and a button that would otherwise be dead still lands:
+
+```
+dji: takeoff pressed (seen by the protocol stream)
+dji: C1 from DJI's protocol stream
+dji: pause from DJI's protocol stream, merged with the log one
+```
+
+While those packets are arriving (within the last second) the remote's own log
+stands aside entirely: its line is only written at the *release*, so with both
+readers wired a long press became two toggles — which is what "C1/C2/C3 sometimes
+do nothing" was. The log stays as the reader for a remote whose protocol library
+does not answer, and comes back by itself a second after the packets stop:
+
+```
+dji: the remote's own log stands aside for DJI's protocol stream
+```
+
+Not taken from the packet: the 5-way (the raw reports carry it at 400 Hz with the
+SDK behind them, and a press-only copy of a direction would step the rotary
+twice), the three-position switch (its two bits are not decoded against a measured
+position order), and focus / FN, which have no EdgeTX switch here.
+
 Only frames that carry the six axes are used. The endpoint also delivers other
 reports, and one of those decoded as a stick position is six zeroes: -100% on all
 four stick channels, with the interface still claimed so the SDK's copies are
@@ -261,22 +344,30 @@ could look dead.
 The takeoff button — the one with the red/green LED — is `SA` on the Plus family.
 On the RC Plus 2 the SDK publishes it as `KeyRCAuthLedButtonDown` (one ~200 ms
 pulse per press). The RC Plus has not been seen to answer that key, so the same
-switch is read three ways there: the listener, the SDK's cached value (polled
-with the sticks, one key per 200 ms) and a name in the remote's own log that
+switch is read four ways there: the listener, the SDK's cached value (polled
+with the sticks, one key per 200 ms), the action the SDK's button event names
+(`KeyRcButtonEventPro` → `RcButtonAction.ONEKEYTAKEOFFLANDING`, which is the one
+path that needs no `READ_LOGS`) and a name in the remote's own log that
 reads like takeoff (`TAKEOFF`, `TAKEOFF_LANDING`, `ONEKEYTAKEOFF`, `AUTHLED`…) —
 that log is already the reader for its C1/C2/C3. The name that matched is logged
 the first time, so one run says which one it was:
 
 ```
-dji: the remote's own log calls the takeoff button 'TAKEOFF_LANDING'
+dji: the remote's own log calls the takeoff button 'AUTH_LED'
 dji: switch 0 (takeoff) -> high [from log]
+dji: takeoff from the button-action event - the remote's own key for that button is not delivering
 ```
+
+The action-event copy is taken only while the remote's own key has never
+answered at all or is in one of the SDK's silent waves, so on the RC Plus 2 — where
+that key is the reader — the event cannot move `SA` twice for one press: RcButtons
+also merges the copies it does see.
 
 Every button the app does not map is logged once (`unmapped button keycode 131
 (F5)`, `the remote logged an unknown button 'PLAYBACK'`), which is how a new
-remote's row is filled in; a name that comes from the remote's own log is also
-shown on the screen once, so a button that does nothing says what it is called
-without adb.
+remote's row is filled in; both of those are also shown on the screen once — the
+log name and the Android key code with its Android name — so a button that does
+nothing says what it is called without adb (`按键 keycode 120 (KEYCODE_SYSRQ) 还没映射到 EdgeTX`).
 
 ## RF modules
 

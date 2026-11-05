@@ -190,6 +190,10 @@ final class RcRawJoystick {
     private static final int SHUTTER_BIT = 0x08;
     private static final int ROUND_BIT = 0x01;
 
+    /** Byte 16's bits, the ones decoded above, and byte 17's five 5-way bits. */
+    private static final int KNOWN_FIRST_BITS = RTN_BIT | RECORD_BIT | SHUTTER_BIT | ROUND_BIT;
+    private static final int KNOWN_SECOND_BITS = 0x1F;
+
     /**
      * If the device stops delivering for this long the reader gives the interface back
      * and the SDK takes the axes over again. The device sends all the time, so a gap this
@@ -962,6 +966,16 @@ final class RcRawJoystick {
                     + namedButtons(first, second));
         }
 
+        // A bit in these two bytes that nothing here decodes is a button this report carries
+        // and the app does not - on a remote the report layout was never measured on, that is
+        // exactly where a dead button turns up. Said once per combination, on the screen as
+        // well as in the log, so it can be identified without adb.
+        final int unknownFirst = first & ~KNOWN_FIRST_BITS;
+        final int unknownSecond = second & ~KNOWN_SECOND_BITS;
+        if ((unknownFirst | unknownSecond) != 0) {
+            noteUndecodedBits(unknownFirst, unknownSecond);
+        }
+
         if (((wasFirst ^ first) & RTN_BIT) != 0) {
             try {
                 nativeOnRawKey(KeyEvent.KEYCODE_BACK, (first & RTN_BIT) != 0);
@@ -1010,6 +1024,30 @@ final class RcRawJoystick {
             }
         }
     }
+
+    /**
+     * Button bits this report carries and nothing here decodes, said once per combination.
+     *
+     * <p>The report's layout was measured on the RC Plus 2, and the RC Pro turned out to put
+     * two buttons in it that the RC Plus 2 never sets (see {@link #SHUTTER_BIT} and
+     * {@link #ROUND_BIT}). A third remote can put others there, and until this was reported a
+     * button that lived in one of them was simply dead - the same silence a button nothing
+     * reports at all makes. The bits go on the screen as well as in the log, so the remote can
+     * name them without adb.
+     */
+    private static void noteUndecodedBits(int first, int second) {
+        final String what = String.format(Locale.US, "byte16=0x%02X byte17=0x%02X", first, second);
+        synchronized (RcRawJoystick.class) {
+            if (!sUndecodedBits.add(what)) {
+                return;
+            }
+        }
+        Log.i(TAG, "raw joystick: undecoded button bits " + what);
+        EdgeTxApplication.announce("遥控器原始报文里的按键位 " + what + " 还没映射到 EdgeTX");
+    }
+
+    /** Distinct undecoded bit combinations already reported. */
+    private static final java.util.Set<String> sUndecodedBits = new java.util.HashSet<>();
 
     /** The buttons a frame carries, named - for the verbose log only. */
     private static String namedButtons(int first, int second) {

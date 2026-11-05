@@ -77,8 +77,9 @@ final class RcModel {
      *       off: the user's return-home button is the 5-way's trim modifier on this remote just
      *       as the H key is on the RC Plus 2, and SA stays the takeoff button with the LED. Its
      *       SDK key ({@code KeyRCAuthLedButtonDown}) is what drives SA on the RC Plus 2, but this
-     *       remote has not been seen to answer it, so the button is read three ways there: the
-     *       SDK listener, the SDK's cached value (polled - see DjiMsdkBridge.pollLoop) and a
+     *       remote publishes no such key at all, so the button is read four ways there: the
+     *       SDK listener, the SDK's cached value (polled - see DjiMsdkBridge.pollLoop), the
+     *       action its button event names ({@code ONEKEYTAKEOFFLANDING}), and a
      *       takeoff-shaped name in the remote's own log, which is already the reader for its
      *       C1/C2/C3. Which name its log uses has not been measured either, so the first one
      *       that matches is logged. Flight mode and pause stay
