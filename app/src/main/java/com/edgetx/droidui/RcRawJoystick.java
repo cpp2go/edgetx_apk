@@ -396,6 +396,7 @@ final class RcRawJoystick {
                 flags |= PendingIntent.FLAG_MUTABLE;
             }
             Log.i(TAG, "raw joystick: asking for permission for " + device.getDeviceName());
+            EdgeTxApplication.hintUsbDefaultOnce(app);
             manager.requestPermission(device, PendingIntent.getBroadcast(app, 0, intent, flags));
         } catch (Throwable t) {
             Log.w(TAG, "raw joystick: could not start", t);

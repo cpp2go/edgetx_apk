@@ -1,3 +1,4 @@
+import org.gradle.api.tasks.compile.JavaCompile
 import java.util.Properties
 
 plugins {
@@ -341,16 +342,30 @@ val buildEdgeTxSimulator = tasks.register("buildEdgeTxSimulator") {
 // ---------------------------------------------------------------------------
 // Reusing an already built simulator library
 //
-// The EdgeTX checkout only builds on a machine that carries the Android patches
-// (see README). With -Pedgetx.skipBuild=true the task above is not run and
-// whatever is already staged in build/edgetx-libs/<abi>/ is packaged as is:
+// The firmware is a fixed dependency of this port: work on the app happens in
+// Java/Kotlin and in the thin host, and none of it needs EdgeTX compiled again.
+// So the task above runs only when a staged library is missing - which is the
+// case on a machine that has never built it, and never otherwise:
 //
-//     gradlew :app:assembleDebug -Pedgetx.skipBuild=true
+//     gradlew :app:assembleRelease                       # packages the staged library
+//     gradlew :app:assembleRelease -Pedgetx.build=true   # rebuilds it first
+//     gradlew :app:assembleRelease -Pedgetx.skipBuild=true
+//
+// The EdgeTX checkout itself only builds on a machine that carries the Android
+// patches (see README); -Pedgetx.dir= points the task at one.
 // ---------------------------------------------------------------------------
-val skipEdgeTxBuild = ((findProperty("edgetx.skipBuild") as String?) ?: "false").toBoolean()
+val forcedSkip = ((findProperty("edgetx.skipBuild") as String?) ?: "false").toBoolean()
+val forcedBuild = ((findProperty("edgetx.build") as String?) ?: "false").toBoolean()
+val stagedEveryAbi = simuAbis.all {
+    File(simuLibsDir.get().asFile, "$it/$simuLibName").isFile
+}
+val skipEdgeTxBuild = forcedSkip || (!forcedBuild && stagedEveryAbi)
 
 if (skipEdgeTxBuild) {
-    logger.lifecycle("EdgeTX build skipped: packaging the libraries staged in ${simuLibsDir.get().asFile}")
+    logger.lifecycle(
+        "EdgeTX build skipped: packaging the libraries staged in ${simuLibsDir.get().asFile}" +
+            " (add -Pedgetx.build=true to rebuild them)"
+    )
 } else {
     tasks.named("preBuild") { dependsOn(buildEdgeTxSimulator) }
 }
@@ -378,4 +393,16 @@ dependencies {
         // NoClassDefFoundError as soon as it is initialised.
         implementation("androidx.core:core:1.13.1")
     }
+}
+
+// ---------------------------------------------------------------------------
+// Source encoding
+//
+// javac reads sources with the platform's default charset, which is GBK on a Chinese
+// Windows: the Chinese text in the app's on-screen messages (the unmapped-button toast,
+// the one-time USB hint) used to be compiled as mojibake and shown as "???" on the
+// remote. Every source file in the project is UTF-8.
+// ---------------------------------------------------------------------------
+tasks.withType<JavaCompile>().configureEach {
+    options.encoding = "UTF-8"
 }

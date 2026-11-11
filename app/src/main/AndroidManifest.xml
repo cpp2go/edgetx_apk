@@ -42,6 +42,17 @@
         android:name="android.hardware.usb.host"
         android:required="false" />
 
+    <!-- Which DJI app this remote runs decides the process name the protocol library answers
+         on (see RcProtocolInputs.installed). Android 11 filters that question to the packages
+         named here, and without it the probe reports "none installed" and all four names are
+         bound instead - correct, but one process per name. -->
+    <queries>
+        <package android:name="dji.go.v5" />
+        <package android:name="com.dji.agras" />
+        <package android:name="com.dji.agrasx" />
+        <package android:name="com.dji.industry.pilot" />
+    </queries>
+
     <!-- RcLinkService: keeps the firmware (and therefore the frames reaching the
          RF module) running after the UI is gone.
 

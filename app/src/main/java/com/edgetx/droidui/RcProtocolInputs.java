@@ -128,15 +128,40 @@ final class RcProtocolInputs {
     private static volatile String sWinner;
 
     /** Called from {@code EdgeTxApplication.startRuntime}. */
-    static void start(Context context) {
+    static void start(final Context context) {
         if (sStarted) {
             return;
         }
         sStarted = true;
         sStartedServices = new java.util.HashSet<>();
-        // Every process name is started; only one of them answers (see fromWinner).
-        for (Class<?> service : SERVICES) {
-            start(context, service);
+        final Context app = context.getApplicationContext() != null
+                ? context.getApplicationContext() : context;
+        final Class<?> service = installed(app);
+        if (service == null) {
+            // Nothing installed to go by: every process name is tried, first that answers wins.
+            for (Class<?> candidate : SERVICES) {
+                start(app, candidate);
+            }
+        } else {
+            // DJI's own app is here, so its process name is the one the library answers on -
+            // the same choice the reference reader makes. The others are not bound: each is a
+            // process of its own, and a name whose app is absent never answers.
+            start(app, service);
+            // A guess that turns out wrong on this firmware costs nothing but a wait: if not a
+            // single packet has arrived, the rest of the names are tried as well.
+            MAIN.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    if (sSeen) {
+                        return;
+                    }
+                    for (Class<?> candidate : SERVICES) {
+                        if (candidate != service) {
+                            start(app, candidate);
+                        }
+                    }
+                }
+            }, FALLBACK_MS);
         }
         MAIN.postDelayed(new Runnable() {
             @Override
@@ -144,6 +169,41 @@ final class RcProtocolInputs {
                 watchdog();
             }
         }, WATCHDOG_MS);
+    }
+
+    /** How long the chosen process name gets before the other three are bound as well. */
+    private static final long FALLBACK_MS = 6000;
+
+    /**
+     * The service whose process is named after the DJI app installed on this remote, if any.
+     *
+     * <p>Which name the protocol library answers on follows the DJI app the remote normally
+     * runs, and nothing documents the rule (see RcProtocolService), so this follows the
+     * reference reader's order: industry, agriculture-x, consumer (DJI Fly), agriculture.
+     */
+    private static Class<?> installed(Context context) {
+        if (isInstalled(context, "com.dji.industry.pilot")) {
+            return RcProtocolServiceIndustryPilot.class;
+        }
+        if (isInstalled(context, "com.dji.agrasx")) {
+            return RcProtocolServiceAgrasX.class;
+        }
+        if (isInstalled(context, "dji.go.v5") && !isInstalled(context, "com.dji.agras")) {
+            return RcProtocolService.class;
+        }
+        if (isInstalled(context, "com.dji.agras")) {
+            return RcProtocolServiceAgras.class;
+        }
+        return null;
+    }
+
+    private static boolean isInstalled(Context context, String pkg) {
+        try {
+            context.getPackageManager().getPackageInfo(pkg, 0);
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     /** The four listeners, one per DJI process name - all of them are tried. */

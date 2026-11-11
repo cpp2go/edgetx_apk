@@ -680,6 +680,7 @@ final class RcModuleSerial {
         }
 
         try {
+            EdgeTxApplication.hintUsbDefaultOnce(appContext());
             sUsbManager.requestPermission(device,
                     PendingIntent.getBroadcast(appContext(), 0, intent, flags));
         } catch (Throwable t) {

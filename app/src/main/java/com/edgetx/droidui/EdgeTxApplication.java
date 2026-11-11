@@ -11,8 +11,11 @@ import android.content.SharedPreferences;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.Settings;
 import android.util.Log;
+import android.widget.Toast;
 
 import java.io.File;
 
@@ -35,6 +38,9 @@ public class EdgeTxApplication extends Application {
     /** Where the USB permission answers that outlive a launch are kept. */
     private static final String USB_PREFS = "usb";
     private static final String PREF_ALLOWED_PREFIX = "allowed:";
+
+    /** Set once the one-time "tick use by default" hint has been shown. */
+    private static final String PREF_DEFAULT_HINT = "defaultHintShown";
 
     /** The notification that leads to the "All files access" page. */
     private static final int SD_ACCESS_NOTIFICATION_ID = 1;
@@ -184,6 +190,47 @@ public class EdgeTxApplication extends Application {
         if (!saved) {
             Log.w(TAG, "usb: could not persist the permission answer for " + identity);
         }
+    }
+
+    /**
+     * Says once, on screen, how to make the USB dialog stop coming back after every boot.
+     *
+     * <p>Android does not keep a USB device grant across a reboot, and no app can ask for one
+     * without a dialog: the grant is the system's, not the app's. What Android <em>does</em>
+     * keep is the device's default app - the "use by default for this USB device" tick in the
+     * dialog, which is offered because this app declares the device in its attach filter (see
+     * {@link UsbAttachActivity}). Ticked once, the system hands the device over at boot with no
+     * dialog at all, which is the only way to "set it up at install time" from here.
+     *
+     * <p>Nothing in this app can tick it: the dialog belongs to the system, and the setting
+     * behind it is only reachable with a signature-level permission. So the hint is the whole
+     * of what is possible, said once - the dialog itself is a better place for it than a screen
+     * the firmware owns, but it cannot be changed.
+     */
+    static void hintUsbDefaultOnce(Context context) {
+        if (context == null) {
+            return;
+        }
+        final SharedPreferences prefs = context.getSharedPreferences(USB_PREFS, MODE_PRIVATE);
+        if (prefs.getBoolean(PREF_DEFAULT_HINT, false)) {
+            return;
+        }
+        prefs.edit().putBoolean(PREF_DEFAULT_HINT, true).apply();
+        Log.i(TAG, "usb: once per install - tick \"use by default for this device\" in the "
+                + "permission dialog, and the system grants the device at boot without asking");
+        final Context app = context.getApplicationContext() != null
+                ? context.getApplicationContext() : context;
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Toast.makeText(app, "USB 授权框里勾选“默认用于此设备”，以后开机就不再询问",
+                            Toast.LENGTH_LONG).show();
+                } catch (Throwable t) {
+                    Log.w(TAG, "usb: could not show the permission hint", t);
+                }
+            }
+        });
     }
 
     /**

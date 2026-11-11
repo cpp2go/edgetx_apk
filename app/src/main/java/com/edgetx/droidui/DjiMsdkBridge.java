@@ -6,6 +6,7 @@ import android.content.SharedPreferences;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.util.Log;
@@ -1806,6 +1807,11 @@ public final class DjiMsdkBridge {
         if (state == null) {
             return;               // UNKNOWN, or a key that went silent
         }
+        if (index == SW_SB) {
+            // The SDK's own copy holds the packet's off for a moment - see
+            // applyProtocolFlightMode.
+            sSdkFlightModeAt = SystemClock.uptimeMillis();
+        }
         applyPosition(index, state);
     }
 
@@ -2428,9 +2434,43 @@ public final class DjiMsdkBridge {
     // would otherwise be dead still lands.
     //
     // Not taken from this packet: the 5-way (the raw reports carry it at 400 Hz and the SDK
-    // behind them, and a press-only copy of a direction would step the rotary twice), the
-    // three-position switch (its two bits are not decoded against a measured position order),
-    // and focus / FN, which have no EdgeTX switch here.
+    // behind them, and a press-only copy of a direction would step the rotary twice), and
+    // focus / FN, which have no EdgeTX switch here.
+
+    /**
+     * The three-position switch, in bits 16..17 of the same field.
+     *
+     * <p>This is the one control the SDK cannot be relied on for while DJI's own app runs: the
+     * flight-mode keys go null in the SDK's quiet spells, the remote's own log has no name for a
+     * switch, and the raw reports do not carry it - which is why SB used to stop working as soon
+     * as DJI Fly was started. The packet keeps reporting it.
+     *
+     * <p>The order is the reference reader's (RC Plus Control 1.15, {@code com.rcplus.keyprobe}:
+     * its native part hands the field back unchanged and the app decodes
+     * {@code (bits >>> 16) & 3} as 2 -> high, 0 -> middle, 1 -> low). "High" is the end DJI's own
+     * flight-mode key calls the top, which this app already maps to +1 (see
+     * {@link #POSITION_TOP_FIRST}), so this table ends the same way round.
+     *
+     * <p>A code of 3 is not a position of a three-position switch and is dropped rather than
+     * guessed at.
+     */
+    private static final int PROTO_SWITCH_SHIFT = 16;
+    private static final int PROTO_SWITCH_MASK = 0x3;
+    private static final int PROTO_SWITCH_UNKNOWN = Integer.MIN_VALUE;
+    private static final int[] PROTO_SWITCH_POSITION = {0, -1, 1, PROTO_SWITCH_UNKNOWN};
+
+    /**
+     * How long the ARM bit has to stay set before the moment it clears counts as a press of its
+     * own.
+     *
+     * <p>The bit is the 授权灯 of the takeoff button, and whether the firmware reports the
+     * button's level (a ~200 ms pulse per press, like the SDK's own key) or the LED's latched
+     * state (high for as long as the remote is armed) has not been measured. A press therefore
+     * always counts when the bit goes high, and a bit that goes low again only counts when it had
+     * been high for longer than a press can last - that is the LED changing state, which is one
+     * more press of the same button. A momentary press is not counted twice by this.
+     */
+    private static final long PROTO_ARM_LATCH_MS = 2000;
 
     private static final int PROTO_PAUSE = 1 << 4;
     private static final int PROTO_GOHOME = 1 << 5;
@@ -2446,17 +2486,22 @@ public final class DjiMsdkBridge {
     private static int sProtocolBits;
     private static boolean sProtocolSeen;
 
+    /** When the ARM bit last went high, 0 while it is clear - see PROTO_ARM_LATCH_MS. */
+    private static long sProtocolArmSetAt;
+
     /**
      * One button field from DJI's protocol stream, as the RC firmware reports it.
      *
      * <p>The field is a level, one bit per control, refreshed with every packet; a press is the
-     * moment a bit goes from clear to set.
+     * moment a bit goes from clear to set. The three-position switch in bits 16..17 is a state
+     * rather than a press, so it is applied on the first packet as well.
      */
     static void onProtocolBits(int bits) {
         if (!sProtocolSeen) {
             // The first packet is the state the remote is in, not a press.
             sProtocolSeen = true;
             sProtocolBits = bits;
+            applyProtocolFlightMode(bits);
             return;
         }
         final int pressed = bits & ~sProtocolBits;
@@ -2466,9 +2511,121 @@ public final class DjiMsdkBridge {
             return;
         }
         try {
+            applyProtocolFlightMode(bits);
+            announceProtocolBits(pressed);
             dispatchProtocolBits(pressed, released);
         } catch (Throwable t) {
             Log.w(TAG, "dji: a protocol button could not be delivered", t);
+        }
+    }
+
+    /**
+     * How long the SDK's own copy of the flight-mode switch keeps the packet from applying it.
+     *
+     * <p>The SDK is the measured reader where it answers, so the packet is the fallback behind
+     * it: every position the SDK delivers holds the packet off for this long, and a stream that
+     * has gone quiet - which is what DJI's own app does to it - lets the packet through. Without
+     * this the two readers would take turns on a firmware whose bit order differs from the one
+     * decoded here, which is a switch that jumps rather than one that is simply the wrong way
+     * round.
+     */
+    private static final long PROTO_SB_SDK_HOLDOFF_MS = 3000;
+
+    /** When the SDK last delivered a flight-mode position, 0 while it never has. */
+    private static long sSdkFlightModeAt;
+
+    /** SB from the packet's own three-position code, which is the only reader it has there. */
+    private static void applyProtocolFlightMode(int bits) {
+        final int code = (bits >>> PROTO_SWITCH_SHIFT) & PROTO_SWITCH_MASK;
+        final int position = PROTO_SWITCH_POSITION[code];
+        if (position == PROTO_SWITCH_UNKNOWN) {
+            return;
+        }
+        final long fromSdk = sSdkFlightModeAt;
+        if (fromSdk != 0 && SystemClock.uptimeMillis() - fromSdk < PROTO_SB_SDK_HOLDOFF_MS) {
+            return;
+        }
+        applyPosition(SW_SB, position);
+    }
+
+    /** Bits already named in the log, one line each, so a log always says what the field carries. */
+    private static final java.util.Set<Integer> sProtocolBitSeen = new java.util.HashSet<>();
+
+    /**
+     * One line the first time each bit of the field is seen set.
+     *
+     * <p>It is what makes the next "this button does nothing" report answerable from a log alone:
+     * the button's bit is named here even when this app has no switch for it, so a remote whose
+     * ARM button turns out to be another bit says so instead of staying a guess.
+     */
+    private static void announceProtocolBits(int pressed) {
+        for (int bit = 0; bit < Integer.SIZE; bit++) {
+            final int mask = 1 << bit;
+            if ((pressed & mask) == 0) {
+                continue;
+            }
+            synchronized (DjiMsdkBridge.class) {
+                if (!sProtocolBitSeen.add(bit)) {
+                    continue;
+                }
+            }
+            Log.i(TAG, "dji: DJI's protocol stream uses button bit " + bit
+                    + " (0x" + Integer.toHexString(mask) + "): " + protocolBitName(bit));
+        }
+    }
+
+    /**
+     * The bit of the field a button from the remote's own log is carried in, or -1 for a name
+     * this packet has no bit for.
+     */
+    private static int protocolBitOf(String name) {
+        switch (name) {
+            case "PAUSE": return 4;
+            case "GOHOME": return 5;
+            case "C1": return 18;
+            case "C2": return 19;
+            case "C3": return 20;
+            case "C4": return 21;
+            default: return isTakeoffName(name) ? 10 : -1;
+        }
+    }
+
+    /**
+     * Whether DJI's protocol stream has been seen to carry this button at all.
+     *
+     * <p>Only such a button is taken away from the remote's own log. A button whose bit never
+     * appears - because this firmware puts it somewhere else, or does not send it - keeps the
+     * log as its reader, which is what "the stream is alive, so everything comes from it" used
+     * to remove.
+     */
+    private static boolean protocolCarries(String name) {
+        final int bit = protocolBitOf(name);
+        if (bit < 0) {
+            return false;
+        }
+        synchronized (DjiMsdkBridge.class) {
+            return sProtocolBitSeen.contains(bit);
+        }
+    }
+
+    /** What each bit of the field is, as far as this app decodes it. */
+    private static String protocolBitName(int bit) {
+        switch (bit) {
+            case 4: return "pause -> SD";
+            case 5: return "go-home / landing";
+            case 6: return "photo -> the photo switch";
+            case 7: return "focus (not mapped)";
+            case 8: return "record -> SC";
+            case 9: return "FN (not mapped)";
+            case 10: return "takeoff / ARM -> SA";
+            case 11: case 12: case 13: case 14: case 15:
+                return "5-way (not taken from here)";
+            case 16: case 17: return "three-position switch code -> SB";
+            case 18: return "C1 -> SF";
+            case 19: return "C2 -> SG";
+            case 20: return "C3 -> SH";
+            case 21: return "C4 / round button";
+            default: return "not mapped here";
         }
     }
 
@@ -2479,8 +2636,24 @@ public final class DjiMsdkBridge {
         // exactly what this reader is for. (Gating on "is the other reader delivering" was tried
         // first and is wrong: that state is per remote, not per press, so a single press the log
         // missed stayed dead - which is what C1/C2/C3 "sometimes doing nothing" was.)
-        if ((pressed & PROTO_ARM) != 0 && !REMOTE.goHomeLands) {
-            takeoffPressed(RcButtons.SOURCE_PROTOCOL, "protocol stream");
+        if ((pressed & PROTO_ARM) != 0) {
+            sProtocolArmSetAt = SystemClock.uptimeMillis();
+            if (!REMOTE.goHomeLands) {
+                takeoffPressed(RcButtons.SOURCE_PROTOCOL, "protocol stream");
+            }
+        }
+        if ((released & PROTO_ARM) != 0) {
+            // A bit that stayed high far longer than a press is the ARM LED's latched state, so
+            // the moment it goes out is the next press of the same button - see
+            // PROTO_ARM_LATCH_MS. A momentary press never gets here with a long-enough time.
+            final long held = sProtocolArmSetAt == 0
+                    ? 0 : SystemClock.uptimeMillis() - sProtocolArmSetAt;
+            sProtocolArmSetAt = 0;
+            if (held >= PROTO_ARM_LATCH_MS && !REMOTE.goHomeLands) {
+                Log.i(TAG, "dji: the ARM bit went out after " + held + " ms - it is the latched "
+                        + "level, so that is the press");
+                takeoffPressed(RcButtons.SOURCE_PROTOCOL, "protocol latch");
+            }
         }
 
         if ((pressed & PROTO_PAUSE) != 0) {
@@ -2557,8 +2730,10 @@ public final class DjiMsdkBridge {
         // second, later press of the same button, which is what a long press turned into two
         // toggles - the "C1/C2/C3 sometimes do nothing" report. So the log is the reader only
         // while the protocol stream is not delivering (a remote whose library does not answer,
-        // or before the first packet).
-        if (RcProtocolInputs.delivering()) {
+        // or before the first packet). It stands aside per button, not as a whole: a blanket rule
+        // takes the log away from a button whose bit this firmware never sets, and the ARM button
+        // is exactly the one that cannot afford it - the log is its only other reader.
+        if (RcProtocolInputs.delivering() && protocolCarries(name)) {
             if (!sLogStoodAside) {
                 sLogStoodAside = true;
                 Log.i(TAG, "dji: the remote's own log stands aside for DJI's protocol stream");

@@ -65,16 +65,28 @@ Output: `app/build/outputs/apk/release/app-release.apk`.
 
 ```powershell
 adb install -r app\build\outputs\apk\release\app-release.apk
-adb shell am start -n com.edgetx.droidui/android.app.NativeActivity
+adb shell am start -n com.edgetx.droidui/.EdgeTxActivity
+```
+
+Then grant everything that can be granted without a dialog, once - see
+[Permissions](#permissions) for what this does and what it cannot do:
+
+```powershell
+.\setup_permissions.ps1
 ```
 
 ### How the EdgeTX library gets built
 
 `app/build.gradle.kts` registers the task **`buildEdgeTxSimulator`** (group
-`edgetx`), which `preBuild` depends on. For every ABI it configures and builds
-the EdgeTX CMake project, strips the result and stages it at
+`edgetx`). For every ABI it configures and builds the EdgeTX CMake project,
+strips the result and stages it at
 `app/build/edgetx-libs/<abi>/libedgetx-st16mk3-simulator.so`, which is wired in
 as a `jniLibs` source directory.
+
+The firmware is a fixed dependency of the app, so an ordinary build does not
+compile it: the task runs only when a staged library is missing. Rebuild it with
+`-Pedgetx.build=true`; `-Pedgetx.dir=<checkout>` points the task at an EdgeTX
+tree, and `-Pedgetx.skipBuild=true` forces the packaging-only path.
 
 ## Input
 
@@ -206,6 +218,29 @@ then. Bit 10 of the field is the ARM button, and the rest is laid out like this
 | 9 | FN | | |
 | **10** | **takeoff / ARM (授权灯)** | | |
 
+Bits 16-17 are not a press but the flight-mode switch's position, and they are
+SB's reader for as long as DJI's own app keeps the SDK's keys silent. The code is
+decoded the way the reference reader decodes it (`RC Plus Control 1.15`,
+`com.rcplus.keyprobe`, whose native part hands the field back untouched):
+`2 -> one end, 0 -> the middle, 1 -> the other end`, with "high" being the end
+DJI's own flight-mode key calls the top, which this app maps to +1. A code of 3 is
+not a position of a three-position switch and is dropped. The packet is the reader
+*behind* the SDK's own keys, not beside them: each position they deliver holds the
+packet off for 3 s, so a quiet stream - DJI's app holding the remote - is what lets
+the packet drive SB. A remote whose bit order turns out to differ from this one
+therefore shows it as a switch that does not follow, not as one that jumps between
+two readings.
+
+The ARM bit is read both ways round, because which one the firmware sends is not
+measured: a press counts when the bit goes high (a ~200 ms pulse, like the SDK's
+key), and a bit that has been high for longer than a press can last (2 s) counts
+again the moment it goes out - that is the LED's latched state changing, which is
+one more press of the same button. The log says which one it was:
+
+```
+dji: the ARM bit went out after 18234 ms - it is the latched level, so that is the press
+```
+
 Each of those moves its switch only while the reader that normally delivers it is
 not delivering — the SDK key, the remote's own log while that is what moves
 switches, or the raw reports — so a remote whose own keys work keeps behaving
@@ -218,10 +253,13 @@ dji: pause from DJI's protocol stream, merged with the log one
 ```
 
 While those packets are arriving (within the last second) the remote's own log
-stands aside entirely: its line is only written at the *release*, so with both
-readers wired a long press became two toggles — which is what "C1/C2/C3 sometimes
-do nothing" was. The log stays as the reader for a remote whose protocol library
-does not answer, and comes back by itself a second after the packets stop:
+stands aside for the buttons the packet has been seen to carry: its line is only
+written at the *release*, so with both readers wired a long press became two
+toggles — which is what "C1/C2/C3 sometimes do nothing" was. The rule is per
+button on purpose: a blanket "the stream is alive, so everything comes from it"
+also took the log away from a button whose bit this firmware never sets, and the
+ARM button is exactly the one that cannot afford it — the log is its only other
+reader. The log comes back by itself a second after the packets stop:
 
 ```
 dji: the remote's own log stands aside for DJI's protocol stream
@@ -229,8 +267,23 @@ dji: the remote's own log stands aside for DJI's protocol stream
 
 Not taken from the packet: the 5-way (the raw reports carry it at 400 Hz with the
 SDK behind them, and a press-only copy of a direction would step the rotary
-twice), the three-position switch (its two bits are not decoded against a measured
-position order), and focus / FN, which have no EdgeTX switch here.
+twice), and focus / FN, which have no EdgeTX switch here.
+
+Which of the four process names is bound is decided from the DJI app installed on
+the remote — industry, agriculture-x, consumer (DJI Fly) and agriculture, in that
+order, the same choice the reference reader makes — instead of binding all four. If
+the chosen name still has not produced a packet after 6 s, the other three are
+bound as well, so a firmware that answers on another name costs a wait rather than
+a dead reader.
+
+The first time each bit of the field is seen set it is named once in the log, so a
+"this button does nothing" report can say which bit the button actually uses even
+when this app has no switch for it:
+
+```
+dji: DJI's protocol stream uses button bit 10 (0x400): takeoff / ARM -> SA
+dji: DJI's protocol stream uses button bit 17 (0x20000): three-position switch code -> SB
+```
 
 Only frames that carry the six axes are used. The endpoint also delivers other
 reports, and one of those decoded as a stick position is six zeroes: -100% on all
@@ -513,6 +566,36 @@ link: firmware running, module tx 4213 B rx 0 B dropped 0 B, port open, window d
 
 `window detached` with `tx` still climbing is the whole point of the service.
 
+## Permissions
+
+Everything that can be granted at install time is granted by one script, so the
+app stops putting dialogs in front of the user. It needs adb only - no root, no
+system app - and every grant it makes is stored by Android and survives a reboot:
+
+```powershell
+.\setup_permissions.ps1                  # grant what can be granted
+.\setup_permissions.ps1 -Apk <apk> -Restart   # install, grant, relaunch
+```
+
+It grants `ACCESS_FINE_LOCATION` (the remote's own GPS, `RcGps`),
+`WRITE_EXTERNAL_STORAGE` (the card on Android 10) or the `MANAGE_EXTERNAL_STORAGE`
+app-op (Android 11+), and `READ_LOGS` (the remote's own button log, `RcDpadLog`)
+where the build lets shell hand it out. It then verifies each one and prints the
+state, so a grant that the remote refuses is visible rather than silent.
+
+**The USB device permission is the one thing that cannot be pre-granted.** Android
+hands a USB device grant out only through a dialog, or to a system app, and the
+grant itself is the system's: it is dropped when the device is detached and at
+every reboot. What *is* kept is the device's default app - the "use by default for
+this USB device" tick in that dialog, which is offered because the app declares the
+joystick (`2ca3:1501`) and the UART bridges in `res/xml/usb_device_filter.xml`
+next to a `USB_DEVICE_ATTACHED` activity (`UsbAttachActivity`). Ticked once, the
+system hands those devices over at boot and starts that activity instead of asking,
+so no dialog comes back after any reboot. The app says this once on screen
+(`EdgeTxApplication.hintUsbDefaultOnce`) the first time it has to raise the dialog;
+nothing else is possible from an app, because the setting behind that tick is only
+reachable with a signature-level permission.
+
 ## Simulated SD card
 
 `app/src/main/assets/sdcard/` holds a full EdgeTX SD-card tree (RADIO, MODELS,
@@ -533,7 +616,8 @@ to another one afterwards):
 | RC Plus 2 | 11 | "All files access" (`MANAGE_EXTERNAL_STORAGE`), a system settings page the app opens at start-up |
 
 The app asks once per launch until the grant exists, and boots with the card in
-its own directory if it is never given. Grant it from the shell instead:
+its own directory if it is never given. Grant it from the shell instead - this is
+what `setup_permissions.ps1` does after installing:
 
 ```powershell
 adb shell appops set com.edgetx.droidui MANAGE_EXTERNAL_STORAGE allow   # Android 11
