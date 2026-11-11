@@ -58,16 +58,20 @@ import java.util.Arrays;
  * </pre>
  *
  * Six 16-bit little-endian axes, all centred on 1024 and with the same range the SDK and the raw
- * reports use, so nothing but the centre comes off. The button field travels as it is: which bit
- * means which control, and when it may move a switch, is {@link DjiMsdkBridge}'s business.
+ * reports use, so nothing but the centre comes off. All six are sent on: the four sticks as the
+ * fallback behind the raw reports and the SDK, and the two wheels as the fallback behind the SDK
+ * alone - on a remote whose SDK reports no dial at all (the RC Pro 2), the packet is the only
+ * reader the wheels have once the raw reports are not arriving (see {@link RcProtocolInputs}).
+ * The button field travels as it is: which bit means which control, and when it may move a
+ * switch, is {@link DjiMsdkBridge}'s business.
  *
  * <p><b>Which process.</b> The library only hands packets to a process named after one of DJI's
  * own apps, so this service is declared once per name (see the manifest, and the three empty
- * subclasses at the bottom of this file). Which of them a given remote answers is not documented
- * and differs per DJI app installed on it, so all of them are tried and the first process that
- * produces a packet wins - see {@link RcProtocolInputs}. It is a started foreground service for
- * the same reason the reference implementation is one: the process has to stay alive on its own,
- * with the app in the background and with the UI gone.
+ * subclasses beside this file). Which of them a given remote answers is not documented
+ * and differs per DJI app the remote ships with; {@link RcProtocolInputs} binds the one the
+ * reference reader picks for this remote, falling back to the other three only when that one
+ * stays silent. The binding is also what keeps this process alive for as long as the app is, and
+ * no notification of its own is wanted - the link service already shows one.
  *
  * <p>Nothing else happens in those processes - {@link EdgeTxApplication} starts no runtime there.
  * A packet that cannot be read is dropped rather than guessed at.
@@ -124,8 +128,8 @@ public class RcProtocolService extends Service {
     /** This process's name, said in every message so only one of the four is listened to. */
     private String mProcess = "?";
 
-    /** Last packet's four stick values, so an unchanged packet costs no message. */
-    private final int[] mLast = new int[4];
+    /** Last packet's six axes, so an unchanged packet costs no message. */
+    private final int[] mLast = new int[RcProtocolInputs.AXIS_COUNT];
     private boolean mAny;
 
     /** Last packet's button/switch field, sent when it changes. */
@@ -865,30 +869,39 @@ public class RcProtocolService extends Service {
         final int bits = (bytes[0] & 0xFF) | ((bytes[1] & 0xFF) << 8)
                 | ((bytes[2] & 0xFF) << 16) | ((bytes[3] & 0xFF) << 24);
         if (!mBitsKnown || bits != mLastBits) {
+            final Bundle payload = header();
+            if (!mBitsKnown) {
+                // The value every stream opens with, not a change: a process whose field is dead
+                // sends this and nothing else (see RcProtocolInputs.fromButtonSource).
+                payload.putBoolean(RcProtocolInputs.KEY_INITIAL, true);
+            }
             mBitsKnown = true;
             mLastBits = bits;
             final Message message = Message.obtain(null, RcProtocolInputs.MSG_BUTTONS, bits, 0);
-            message.setData(header());
+            message.setData(payload);
             send(sink, message);
         }
 
-        // The packet names the axes in its own order; these are the four sticks in the order
-        // the firmware uses (left horizontal, left vertical, right horizontal, right vertical).
-        final int[] sticks = {
+        // The packet names the axes in its own order; these are all six in the order the
+        // firmware uses (the four sticks, then the two wheels) - the same order and layout the
+        // reference reader decodes them in.
+        final int[] axes = {
                 axis(bytes, 11),   // left horizontal
                 axis(bytes, 9),    // left vertical
                 axis(bytes, 5),    // right horizontal
                 axis(bytes, 7),    // right vertical
+                axis(bytes, 13),   // left wheel
+                axis(bytes, 15),   // right wheel
         };
-        if (mAny && Arrays.equals(sticks, mLast)) {
+        if (mAny && Arrays.equals(axes, mLast)) {
             return;
         }
-        System.arraycopy(sticks, 0, mLast, 0, sticks.length);
+        System.arraycopy(axes, 0, mLast, 0, axes.length);
         mAny = true;
 
         final Message message = Message.obtain(null, RcProtocolInputs.MSG_STICKS);
         final Bundle payload = header();
-        payload.putIntArray(RcProtocolInputs.KEY_STICKS, sticks);
+        payload.putIntArray(RcProtocolInputs.KEY_STICKS, axes);
         message.setData(payload);
         send(sink, message);
     }

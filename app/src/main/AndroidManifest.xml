@@ -42,10 +42,10 @@
         android:name="android.hardware.usb.host"
         android:required="false" />
 
-    <!-- Which DJI app this remote runs decides the process name the protocol library answers
-         on (see RcProtocolInputs.installed). Android 11 filters that question to the packages
-         named here, and without it the probe reports "none installed" and all four names are
-         bound instead - correct, but one process per name. -->
+    <!-- Which DJI app this remote ships with decides the process name the protocol library
+         answers on (see RcProtocolInputs.installed). Android 11 filters that question to the
+         packages named here, and without it every app looks absent - which picks DJI Fly's
+         process name, and costs the 6 s wait before the other three names are tried. -->
     <queries>
         <package android:name="dji.go.v5" />
         <package android:name="com.dji.agras" />
@@ -170,9 +170,10 @@
 
              The process names are the point of these entries: DJI's protocol library only hands
              out packets to a process named after one of DJI's own apps, and which one depends on
-             the DJI app the remote normally runs. All four are declared and the first that
-             delivers is used (see RcProtocolInputs). Nothing else runs in those processes -
-             EdgeTxApplication starts no runtime there. -->
+             the DJI app the remote ships with. All four are declared; RcProtocolInputs binds the
+             one the reference reader picks for this remote, and falls back to the others only if
+             it stays silent. Nothing else runs in those processes - EdgeTxApplication starts no
+             runtime there. -->
         <service
             android:name=".RcProtocolService"
             android:exported="false"
