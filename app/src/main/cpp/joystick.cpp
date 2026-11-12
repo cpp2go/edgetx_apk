@@ -1372,8 +1372,9 @@ void requestScrollWheel(int32_t steps) {
 // remembered across a restart, because EdgeTX reads its switch positions once while
 // booting and warns about every one that is not where the model expects it.
 //
-// Every switch driven by a button is kept here:
+// Every switch the app drives is kept here - the button-driven ones, and SB:
 //
+//   1  SB  flight-mode switch (a real three-position switch, restored as well)
 //   4  SE  photo (Plus family), round button (RC Pro)
 //   5  SF  C1 (Plus family), photo (Pro family)
 //   6  SG  C2 (Plus family), C1 (Pro family)
@@ -1381,8 +1382,12 @@ void requestScrollWheel(int32_t steps) {
 //   8  SI  R1/R2/R3 pick its position (Android key codes F4..F6, see kPositionKeys)
 //   9  SJ  L1/L2/L3 pick its position (Android key codes F1..F3, see kPositionKeys)
 //
-// SB is the flight-mode switch: a real three-position switch that reports where it stands,
-// so there is nothing to remember.
+// SB is not latched by a button, but it is restored for the same reason: the firmware
+// comes up with a three-position switch in the middle, and nothing has reported where
+// this one really stands until the SDK's key (late on the RC Plus) or the control
+// packet answers - so a radio whose switch sits at one of the ends showed the middle
+// for the first seconds of every start. The saved position is put back before the boot
+// (see restoreSwitches), so the right end is on screen from the first frame.
 //
 // SA (takeoff), SC (video) and SD (pause) are remembered too, but on the Java side (see
 // DjiMsdkBridge.restoreLatchedSwitches): their buttons latch in the remote's own hardware,
@@ -1394,9 +1399,10 @@ void requestScrollWheel(int32_t steps) {
 // the right one.
 //
 // Caveat, and it cannot be fixed from here: the remote's latch moves even while the app
-// is dead, and a press made in that window is invisible. The restored position is
-// therefore the app's best guess, and the next press puts both sides back in step.
-constexpr uint8_t kPersistedSwitches[] = {4, 5, 6, 7, 8, 9};
+// is dead, and a press made in that window is invisible. The same holds for SB's lever. The
+// restored position is therefore the app's best guess, and the next press or movement puts
+// both sides back in step.
+constexpr uint8_t kPersistedSwitches[] = {1, 4, 5, 6, 7, 8, 9};
 
 bool is_latching_switch(int index) {
     for (uint8_t persisted : kPersistedSwitches) {
@@ -1590,13 +1596,31 @@ void tick() {
 // ---------------------------------------------------------------------------
 #if defined(EDGETX_MSDK)
 std::atomic<bool> g_inputsReady{false};
+std::atomic<uint8_t> g_startupStickMask{0};
 
 void setInputsReady(bool ready) { g_inputsReady.store(ready); }
 bool inputsReady() { return g_inputsReady.load(); }
+
+bool releaseInputsReady() {
+    bool expected = false;
+    return g_inputsReady.compare_exchange_strong(expected, true);
+}
+
+void noteStartupStick(int axis) {
+    if (axis < 0 || axis >= 4) return;
+
+    const uint8_t bit = static_cast<uint8_t>(1u << axis);
+    const uint8_t seen = g_startupStickMask.fetch_or(bit);
+    if (((seen | bit) & 0x0F) == 0x0F && releaseInputsReady()) {
+        LOGI("joystick: all four RC stick axes received, the firmware may boot");
+    }
+}
 #else
 // Nothing to wait for: without the SDK there is no source for the RC's controls.
 void setInputsReady(bool) {}
 bool inputsReady() { return true; }
+bool releaseInputsReady() { return false; }
+void noteStartupStick(int) {}
 #endif
 
 // ---------------------------------------------------------------------------
@@ -1662,8 +1686,9 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_edgetx_droidui_DjiMsdkBridge_nativeSetInputsReady(JNIEnv* env, jclass clazz) {
     (void)env;
     (void)clazz;
-    LOGI("joystick: RC controls reporting, the firmware may boot");
-    setInputsReady(true);
+    if (releaseInputsReady()) {
+        LOGI("joystick: RC controls reporting, the firmware may boot");
+    }
 }
 
 // Called from RcGps.java with the remote controller's own position, which comes from Android's
@@ -1837,6 +1862,7 @@ Java_com_edgetx_droidui_DjiMsdkBridge_nativeOnDjiStick(JNIEnv* env, jclass clazz
     (void)env;
     (void)clazz;
     requestStick(axis, value);
+    noteStartupStick(axis);
 }
 
 // Called from DjiMsdkBridge.java with a dial position. `dial` is 0 = left,

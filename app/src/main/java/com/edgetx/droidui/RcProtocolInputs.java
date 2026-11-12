@@ -107,6 +107,7 @@ final class RcProtocolInputs {
     private static final Handler SINK = new Handler(Looper.getMainLooper()) {
         @Override
         public void handleMessage(Message message) {
+            sLastMessageAt = SystemClock.uptimeMillis();
             final Bundle data = message.getData();
             final String process = data == null
                     ? null : data.getString(RcProtocolService.KEY_PROCESS);
@@ -406,6 +407,24 @@ final class RcProtocolInputs {
      */
     static boolean delivering() {
         return ownsSticks();
+    }
+
+    /**
+     * When any message - axes or button field - last arrived from one of the service processes.
+     *
+     * <p>Not the same thing as {@link #ownsSticks()}, which only counts a packet whose axes
+     * changed: this is what says the stream itself is alive, which is what the SDK's own copies
+     * of the flight-mode switch defer to (see DjiMsdkBridge.noteProtocolFlightMode).
+     */
+    private static volatile long sLastMessageAt;
+
+    /** How long a message keeps the stream alive for that test. */
+    private static final long ALIVE_MS = 1500;
+
+    /** Whether the service processes are delivering anything at all right now. */
+    static boolean streamAlive() {
+        final long at = sLastMessageAt;
+        return at != 0 && SystemClock.uptimeMillis() - at < ALIVE_MS;
     }
 
     /**

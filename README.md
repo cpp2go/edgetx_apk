@@ -225,27 +225,33 @@ then. Bit 10 of the field is the ARM button, and the rest is laid out like this
 | 9 | FN | | |
 | **10** | **takeoff / ARM (授权灯)** | | |
 
-Bits 16-17 are not a press but the flight-mode switch's position, and they are
-SB's reader for as long as DJI's own app keeps the SDK's keys silent. The code is
-decoded the way the reference reader decodes it (`RC Plus Control 1.15`,
-`com.rcplus.keyprobe`, whose native part hands the field back untouched):
-`2 -> one end, 0 -> the middle, 1 -> the other end`, with "high" being the end
-DJI's own flight-mode key calls the top, which this app maps to +1. A code of 3 is
-not a position of a three-position switch and is dropped.
+Bits 16-17 carry a three-position code as well. It is decoded the way the reference
+reader decodes it (`RC Plus Control 1.15`, `com.rcplus.keyprobe`, whose native part
+hands the field back untouched: `2 -> one end, 0 -> the middle, 1 -> the other end`),
+and code 3, which is not a position of a three-position switch, is dropped. The RC
+Plus uses this code for SB to match the reference app's fast start-up path. The SDK
+takes over permanently as soon as it reports a real end position, so packet and SDK
+values cannot alternate later if the stream blinks; the packet reader also backs off
+if its code changes too frequently to represent a physical switch. The RC Plus 2 stays
+on the SDK because its packet field was observed cycling while the lever was still.
 
-Each new position from the packet is held for 250 ms and then applied unless the
-SDK's own copy of the same movement arrived first — the SDK is the measured reader
-where it answers, and a remote whose bit order turns out to differ from this one
-therefore shows it as a switch that does not follow, not as one that jumps between
-two readings. The wait is only ever for *this* movement: a position the SDK
-delivers later no longer blocks the packet for seconds, which is what used to make
-SB on the RC Plus wait for a key that answers when it feels like it. And once both
-readers agree on a position and the SDK's copy of it turns out to be the later of
-the two, the packet is applied at once for the rest of the session:
+What start-up did need is the middle problem: the SDK and packet field can open with
+the *middle* before they have seen the lever, and the firmware comes up with a
+three-position switch in the middle as well, so SB showed the middle for the first
+seconds of every start whatever the lever was at. Two things fix that — the last
+position is saved across restarts and put back before the boot
+(`joystick.switches`, see `joystick.cpp`), and a middle from either reader is ignored
+until it has reported one of the ends at least once in the session:
 
 ```
-dji: the SDK's flight-mode copy came 640 ms after the packet's - SB follows the packet from now on
+joystick: switch SB restored to down
+dji: SB stays put - the SDK opened with the middle, and no reader has seen an end yet
 ```
+
+The switch is also remembered across restarts (`joystick.switches`, see
+`joystick.cpp`): the firmware comes up with a three-position switch in the middle,
+and the saved position is put back before the boot, so the first frames already show
+the end the lever is at even before any reader has answered.
 
 The ARM bit is read both ways round, because which one the firmware sends is not
 measured: a press counts when the bit goes high (a ~200 ms pulse, like the SDK's
@@ -368,11 +374,10 @@ RC Plus 2's switches but **not** its readers: its C1/C2/C3 never arrive from the
 SDK, only from the remote's own log, so
 `adb shell pm grant com.edgetx.droidui android.permission.READ_LOGS` is what
 makes those three custom buttons work there (the app logs it when the grant is
-missing). Its flight-mode switch and pause answer from the SDK a moment late; SB is
-the one of the two that has a second reader — the packet's bits 16-17 — and that
-reader takes over by itself as soon as it is measured to arrive first. Only the
-buttons are shared otherwise: the RC Plus runs Android 10, so the grant its SD card
-needs is its own (see below).
+missing). Its flight-mode switch and pause button answer from the SDK a moment late,
+as they always have — SB follows the protocol stream on the RC Plus and the SDK on
+the other remotes (see the three-position notes above). Only the buttons are shared otherwise:
+the RC Plus runs Android 10, so the grant its SD card needs is its own (see below).
 
 The six side buttons L1/L2/L3/R1/R2/R3 are not in the DJI SDK at all — the
 only supported way to read them is Android key events

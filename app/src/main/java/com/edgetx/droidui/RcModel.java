@@ -82,8 +82,10 @@ final class RcModel {
      *       action its button event names ({@code ONEKEYTAKEOFFLANDING}), and a
      *       takeoff-shaped name in the remote's own log, which is already the reader for its
      *       C1/C2/C3. Which name its log uses has not been measured either, so the first one
-     *       that matches is logged. Flight mode and pause stay
-     *       on the SDK, which is where their delay comes from.
+     *       that matches is logged. SB uses the reference app's protocol code on this
+     *       remote; it is only the fast start-up reader, and the SDK becomes authoritative after
+     *       its first real end position or if the packet field becomes erratic.
+     *       Pause stays on the SDK, which is where its delay comes from.
      *       It runs Android 10 like the RC Pro, so its SD card is the
      *       {@code WRITE_EXTERNAL_STORAGE} grant rather than "All files access", and that is
      *       decided from the API level, not from this class.</li>
@@ -97,15 +99,15 @@ final class RcModel {
      * </ul>
      */
     private static final RcModel[] MODELS = {
-            //           video pause photo  C1  C2  C3  round      C3sdk  logSw  goHome  proMode
+            //           video pause photo  C1  C2  C3  round      C3sdk  logSw  goHome  proMode  packetFM
             new RcModel(new String[] {"rc701"}, "RC Plus 2",
-                    SC,   SD,   SE,   SF, SG, SH, NO_SWITCH, true,  false, false,  false),
+                    SC,   SD,   SE,   SF, SG, SH, NO_SWITCH, true,  false, false,  false,  false),
             new RcModel(new String[] {"rm510"}, "RC Pro",
-                    SD,   SC,   SF,   SG, SH, SI, SE,        false, true,  true,   true),
+                    SD,   SC,   SF,   SG, SH, SI, SE,        false, true,  true,   true,   false),
             new RcModel(new String[] {"rm700"}, "RC Plus",
-                    SC,   SD,   SE,   SF, SG, SH, NO_SWITCH, true,  true,  false,  false),
+                    SC,   SD,   SE,   SF, SG, SH, NO_SWITCH, true,  true,  false,  false,  true),
             new RcModel(new String[] {"rc520"}, "RC Pro 2",
-                    SD,   SC,   SF,   SG, SH, SI, NO_SWITCH, true,  true,  true,   false),
+                    SD,   SC,   SF,   SG, SH, SI, NO_SWITCH, true,  true,  true,   false,  false),
     };
 
     /**
@@ -157,9 +159,20 @@ final class RcModel {
     /** Whether the flight-mode switch reports {@code SWITCH_ONE} at the top. */
     final boolean proFlightMode;
 
+    /**
+     * Whether SB is taken from DJI's protocol stream (bits 16..17) on this remote.
+     *
+     * <p>Enabled only on the RC Plus to match the reference reader's fast protocol path. It is
+     * used for start-up responsiveness, then the SDK takes over permanently after its first real
+     * end position. The RC Plus 2 stays on the SDK: its packet field was observed cycling while
+     * the lever was still.
+     */
+    final boolean packetFlightMode;
+
     private RcModel(String[] devices, String label, int video, int pause, int photo,
                     int c1, int c2, int c3, int round, boolean c3OnSdk,
-                    boolean logDrivesSwitches, boolean goHomeLands, boolean proFlightMode) {
+                    boolean logDrivesSwitches, boolean goHomeLands, boolean proFlightMode,
+                    boolean packetFlightMode) {
         this.devices = devices;
         this.label = label;
         this.video = video;
@@ -173,6 +186,7 @@ final class RcModel {
         this.logDrivesSwitches = logDrivesSwitches;
         this.goHomeLands = goHomeLands;
         this.proFlightMode = proFlightMode;
+        this.packetFlightMode = packetFlightMode;
     }
 
     private static RcModel find(String device) {
@@ -207,6 +221,7 @@ final class RcModel {
                 + ", round " + switchName(round)
                 + "; go-home " + (goHomeLands ? "switch SA" : "5-way trim modifier")
                 + "; flight mode top = " + (proFlightMode ? "SWITCH_ONE" : "SWITCH_TWO")
+                + "; SB from " + (packetFlightMode ? "the packet" : "the SDK")
                 + "; the remote's log " + (logDrivesSwitches ? "may move switches" : "is only merged");
     }
 }

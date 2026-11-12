@@ -954,10 +954,10 @@ bool link_start(AAssetManager* assets, const char* filesDir, const char* externa
 
     // The firmware is what runs EdgeTX's boot checks, and those sample the throttle
     // and the switches once - whatever they see then is what the user is told about. A
-    // stick the DJI SDK has not reported on yet reads as centred (simuGetAnalog()
+    // stick no input reader has reported on yet reads as centred (simuGetAnalog()
     // returns 2048 for a channel nobody has written, see the simulator's
     // android_host.cpp), which is what made the throttle warning appear although the
-    // stick was at the bottom. So the boot waits for the RC's controls first.
+    // stick was at the bottom. So the boot waits for all four stick axes from any reader.
     //
     // Bounded, because nothing may ever arrive: no SDK in the build, a failed
     // registration, or a remote that is not an RC Plus 2. Booting late beats not

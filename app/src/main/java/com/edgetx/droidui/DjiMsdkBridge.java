@@ -1803,15 +1803,45 @@ public final class DjiMsdkBridge {
      * that has not changed cannot move the switch twice.
      */
     private static void applySwitchPosition(final int index, Object value) {
+        applySwitchPosition(index, "poll", value);
+    }
+
+    /** The same, with the key that carried the position, for the diagnosis in the log. */
+    private static void applySwitchPosition(final int index, String key, Object value) {
         final Integer state = switchPosition(value);
         if (state == null) {
             return;               // UNKNOWN, or a key that went silent
         }
-        if (index == SW_SB && state != sLastSwitchPosition[index]) {
-            // A *new* position from the SDK answers the packet's held one - see
-            // noteSdkFlightMode. A repeat of the position already applied is not an answer,
-            // and must not take a real movement away from the packet.
-            noteSdkFlightMode(state);
+        if (index == SW_SB) {
+            if (state != sSdkFlightMode) {
+                // Tracked apart from the applied position: the packet has usually moved SB to
+                // this value already, and the count below is what RcProtocolInputs uses to tell
+                // a live SDK from a dead one.
+                sSdkFlightMode = state;
+                sSdkSwitchMoves++;
+                Log.i(TAG, "dji: SB from the SDK -> " + flightModeName(state) + " (" + key + ')');
+            }
+            if (state != 0) {
+                sSwitchEndSeen = true;
+                if (REMOTE.packetFlightMode && !sSdkTookOverPacket) {
+                    // The packet is the fast start-up reader. The SDK's first real end is a
+                    // trustworthy live position, so hand SB to it permanently rather than
+                    // letting the two readers alternate when the packet stream blinks.
+                    sSdkTookOverPacket = true;
+                    Log.i(TAG, "dji: SDK reported an SB end; packet startup reader released");
+                }
+            } else if (!sSwitchEndSeen) {
+                Log.i(TAG, "dji: SB stays put - the SDK opened with the middle, and no reader "
+                        + "has seen an end yet");
+                return;
+            }
+            if (REMOTE.packetFlightMode && !sPacketSwitchUnusable && !sSdkTookOverPacket
+                    && RcProtocolInputs.streamAlive() && sPacketCodeEndSeen) {
+                // Until the SDK reports a real end, the live packet stream is the fast reader.
+                // A stale SDK copy cannot pull SB back; after the first real SDK end above,
+                // the SDK stays authoritative even if packets briefly stop and resume.
+                return;
+            }
         }
         applyPosition(index, state);
     }
@@ -1848,7 +1878,7 @@ public final class DjiMsdkBridge {
                         @Override
                         public void onValueChange(T oldValue, T newValue) {
                             noteKeyValue(name, newValue);
-                            applySwitchPosition(index, newValue);
+                            applySwitchPosition(index, name, newValue);
                         }
                     };
             KeyManager.getInstance().listen(key, OWNER, listener);
@@ -2478,19 +2508,26 @@ public final class DjiMsdkBridge {
      * switch, and the raw reports do not carry it - which is why SB used to stop working as soon
      * as DJI Fly was started. The packet keeps reporting it.
      *
-     * <p>The order is the reference reader's (RC Plus Control 1.15, {@code com.rcplus.keyprobe}:
-     * its native part hands the field back unchanged and the app decodes
-     * {@code (bits >>> 16) & 3} as 2 -> high, 0 -> middle, 1 -> low). "High" is the end DJI's own
-     * flight-mode key calls the top, which this app already maps to +1 (see
-     * {@link #POSITION_TOP_FIRST}), so this table ends the same way round.
+     * <p>The code itself is the reference reader's (RC Plus Control 1.15,
+     * {@code com.rcplus.keyprobe}: its native part hands the field back unchanged and the app
+     * decodes {@code (bits >>> 16) & 3}). Which end of the switch each code means was measured
+     * on the RC Plus by moving SB: code 1 is the high end and code 2 the low one - the other way
+     * round from the order the reference reader's display suggested, which is what made high and
+     * low swap on that remote. +1 is EdgeTX's down position and the label's high end (see
+     * {@link #POSITION_TOP_FIRST}), so the table below ends +1 for code 1.
      *
-     * <p>A code of 3 is not a position of a three-position switch and is dropped rather than
-     * guessed at.
+     * <p>The table is the measured one and is not re-learned at run time: an attempt at that
+     * paired a late SDK copy with whatever code the packet was already on and moved high and low
+     * around within a session (measured in a log: "code 1 -> the middle" while the lever was at
+     * the top). A code of 3 is not a position of a three-position switch and is dropped rather
+     * than guessed at.
      */
     private static final int PROTO_SWITCH_SHIFT = 16;
     private static final int PROTO_SWITCH_MASK = 0x3;
     private static final int PROTO_SWITCH_UNKNOWN = Integer.MIN_VALUE;
-    private static final int[] PROTO_SWITCH_POSITION = {0, -1, 1, PROTO_SWITCH_UNKNOWN};
+
+    /** What each code means: the middle, the high end (+1), the low end (-1), nothing. */
+    private static final int[] sCodePosition = {0, 1, -1, PROTO_SWITCH_UNKNOWN};
 
     /**
      * How long the ARM bit has to stay set before the moment it clears counts as a press of its
@@ -2545,6 +2582,8 @@ public final class DjiMsdkBridge {
             // The first packet is the state the remote is in, not a press.
             sProtocolSeen = true;
             sProtocolBits = bits;
+            Log.i(TAG, "dji: the protocol field opens at 0x" + Integer.toHexString(bits)
+                    + " (switch code " + ((bits >>> PROTO_SWITCH_SHIFT) & PROTO_SWITCH_MASK) + ')');
             // A bit that is already high now is a level that has been high since before this
             // reader opened: remember when, so that the moment it goes out can be measured.
             if ((bits & PROTO_ARM) != 0) {
@@ -2568,91 +2607,106 @@ public final class DjiMsdkBridge {
         }
     }
 
+    /** The packet's latest switch code (0..2), -1 while none has been seen. */
+    private static volatile int sPacketCode = -1;
+
     /**
-     * How long a packet's new switch position waits for the SDK's own copy of the same movement.
-     *
-     * <p>Both readers see the same switch, and the SDK's copy is the measured one where it
-     * answers, so a position it delivers inside this window is the answer and the packet's is
-     * dropped - which is also what keeps a firmware whose bit order differs from the one decoded
-     * here from making the switch jump.
-     *
-     * <p>What this window does not do is hold the packet off for seconds after an *earlier*
-     * position, which is what the fixed 3 s holdoff used to do and what made SB on the RC Plus
-     * answer only when the SDK got round to it. It is short enough to stay under the SDK's own
-     * latency on the remotes where that reader works (its listener fires within ~125 ms and the
-     * poll adds at most {@link #POLL_INTERVAL_MS}), and a position the SDK never delivers in it
-     * is applied from the packet instead of being lost.
+     * Whether the field has been seen to carry one of the switch's ends, see
+     * {@link #noteProtocolFlightMode} - the middle is only trusted after that.
      */
-    private static final long PROTO_SB_ARBITRATION_MS = 250;
-
-    /** When the SDK last delivered a *new* flight-mode position, 0 while it never has. */
-    private static volatile long sSdkFlightModeAt;
-
-    /** The packet's latest position for SB, and when it arrived - see the window above. */
-    private static volatile int sPacketPosition = PROTO_SWITCH_UNKNOWN;
-    private static volatile long sPacketPositionAt;
+    private static volatile boolean sPacketCodeEndSeen;
 
     /**
-     * Whether the packet's copy of the switch has been measured to arrive *before* the SDK's own
-     * on this remote.
+     * Whether *any* reader has reported one of the switch's ends since the app started.
      *
-     * <p>Latching this is what makes SB feel direct on the RC Plus, whose SDK key answers when it
-     * feels like it: from then on the packet's position is applied at once instead of waiting for
-     * a copy that is known to be later. The latch is only set when both readers agree on a
-     * position and the SDK's copy of it arrives after the window above, so a firmware whose bit
-     * order differs from the one decoded here can never set it - its copies disagree.
+     * <p>Both readers can hand out the middle before either has seen the lever: the SDK's keys
+     * open with their default, and the packet's field is empty until the firmware fills it. Acting
+     * on that moved a switch that sat at an end to the middle for the first seconds of every
+     * start, only to be corrected once the lever was really read - the middle is therefore not
+     * applied until some reader has reported an end. A switch that really is in the middle is
+     * already there: its last position is put back at boot (see joystick.cpp).
      */
-    private static volatile boolean sPacketLeadsSdk;
+    private static volatile boolean sSwitchEndSeen;
 
-    private static final Handler MAIN = new Handler(Looper.getMainLooper());
+    /** The SDK's own last flight-mode position, so only a *new* one is counted. */
+    private static volatile int sSdkFlightMode = PROTO_SWITCH_UNKNOWN;
 
-    /** Applies the packet's held position unless the SDK answered for that movement first. */
-    private static final Runnable APPLY_PACKET_POSITION = new Runnable() {
-        @Override
-        public void run() {
-            final int position = sPacketPosition;
-            if (position == PROTO_SWITCH_UNKNOWN) {
-                return;
-            }
-            final long fromSdk = sSdkFlightModeAt;
-            if (fromSdk != 0 && fromSdk - sPacketPositionAt >= 0) {
-                // The SDK's own copy is the measured one, and it covered this movement.
-                return;
-            }
-            applyPosition(SW_SB, position);
-        }
-    };
+    /** Set when the field's three-position code is shown not to follow the switch - see below. */
+    private static volatile boolean sPacketSwitchUnusable;
+
+    /** Set on the SDK's first real end; the packet then remains a start-up reader only. */
+    private static volatile boolean sSdkTookOverPacket;
+
+    /** How many code changes are allowed inside {@link #PROTO_SB_CHANGE_WINDOW_MS}. */
+    private static final int PROTO_SB_MAX_CHANGES = 10;
+    private static final long PROTO_SB_CHANGE_WINDOW_MS = 5000;
+    private static int sPacketCodeChanges;
+    private static long sPacketCodeWindowAt;
 
     /**
-     * SB from the packet's own three-position code - the reader that answers while the SDK's
-     * flight-mode keys are silent, and the one that answers first on a remote whose SDK copy
-     * comes late.
+     * SB from the packet's own three-position code.
      *
-     * <p>Each new position is held for {@link #PROTO_SB_ARBITRATION_MS} and then applied unless
-     * the SDK delivered a new position meanwhile. On such a remote - the RC Plus - the switch
-     * follows the packet a quarter of a second after it moves instead of waiting for a key that
-     * answers when it feels like it; where the SDK works, its copy arrives first and the
-     * packet's is dropped exactly as before. A code of 3 is not a position of a three-position
-     * switch and is dropped rather than guessed at.
+     * <p>Enabled only on the RC Plus to match the reference app's fast path. It gets SB onto the
+     * right position during start-up, then the SDK takes over permanently on its first real end.
+     * The RC Plus 2 remains on the SDK because its packet code was observed changing while the
+     * lever was still. The SDK also takes over if the RC Plus packet field is too restless.
+     *
+     * <p>It applies the position the moment the code changes (the reference reader's behaviour),
+     * takes the middle only once the field has shown one of the ends (the field opens empty, and
+     * that read as the middle put an end-position lever to the middle for the first seconds of a
+     * start), and gives up for the session if the code keeps changing while the lever is still.
      */
     private static void noteProtocolFlightMode(int bits) {
+        if (!REMOTE.packetFlightMode || sPacketSwitchUnusable || sSdkTookOverPacket) {
+            return;
+        }
         final int code = (bits >>> PROTO_SWITCH_SHIFT) & PROTO_SWITCH_MASK;
-        final int position = PROTO_SWITCH_POSITION[code];
-        if (position == PROTO_SWITCH_UNKNOWN || position == sPacketPosition) {
+        if (code == sPacketCode) {
+            return;                         // a level: only a change is news
+        }
+        sPacketCode = code;
+        if (code == PROTO_SWITCH_MASK) {
+            return;                         // 3: not a position of this switch
+        }
+        if (codeTooRestless()) {
             return;
         }
-        sPacketPosition = position;
-        sPacketPositionAt = SystemClock.uptimeMillis();
-        MAIN.removeCallbacks(APPLY_PACKET_POSITION);
-        if (sPacketLeadsSdk) {
-            // Measured on this remote: the SDK's copy of this switch is the later one.
-            applyPosition(SW_SB, position);
+        if (code != 0) {
+            sPacketCodeEndSeen = true;
+            sSwitchEndSeen = true;
+        } else if (!sPacketCodeEndSeen) {
             return;
         }
-        MAIN.postDelayed(APPLY_PACKET_POSITION, PROTO_SB_ARBITRATION_MS);
+        Log.i(TAG, "dji: SB from the packet, code " + code + " -> "
+                + flightModeName(sCodePosition[code]));
+        applyPosition(SW_SB, sCodePosition[code]);
     }
 
-    /** How many new flight-mode positions the SDK has delivered, for {@link #noteSdkFlightMode}. */
+    /**
+     * Whether these code changes are too many to be a hand on a lever.
+     *
+     * <p>Measured on the RC Plus 2: its field carries a code that cycles 2 / 0 / 1 / 0 two or
+     * three times a second with the switch still, so it is not this switch at all. A lever moved
+     * by hand does not produce that; when it happens the packet's SB reader is given up for the
+     * rest of the session and the SDK keeps the switch.
+     */
+    private static boolean codeTooRestless() {
+        final long now = SystemClock.uptimeMillis();
+        if (now - sPacketCodeWindowAt > PROTO_SB_CHANGE_WINDOW_MS) {
+            sPacketCodeWindowAt = now;
+            sPacketCodeChanges = 0;
+        }
+        if (++sPacketCodeChanges <= PROTO_SB_MAX_CHANGES) {
+            return false;
+        }
+        sPacketSwitchUnusable = true;
+        Log.i(TAG, "dji: the packet's flight-mode code changed " + sPacketCodeChanges
+                + " times in " + PROTO_SB_CHANGE_WINDOW_MS + " ms - that is not this switch, "
+                + "SB stays on the SDK");
+        return true;
+    }
+
+    /** How many new flight-mode positions the SDK has delivered, for RcProtocolInputs. */
     private static volatile int sSdkSwitchMoves;
 
     /** How many positions the SDK's own copy of SB has delivered - RcProtocolInputs asks this. */
@@ -2660,25 +2714,9 @@ public final class DjiMsdkBridge {
         return sSdkSwitchMoves;
     }
 
-    /**
-     * The SDK delivered a new flight-mode position.
-     *
-     * <p>It answers the packet's held position for this movement - and it says which of the two
-     * readers is the late one here: a copy that agrees with the packet's and arrives after the
-     * arbitration window means this remote's SDK key lags behind the packet, so SB is applied
-     * from the packet immediately from then on.
-     */
-    private static void noteSdkFlightMode(int state) {
-        final long now = SystemClock.uptimeMillis();
-        final long packetAt = sPacketPositionAt;
-        sSdkSwitchMoves++;
-        if (!sPacketLeadsSdk && state == sPacketPosition && packetAt != 0
-                && now - packetAt > PROTO_SB_ARBITRATION_MS) {
-            sPacketLeadsSdk = true;
-            Log.i(TAG, "dji: the SDK's flight-mode copy came " + (now - packetAt)
-                    + " ms after the packet's - SB follows the packet from now on");
-        }
-        sSdkFlightModeAt = now;
+    /** One position the way a person reads the switch, for the lines above. */
+    private static String flightModeName(int position) {
+        return position > 0 ? "high" : position < 0 ? "low" : "the middle";
     }
 
     /**

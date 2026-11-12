@@ -78,13 +78,13 @@ void requestSwitch(int index, int8_t state);
 // ---------------------------------------------------------------- startup ----
 //
 // Booting the firmware is what runs EdgeTX's boot checks, and those sample the
-// throttle and every switch once and warn about whatever they find. Until the
-// RC's own controls have reported, a stick reads as centred - so the host waits
+// throttle and every switch once and warn about whatever they find. Until all
+// four stick axes have arrived, a stick reads as centred - so the host waits
 // for this before letting the firmware start (see native_main.cpp: link_start).
 //
-// Set from DjiMsdkBridge.java once the DJI SDK is registered and the sticks are
-// reporting, or once it is clear that they never will be. A build without the
-// SDK has nothing to wait for and is ready from the start.
+// Set once all four stick axes have arrived through any input reader, or once
+// it is clear that they never will be. A build without the SDK has nothing to wait
+// for and is ready from the start.
 bool inputsReady();
 void setInputsReady(bool ready);
 
