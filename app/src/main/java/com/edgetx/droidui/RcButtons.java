@@ -75,6 +75,12 @@ final class RcButtons {
     static final int SOURCE_HW = 4;
     /** DJI's own protocol stream, the RC firmware's control packet - see RcProtocolService. */
     static final int SOURCE_PROTOCOL = 5;
+    /** One protocol source ID per DJI process, so duplicate packet copies can be merged. */
+    private static final int SOURCE_PROTOCOL_COUNT = 4;
+
+    static int protocolSource(int processIndex) {
+        return SOURCE_PROTOCOL + processIndex;
+    }
 
     /** The edge is news: the caller acts on it. */
     static final int PRESS = 0;
@@ -120,12 +126,14 @@ final class RcButtons {
 
     /** How a source is named in the log lines, so which reader delivered a press is visible. */
     static String sourceName(int source) {
+        if (source >= SOURCE_PROTOCOL && source < SOURCE_PROTOCOL + SOURCE_PROTOCOL_COUNT) {
+            return "protocol";
+        }
         switch (source) {
             case SOURCE_RAW: return "raw";
             case SOURCE_LOG: return "log";
             case SOURCE_EVENT: return "event";
             case SOURCE_HW: return "hw";
-            case SOURCE_PROTOCOL: return "protocol";
             default: return "sdk";
         }
     }

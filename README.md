@@ -265,17 +265,19 @@ that does nothing. The reference reader maps this bit as a level, and this keeps
 the two shapes from cancelling each other out. The log says which shape it was:
 
 ```
-dji: the ARM bit went out after 18234 ms - it is the latched level, so that is the press
-dji: the ARM bit came back after 180 ms - the release of the active-low press, not another
+dji: ARM bit in com.dji.agras went out after 18234 ms - latched level press
+dji: ARM bit in dji.go.v5 returned after 180 ms - release, not another press
 ```
 
-Each of those moves its switch only while the reader that normally delivers it is
-not delivering — the SDK key, the remote's own log while that is what moves
-switches, or the raw reports — so a remote whose own keys work keeps behaving
-exactly as it did, and a button that would otherwise be dead still lands:
+The ARM edge is tracked independently for each process, including its initial
+baseline and active-low timing. On the RC Plus, the selected process and its
+known DJI Fly/agriculture counterpart are bound at start-up; this lets the ARM
+bit through even when the preferred process carries axes but no button field.
+Every reader can report the press, while `RcButtons` merges copies of the same
+physical press so the switch moves once:
 
 ```
-dji: takeoff pressed (seen by the protocol stream)
+dji: takeoff pressed (seen by the protocol stream (dji.go.v5))
 dji: C1 from DJI's protocol stream
 dji: pause from DJI's protocol stream, merged with the log one
 ```
@@ -308,20 +310,20 @@ the same as the firmware's own.
 
 If the chosen name still has not produced a packet after 6 s, the other three are
 bound as well; the button field keeps its own winner, and the chosen process takes
-it over as soon as it speaks, so a fallback that answered first cannot keep `SA`
-away from it.
+it over as soon as it speaks, so a fallback that answered first cannot keep the
+other protocol buttons away from it. The RC Plus ARM bit is the exception: it is
+tracked per process and is not blocked by that field winner.
 
-The field itself is judged by whether it *moves*: every process sends the value its
-stream opens with, and a process whose field carries nothing sends that value and
-never another. An RC Plus answers on the agriculture process with the sticks but an
-empty button field, so once the switch has been moved there and the named process's
-field still has not, the other candidate of the same rule — DJI Fly's process, or
-the agriculture one — is bound as a button-only reader, and its field is used until
-the named process shows one of its own:
+The general button field itself is judged by whether it *moves*: every process
+sends the value its stream opens with, and a process whose field carries nothing
+sends that value and never another. An RC Plus can answer on the agriculture
+process with the sticks but an empty button field, so its DJI Fly/agriculture
+counterpart is already bound for the ARM bit; the general field still uses its
+own winner until the named process shows one of its own:
 
 ```
 rc protocol: preinstalled dji.go.v5=true, agras=true, agrasx=false, industry=false; listening in com.dji.agras
-rc protocol: com.dji.agras moves no button field here - also listening in dji.go.v5 for the buttons
+rc protocol: RC Plus SA ARM-bit listener also enabled in dji.go.v5
 ```
 
 The first time each bit of the field is seen set it is named once in the log, so a

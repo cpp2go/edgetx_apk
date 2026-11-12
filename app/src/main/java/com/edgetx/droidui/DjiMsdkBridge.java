@@ -2558,17 +2558,79 @@ public final class DjiMsdkBridge {
     private static int sProtocolBits;
     private static boolean sProtocolSeen;
 
-    /** When the ARM bit last went high, 0 while it is clear - see PROTO_ARM_LATCH_MS. */
-    private static long sProtocolArmSetAt;
+    /** ARM-bit edge state is kept per DJI process; button fields need not share an owner. */
+    private static final java.util.Map<String, ProtocolArmState> sProtocolArmStates =
+            new java.util.HashMap<>();
 
-    /** When the ARM bit last went low, 0 until it has - see PROTO_ARM_LATCH_MS. */
-    private static long sProtocolArmClearAt;
+    private static final class ProtocolArmState {
+        int bits;
+        boolean seen;
+        long setAt;
+        long clearAt;
+        boolean lowWasPress;
+    }
 
-    /**
-     * Whether the last time the ARM bit went low was counted as a press. An active-low firmware
-     * then sends the release a moment later, and that release must not count a second time.
-     */
-    private static boolean sProtocolArmLowWasPress;
+    /** One source-independent ARM edge stream from a specific DJI process. */
+    static void onProtocolArmBits(int bits, String process, boolean initial, int source) {
+        if (REMOTE.goHomeLands || process == null) {
+            return;
+        }
+
+        final long now = SystemClock.uptimeMillis();
+        final boolean set = (bits & PROTO_ARM) != 0;
+        boolean countPress = false;
+        boolean activeLowRelease = false;
+        long interval = 0;
+
+        synchronized (DjiMsdkBridge.class) {
+            ProtocolArmState state = sProtocolArmStates.get(process);
+            if (state == null) {
+                state = new ProtocolArmState();
+                sProtocolArmStates.put(process, state);
+            }
+            if (initial || !state.seen) {
+                state.seen = true;
+                state.bits = bits;
+                state.setAt = set ? now : 0;
+                state.clearAt = 0;
+                state.lowWasPress = false;
+                return;
+            }
+
+            final boolean wasSet = (state.bits & PROTO_ARM) != 0;
+            state.bits = bits;
+            if (wasSet == set) {
+                return;
+            }
+
+            if (set) {
+                interval = state.clearAt == 0 ? 0 : now - state.clearAt;
+                activeLowRelease = state.lowWasPress && state.clearAt != 0
+                        && interval < PROTO_ARM_LATCH_MS;
+                state.setAt = now;
+                state.clearAt = 0;
+                state.lowWasPress = false;
+                countPress = !activeLowRelease;
+            } else {
+                interval = state.setAt == 0 ? 0 : now - state.setAt;
+                state.setAt = 0;
+                state.clearAt = now;
+                state.lowWasPress = interval >= PROTO_ARM_LATCH_MS;
+                countPress = state.lowWasPress;
+            }
+        }
+
+        if (activeLowRelease) {
+            Log.i(TAG, "dji: ARM bit in " + process + " returned after " + interval
+                    + " ms - release, not another press");
+        } else if (countPress) {
+            if (!set) {
+                Log.i(TAG, "dji: ARM bit in " + process + " went out after " + interval
+                        + " ms - latched level press");
+            }
+            takeoffPressed(source, "protocol stream (" + process + ')');
+        }
+    }
 
     /**
      * One button field from DJI's protocol stream, as the RC firmware reports it.
@@ -2584,11 +2646,6 @@ public final class DjiMsdkBridge {
             sProtocolBits = bits;
             Log.i(TAG, "dji: the protocol field opens at 0x" + Integer.toHexString(bits)
                     + " (switch code " + ((bits >>> PROTO_SWITCH_SHIFT) & PROTO_SWITCH_MASK) + ')');
-            // A bit that is already high now is a level that has been high since before this
-            // reader opened: remember when, so that the moment it goes out can be measured.
-            if ((bits & PROTO_ARM) != 0) {
-                sProtocolArmSetAt = SystemClock.uptimeMillis();
-            }
             noteProtocolFlightMode(bits);
             return;
         }
@@ -2819,43 +2876,6 @@ public final class DjiMsdkBridge {
         // exactly what this reader is for. (Gating on "is the other reader delivering" was tried
         // first and is wrong: that state is per remote, not per press, so a single press the log
         // missed stayed dead - which is what C1/C2/C3 "sometimes doing nothing" was.)
-        if ((pressed & PROTO_ARM) != 0) {
-            final long now = SystemClock.uptimeMillis();
-            final long lowFor = sProtocolArmClearAt == 0 ? 0 : now - sProtocolArmClearAt;
-            final boolean releaseOfActiveLowPress = sProtocolArmLowWasPress
-                    && sProtocolArmClearAt != 0 && lowFor < PROTO_ARM_LATCH_MS;
-            sProtocolArmSetAt = now;
-            sProtocolArmClearAt = 0;
-            sProtocolArmLowWasPress = false;
-            if (releaseOfActiveLowPress) {
-                // The firmware sends the button's level as 0 while it is pressed and 1 at rest.
-                // The drop counted as that press a moment ago; this is the same press ending,
-                // not another one - counting it would toggle SA straight back and the button
-                // would look dead.
-                Log.i(TAG, "dji: the ARM bit came back after " + lowFor
-                        + " ms - the release of the active-low press, not another");
-            } else if (!REMOTE.goHomeLands) {
-                takeoffPressed(RcButtons.SOURCE_PROTOCOL, "protocol stream");
-            }
-        }
-        if ((released & PROTO_ARM) != 0) {
-            // A bit that stayed high far longer than a press is the ARM LED's latched state (or
-            // the resting level of an active-low button), so the moment it goes out is the press
-            // of the same button - see PROTO_ARM_LATCH_MS. A momentary press never gets here with
-            // a long-enough time.
-            final long now = SystemClock.uptimeMillis();
-            final long held = sProtocolArmSetAt == 0 ? 0 : now - sProtocolArmSetAt;
-            sProtocolArmSetAt = 0;
-            sProtocolArmClearAt = now;
-            final boolean press = held >= PROTO_ARM_LATCH_MS && !REMOTE.goHomeLands;
-            sProtocolArmLowWasPress = press;
-            if (press) {
-                Log.i(TAG, "dji: the ARM bit went out after " + held + " ms - it is the latched "
-                        + "level, so that is the press");
-                takeoffPressed(RcButtons.SOURCE_PROTOCOL, "protocol latch");
-            }
-        }
-
         if ((pressed & PROTO_PAUSE) != 0) {
             protocolPress(SLOT_PAUSE, "pause");
         }

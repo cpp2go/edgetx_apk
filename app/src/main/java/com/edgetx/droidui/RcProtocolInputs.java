@@ -113,6 +113,16 @@ final class RcProtocolInputs {
                     ? null : data.getString(RcProtocolService.KEY_PROCESS);
             if (message.what == MSG_BUTTONS) {
                 final boolean initial = data != null && data.getBoolean(KEY_INITIAL, false);
+                final int source = protocolSource(process);
+                if (source >= 0) {
+                    // SA can be present in a different DJI process than the preferred button
+                    // field, so its ARM bit is tracked independently for each process.
+                    try {
+                        DjiMsdkBridge.onProtocolArmBits(message.arg1, process, initial, source);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "dji: could not deliver a protocol SA button", t);
+                    }
+                }
                 if (!fromButtonSource(process, initial)) {
                     return;
                 }
@@ -206,6 +216,18 @@ final class RcProtocolInputs {
         return true;
     }
 
+    /** The process-specific press source used to merge duplicate SA packet copies. */
+    private static int protocolSource(String process) {
+        if (process == null) return -1;
+        final String[] processes = RcProtocolService.PROCESSES;
+        for (int i = 0; i < processes.length; i++) {
+            if (processes[i].equals(process)) {
+                return RcButtons.protocolSource(i);
+            }
+        }
+        return -1;
+    }
+
     /** The process whose stick packets are used. */
     private static volatile String sWinner;
 
@@ -234,6 +256,16 @@ final class RcProtocolInputs {
         // reader makes. The others are not bound: each is a process of its own, and a name
         // whose app is absent never answers.
         start(app, service);
+        final Class<?> counterpart = "RC Plus".equals(RcModel.CURRENT.label)
+                ? counterpartFor(sPreferred) : null;
+        if (counterpart != null) {
+            // On the RC Plus, axes and the SA button field can answer in different processes.
+            // Bind the known counterpart immediately instead of waiting for SB's SDK key to move.
+            start(app, counterpart);
+            sCounterpartTried = true;
+            Log.i(TAG, "rc protocol: RC Plus SA ARM-bit listener also enabled in "
+                    + processOf(counterpart));
+        }
         // A guess that turns out wrong on this firmware costs nothing but a wait: if not a
         // single packet has arrived, the rest of the names are tried as well.
         MAIN.postDelayed(new Runnable() {
@@ -377,18 +409,25 @@ final class RcProtocolInputs {
         if (context == null) {
             return;
         }
-        final Class<?> counterpart;
-        if (sPreferred.equals(processOf(RcProtocolServiceAgras.class))) {
-            counterpart = RcProtocolService.class;
-        } else if (sPreferred.equals(RcProtocolService.PROCESS)) {
-            counterpart = RcProtocolServiceAgras.class;
-        } else {
+        final Class<?> counterpart = counterpartFor(sPreferred);
+        if (counterpart == null) {
             return;   // an industry or agriculture-X build has no second candidate
         }
         sCounterpartTried = true;
         start(context, counterpart);
         Log.i(TAG, "rc protocol: " + sPreferred + " moves no button field here - also listening in "
                 + processOf(counterpart) + " for the buttons");
+    }
+
+    /** The two process names that can carry the alternate RC Plus button field. */
+    private static Class<?> counterpartFor(String preferred) {
+        if (processOf(RcProtocolServiceAgras.class).equals(preferred)) {
+            return RcProtocolService.class;
+        }
+        if (RcProtocolService.PROCESS.equals(preferred)) {
+            return RcProtocolServiceAgras.class;
+        }
+        return null;
     }
 
     /**
@@ -435,9 +474,12 @@ final class RcProtocolInputs {
      * reference reader's startForeground() buys it - without a second notification.
      */
     private static void start(final Context context, Class<?> service) {
+        final String name = service.getSimpleName();
+        if (sStartedServices.contains(name)) {
+            return;
+        }
         final Intent intent = new Intent(context, service);
         intent.putExtra(RcProtocolService.EXTRA_SINK, new Messenger(SINK));
-        final String name = service.getSimpleName();
         try {
             boolean bound;
             try {
