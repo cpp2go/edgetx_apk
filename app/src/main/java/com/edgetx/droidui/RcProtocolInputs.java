@@ -48,6 +48,13 @@ import java.util.Locale;
  * is where it goes: every button whose own reader can miss a press has this copy as well, and
  * {@link RcButtons} merges them - the takeoff / ARM button first of all, which on the RC Plus
  * answers neither the SDK key nor the remote's own log.
+ *
+ * <p>On a remote whose row sets {@link RcModel#packetOnly} - the RC Plus, and anything this
+ * port has not been measured on - the packet is not the fallback but the reader: no SDK is
+ * registered and no log is read there, so the button field, the 5-way
+ * ({@link DjiMsdkBridge#noteProtocolFiveWay}) and the flight-mode code carry every control the
+ * raw reports do not. That is the way the reference reader for the RC Plus reads the remote
+ * (RC Plus Control 1.15, {@code com.rcplus.keyprobe}).
  */
 final class RcProtocolInputs {
 
@@ -145,10 +152,11 @@ final class RcProtocolInputs {
     };
 
     /**
-     * All four DJI process names are listened to (only one of them answers, and which one is not
-     * documented), so the copies from the others are dropped here rather than merged or counted
-     * twice. The first process that produces a packet is used, and the process the installed DJI
-     * app names takes over from it if it speaks later.
+     * Where several DJI process names are bound (the remotes that also have the SDK, see
+     * {@link #start}), only one of them answers and the copies from the others are dropped here
+     * rather than merged or counted twice. The first process that produces a packet is used, and
+     * the process the installed DJI app names takes over from it if it speaks later. A remote
+     * read from the packet alone binds one process, so this is a no-op there.
      */
     private static boolean fromWinner(String process) {
         if (process == null) {
@@ -176,13 +184,17 @@ final class RcProtocolInputs {
     /**
      * The button field gets its own winner.
      *
-     * <p>The process the reference rule names wins it - but only once its field has *moved*.
-     * Every process sends the value its stream opens with, and a process whose field carries
-     * nothing sends that value and never another one: measured on one RC Plus, the agriculture
-     * process the rule picks there delivers the axes with an empty field, while DJI Fly's
-     * process carries the switch and the buttons. So the named process's opening value is
+     * <p>Only matters where several process names are bound (the SDK remotes, after the 6 s
+     * fallback). The process the reference rule names wins it - but only once its field has
+     * *moved*. Every process sends the value its stream opens with, and a process whose field
+     * carries nothing sends that value and never another one: measured on one RC Plus, the
+     * agriculture process the rule picks there delivers the axes with an empty field, while DJI
+     * Fly's process carries the switch and the buttons. So the named process's opening value is
      * accepted as a placeholder, another process's field is used as soon as it moves, and the
      * named process takes the field over for good the moment it shows a movement of its own.
+     *
+     * <p>With one process bound (RcModel.packetOnly) there is nothing to arbitrate: its field is
+     * the field, exactly as in the reference reader.
      */
     private static boolean fromButtonSource(String process, boolean initial) {
         if (process == null) {
@@ -256,31 +268,31 @@ final class RcProtocolInputs {
         // reader makes. The others are not bound: each is a process of its own, and a name
         // whose app is absent never answers.
         start(app, service);
-        final Class<?> counterpart = "RC Plus".equals(RcModel.CURRENT.label)
-                ? counterpartFor(sPreferred) : null;
-        if (counterpart != null) {
-            // On the RC Plus, axes and the SA button field can answer in different processes.
-            // Bind the known counterpart immediately instead of waiting for SB's SDK key to move.
-            start(app, counterpart);
-            sCounterpartTried = true;
-            Log.i(TAG, "rc protocol: RC Plus SA ARM-bit listener also enabled in "
-                    + processOf(counterpart));
-        }
-        // A guess that turns out wrong on this firmware costs nothing but a wait: if not a
-        // single packet has arrived, the rest of the names are tried as well.
-        MAIN.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                if (sSeen) {
-                    return;
-                }
-                for (Class<?> candidate : SERVICES) {
-                    if (candidate != service) {
-                        start(app, candidate);
+        if (RcModel.CURRENT.packetOnly) {
+            // The reference reader for these remotes binds exactly this one process and nothing
+            // else - the same service DJI's own app would be, chosen by the same rule - so a
+            // stock system and one with a sideloaded DJI Fly are read the same way. Its packets
+            // carry every control (see RcModel.packetOnly), so there is no second process to
+            // listen to and no need to guess another name.
+            Log.i(TAG, "rc protocol: the reference reader uses " + processOf(service)
+                    + " here - that is the only process bound");
+        } else {
+            // A guess that turns out wrong on this firmware costs nothing but a wait: if not a
+            // single packet has arrived, the rest of the names are tried as well.
+            MAIN.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    if (sSeen) {
+                        return;
+                    }
+                    for (Class<?> candidate : SERVICES) {
+                        if (candidate != service) {
+                            start(app, candidate);
+                        }
                     }
                 }
-            }
-        }, FALLBACK_MS);
+            }, FALLBACK_MS);
+        }
         MAIN.postDelayed(new Runnable() {
             @Override
             public void run() {
@@ -397,7 +409,8 @@ final class RcProtocolInputs {
      * its own (see {@link #fromButtonSource}).
      */
     private static void bindCounterpart(int sdkSwitchMoves) {
-        if (sCounterpartTried || sPreferredFieldAlive || !sSeen) {
+        if (RcModel.CURRENT.packetOnly || sCounterpartTried || sPreferredFieldAlive || !sSeen) {
+            // packetOnly: the reference reader binds one process only, see start().
             return;
         }
         if (sdkSwitchMoves < 2) {

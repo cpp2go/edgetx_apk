@@ -294,7 +294,9 @@ public class EdgeTxApplication extends Application {
         // up before the activity attaches to it.
         RcLinkService.start(this);
         // The bridge only loads when the SDK is packaged; without it this throws
-        // NoClassDefFoundError, which we deliberately swallow.
+        // NoClassDefFoundError, which we deliberately swallow. On the RC Plus it registers
+        // nothing with the SDK (see RcModel.packetOnly) - it still owns the native side the
+        // protocol stream and the raw reports push through.
         try {
             Class<?> bridge = Class.forName("com.edgetx.droidui.DjiMsdkBridge");
             bridge.getMethod("init", Application.class).invoke(null, this);
@@ -309,18 +311,27 @@ public class EdgeTxApplication extends Application {
 
         // The same axes from DJI's own protocol stream, which needs neither the USB interface
         // nor the SDK: the fallback for the sticks while the raw reports are not arriving - see
-        // RcProtocolInputs. Only the sticks are taken from it.
+        // RcProtocolInputs. The packet is also the reader for every control the raw reports do
+        // not carry, and on the RC Plus (RcModel.packetOnly) it is the only one.
         RcProtocolInputs.start(this);
 
-        // The buttons the remote's own handler logs, which on the RC Pro and the RC Plus is the
-        // reliable source for the pause, landing and custom buttons. Inert without READ_LOGS,
-        // see RcDpadLog - and on a remote whose switches that log is the only reader for, the
-        // missing grant is a button that does nothing, so it is said in the log with the command
-        // that grants it.
-        RcDpadLog.start(this);
-        if (RcModel.CURRENT.logDrivesSwitches && !RcDpadLog.granted(this)) {
-            Log.i(TAG, "rc: " + RcModel.CURRENT.label + " needs READ_LOGS for its C buttons"
-                    + " (adb shell pm grant com.edgetx.droidui android.permission.READ_LOGS)");
+        // The buttons the remote's own handler logs, which on the RC Pro is the reliable source
+        // for the pause, landing and custom buttons. Inert without READ_LOGS, see RcDpadLog -
+        // and on a remote whose switches that log is the only reader for, the missing grant is a
+        // button that does nothing, so it is said in the log with the command that grants it.
+        //
+        // Not on the RC Plus: its reference reader gets every button from DJI's protocol stream,
+        // and the log line there is written at the release and only needs a hand grant to read
+        // (see RcModel.packetOnly).
+        if (RcModel.CURRENT.packetOnly) {
+            Log.i(TAG, "rc: " + RcModel.CURRENT.label + " reads its controls from DJI's protocol"
+                    + " stream - no SDK, no log");
+        } else {
+            RcDpadLog.start(this);
+            if (RcModel.CURRENT.logDrivesSwitches && !RcDpadLog.granted(this)) {
+                Log.i(TAG, "rc: " + RcModel.CURRENT.label + " needs READ_LOGS for its C buttons"
+                        + " (adb shell pm grant com.edgetx.droidui android.permission.READ_LOGS)");
+            }
         }
     }
 

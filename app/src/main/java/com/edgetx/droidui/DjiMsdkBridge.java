@@ -259,6 +259,15 @@ public final class DjiMsdkBridge {
         Log.i(TAG, "dji: EdgeTX haptics go to the remote's own motor: "
                 + (sVibrator != null && sVibrator.hasVibrator() ? "yes" : "no motor here"));
 
+        // The RC Plus is read the way its reference app reads it (see RcModel.packetOnly): the
+        // control packet carries every button, the 5-way and the flight-mode code, and neither
+        // the SDK nor the remote's log is touched. What is left of this class there is the
+        // native side both other readers push through.
+        if (REMOTE.packetOnly) {
+            listenProtocolOnly();
+            return;
+        }
+
         if (SDKManager.getInstance().isRegistered()) {
             listen();
             return;
@@ -293,6 +302,45 @@ public final class DjiMsdkBridge {
 
             @Override public void onDatabaseDownloadProgress(long current, long total) { }
         });
+    }
+
+    /**
+     * The RC Plus's start-up, without the SDK.
+     *
+     * <p>Its controls come from DJI's protocol stream ({@link RcProtocolInputs}) and, while it is
+     * alive, from the joystick's raw reports - see {@link RcModel#packetOnly}. So nothing here
+     * registers with the SDK, subscribes to a key or reads the remote's log; the packet's button
+     * bits, 5-way and flight-mode code are handed to the same places the SDK's callbacks used to
+     * reach (see dispatchProtocolBits and noteProtocolFiveWay).
+     *
+     * <p>Two things the SDK's registration used to do as a side effect still have to happen: the
+     * positions of the latching switches are pushed back, so a model that reads them sees what
+     * they were left at, and the haptic poller is started - the firmware's own haptic counter is
+     * read from Java on every remote, SDK or not.
+     */
+    private static void listenProtocolOnly() {
+        Log.i(TAG, "dji: remote " + REMOTE.label + " (" + Build.DEVICE + " / " + Build.MODEL
+                + "): " + REMOTE.describe());
+
+        // SA, SC and SD are latched on this side only (see kPersistedSwitches in joystick.cpp),
+        // and SF/SG/SH are pushed here for the same reason the SDK's registration pushed them:
+        // the buttons toggle them, so the value a restart starts from is the last one.
+        final int[] latched = {SW_SA, SLOT_VIDEO, SLOT_PAUSE, SLOT_C1, SLOT_C2, SLOT_C3};
+        for (int index : latched) {
+            if (index >= 0) {
+                dispatchToggle(index, sToggleHigh[index]);
+            }
+        }
+        try {
+            nativeOnDjiSwitch(SLOT_PHOTO, sShutterPosition);
+        } catch (Throwable t) {
+            Log.w(TAG, "dji: could not restore the photo switch", t);
+        }
+
+        startHapticPolling();
+        Log.i(TAG, "dji: no SDK and no log on this remote - every button, the 5-way and SB come"
+                + " from DJI's protocol stream, and the raw reports keep the axes when they are"
+                + " alive");
     }
 
     private static void listen() {
@@ -1738,6 +1786,10 @@ public final class DjiMsdkBridge {
             }
         }
 
+        if (REMOTE.packetOnly) {
+            return;   // no SDK is registered on this remote, so there is no key to ask
+        }
+
         try {
             final DJIKey.ActionKey<EmptyMsg, EmptyMsg> key =
                     KeyTools.createKey(DJIRemoteControllerKey.KeyRcShakeMotor);
@@ -2496,9 +2548,10 @@ public final class DjiMsdkBridge {
     // is what keeps a remote whose own keys work behaving exactly as it did, while a button that
     // would otherwise be dead still lands.
     //
-    // Not taken from this packet: the 5-way (the raw reports carry it at 400 Hz and the SDK
-    // behind them, and a press-only copy of a direction would step the rotary twice), and
-    // focus / FN, which have no EdgeTX switch here.
+    // Not taken from this packet everywhere: the 5-way (the raw reports carry it at 400 Hz, and
+    // a press-only copy of a direction would step the rotary twice - on the RC Plus, which has
+    // no SDK reader left, the packet's bits are used exactly while those reports are not
+    // arriving, see noteProtocolFiveWay), and focus / FN, which have no EdgeTX switch here.
 
     /**
      * The three-position switch, in bits 16..17 of the same field.
@@ -2554,9 +2607,28 @@ public final class DjiMsdkBridge {
     private static final int PROTO_C3 = 1 << 20;
     private static final int PROTO_C4 = 1 << 21;
 
+    /**
+     * The 5-way switch, one bit per direction, in the same field - the reference reader names
+     * them in exactly this order ({@code 五维中}, {@code 五维右}, {@code 五维左}, {@code 五维下},
+     * {@code 五维上}).
+     *
+     * <p>Only the RC Plus uses them: it is the remote with no SDK reader after
+     * {@link RcModel#packetOnly}, and a press is the moment the bit comes on. Where the raw USB
+     * reports are alive they carry the same directions at 400 Hz, so the bits are only tracked
+     * there (see noteProtocolFiveWay).
+     */
+    private static final int PROTO_FIVE_MIDDLE = 1 << 11;
+    private static final int PROTO_FIVE_RIGHT = 1 << 12;
+    private static final int PROTO_FIVE_LEFT = 1 << 13;
+    private static final int PROTO_FIVE_DOWN = 1 << 14;
+    private static final int PROTO_FIVE_UP = 1 << 15;
+
     /** The last button field seen, so a press is an edge and not a level. */
     private static int sProtocolBits;
     private static boolean sProtocolSeen;
+
+    /** When the go-home bit came on, so its release can be timed - see dispatchProtocolBits. */
+    private static long sGoHomeAt;
 
     /** ARM-bit edge state is kept per DJI process; button fields need not share an owner. */
     private static final java.util.Map<String, ProtocolArmState> sProtocolArmStates =
@@ -2647,20 +2719,53 @@ public final class DjiMsdkBridge {
             Log.i(TAG, "dji: the protocol field opens at 0x" + Integer.toHexString(bits)
                     + " (switch code " + ((bits >>> PROTO_SWITCH_SHIFT) & PROTO_SWITCH_MASK) + ')');
             noteProtocolFlightMode(bits);
+            noteProtocolFiveWay(bits);
             return;
         }
         final int pressed = bits & ~sProtocolBits;
         final int released = sProtocolBits & ~bits;
         sProtocolBits = bits;
         if ((pressed | released) == 0) {
+            // The levels are unchanged, but the raw reader may have stopped owning the inputs in
+            // the meantime - then the state the remote is in has to be taken as the baseline.
+            noteProtocolFiveWay(bits);
             return;
         }
         try {
             noteProtocolFlightMode(bits);
+            noteProtocolFiveWay(bits);
             announceProtocolBits(pressed);
             dispatchProtocolBits(pressed, released);
         } catch (Throwable t) {
             Log.w(TAG, "dji: a protocol button could not be delivered", t);
+        }
+    }
+
+    /**
+     * The 5-way from bits 11..15 of the button field.
+     *
+     * <p>On the RC Plus this is the reader the 5-way has once the SDK is gone, and the bits are
+     * a level: a direction steps the rotary on the edge into it, exactly as
+     * {@link #dispatchFiveDimension} does for the SDK's copy (the two share
+     * {@link #sFiveDimPrev}). While the raw USB reports own the inputs they have already
+     * delivered that press at 400 Hz, so the levels are only tracked here - a press copied from
+     * this packet as well would step the rotary twice. If the raw reader stops, the bits in the
+     * next packet are taken as the state the remote is in, not as a press.
+     */
+    private static void noteProtocolFiveWay(int bits) {
+        if (!REMOTE.packetOnly) {
+            return;
+        }
+        final boolean raw = RcRawJoystick.ownsInputs();
+        final int[] masks = {PROTO_FIVE_UP, PROTO_FIVE_DOWN, PROTO_FIVE_LEFT,
+                PROTO_FIVE_RIGHT, PROTO_FIVE_MIDDLE};
+        final int[] ids = {BTN_UP, BTN_DOWN, BTN_LEFT, BTN_RIGHT, BTN_PRESS};
+        for (int slot = 0; slot < ids.length; slot++) {
+            final boolean on = (bits & masks[slot]) != 0;
+            if (on && !raw && !sFiveDimPrev[slot]) {
+                dispatch(ids[slot]);
+            }
+            sFiveDimPrev[slot] = on;
         }
     }
 
@@ -2703,10 +2808,12 @@ public final class DjiMsdkBridge {
     /**
      * SB from the packet's own three-position code.
      *
-     * <p>Enabled only on the RC Plus to match the reference app's fast path. It gets SB onto the
-     * right position during start-up, then the SDK takes over permanently on its first real end.
-     * The RC Plus 2 remains on the SDK because its packet code was observed changing while the
-     * lever was still. The SDK also takes over if the RC Plus packet field is too restless.
+     * <p>Enabled only on the RC Plus to match the reference app's fast path. On the remotes that
+     * have the SDK it gets SB onto the right position during start-up, and the SDK then takes
+     * over permanently on its first real end. The RC Plus registers no SDK at all (see
+     * {@link RcModel#packetOnly}), so there the code is the reader for good and nothing can take
+     * it away. The RC Plus 2 remains on the SDK because its packet code was observed changing
+     * while the lever was still.
      *
      * <p>It applies the position the moment the code changes (the reference reader's behaviour),
      * takes the middle only once the field has shown one of the ends (the field opens empty, and
@@ -2759,7 +2866,8 @@ public final class DjiMsdkBridge {
         sPacketSwitchUnusable = true;
         Log.i(TAG, "dji: the packet's flight-mode code changed " + sPacketCodeChanges
                 + " times in " + PROTO_SB_CHANGE_WINDOW_MS + " ms - that is not this switch, "
-                + "SB stays on the SDK");
+                + (REMOTE.packetOnly ? "SB keeps the position it is at"
+                                     : "SB stays on the SDK"));
         return true;
     }
 
@@ -2859,7 +2967,7 @@ public final class DjiMsdkBridge {
             case 9: return "FN (not mapped)";
             case 10: return "takeoff / ARM -> SA";
             case 11: case 12: case 13: case 14: case 15:
-                return "5-way (not taken from here)";
+                return "5-way (the packet's reader once the raw reports are not arriving)";
             case 16: case 17: return "three-position switch code -> SB";
             case 18: return "C1 -> SF";
             case 19: return "C2 -> SG";
@@ -2902,7 +3010,26 @@ public final class DjiMsdkBridge {
             } else {
                 // The H key: the press is counted exactly as the SDK's own callback counts it.
                 Log.i(TAG, "dji: go-home from DJI's protocol stream");
+                sGoHomeAt = SystemClock.uptimeMillis();
                 nativeOnDjiGoHome();
+            }
+        }
+        if ((released & PROTO_GOHOME) != 0 && !REMOTE.goHomeLands && sGoHomeAt != 0) {
+            // The hold this button answers to is a long press of the return key, and the packet
+            // carries its release as well - so the duration the SDK's callback used to measure
+            // comes from the bits here. Only where the packet is the reader for this button
+            // (RcModel.packetOnly): everywhere else the SDK's own callback already counts it.
+            final long held = SystemClock.uptimeMillis() - sGoHomeAt;
+            sGoHomeAt = 0;
+            if (REMOTE.packetOnly) {
+                Log.i(TAG, "dji: go-home released after " + held + " ms");
+                if (held >= HOLD_FOR_EXIT_MS) {
+                    try {
+                        nativeOnDjiGoHomeHeld();
+                    } catch (Throwable t) {
+                        Log.w(TAG, "dji: could not send the long press", t);
+                    }
+                }
             }
         }
 

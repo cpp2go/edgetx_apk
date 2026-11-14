@@ -44,8 +44,10 @@
 
     <!-- Which DJI app this remote ships with decides the process name the protocol library
          answers on (see RcProtocolInputs.installed). Android 11 filters that question to the
-         packages named here, and without it every app looks absent - which picks DJI Fly's
-         process name, and costs the 6 s wait before the other three names are tried. -->
+         packages named here, and without it every app looks absent - which picks the wrong
+         process name: on a remote read from the packet alone (RcModel.packetOnly) that is the
+         only process bound, exactly as the reference reader does it, so the controls would
+         simply be missing; elsewhere it costs the 6 s wait before the other three are tried. -->
     <queries>
         <package android:name="dji.go.v5" />
         <package android:name="com.dji.agras" />
@@ -164,16 +166,19 @@
                 android:value="Keeps an EdgeTX transmitter link to an RF module on a USB serial port" />
         </service>
 
-        <!-- The RC's own control stream (cmd 6/174), read the way DJI's apps read it and used
-             as the fallback reader for the sticks and for every button whose own reader is not
-             delivering - see RcProtocolService.
+        <!-- The RC's own control stream (cmd 6/174), read the way DJI's apps read it: the sole
+             reader for every control on the remotes whose row sets RcModel.packetOnly (the RC
+             Plus and any unmeasured remote), and the fallback reader for the sticks and for
+             every button whose own reader is not delivering everywhere else - see
+             RcProtocolService.
 
              The process names are the point of these entries: DJI's protocol library only hands
              out packets to a process named after one of DJI's own apps, and which one depends on
              the DJI app the remote ships with. All four are declared; RcProtocolInputs binds the
-             one the reference reader picks for this remote, and falls back to the others only if
-             it stays silent. Nothing else runs in those processes - EdgeTxApplication starts no
-             runtime there. -->
+             one the reference reader picks for this remote - and only that one where the packet
+             is the sole reader, exactly as the reference app does - falling back to the others
+             only on the SDK remotes, and only if the chosen one stays silent. Nothing else runs
+             in those processes - EdgeTxApplication starts no runtime there. -->
         <service
             android:name=".RcProtocolService"
             android:exported="false"

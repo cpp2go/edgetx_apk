@@ -137,7 +137,9 @@ is the raw one:
 
 While that reader is running the SDK's copies of the same axes are ignored, and
 everything the reports do not carry (the flight-mode switch, the C buttons, the
-remote's log) still comes from the SDK and Android.
+remote's log) still comes from the SDK and Android — except on the RC Plus, whose
+row reads all of that from DJI's protocol stream and never touches the SDK (see
+*RcModel.packetOnly* below).
 
 The reader is restarted by the app itself when it stops. That is what keeps the
 sticks alive when **DJI Fly is started**: while `dji.go.v5` runs in the
@@ -210,11 +212,13 @@ dials: the left dial comes from DJI's protocol stream - the SDK does not move it
 ```
 
 The packet's button field is a reader of its own for **every button the other
-readers can miss**, which is what the RC Plus's takeoff / ARM button needed —
-neither its SDK key nor the remote's own log ever answers there — and what
-C1/C2/C3 on that remote needed as well, since the log drops a press now and
-then. Bit 10 of the field is the ARM button, and the rest is laid out like this
-(measured from DJI's own parser):
+readers can miss**, and on the RC Plus it is the reader for all of them: that
+remote's row sets `packetOnly`, so no SDK is registered and no log is read there
+(see `RcModel.packetOnly`). The reference app for the remote works the same way —
+a pack rule for `cmd(6, 174)` and nothing else. Its C1/C2/C3 have no SDK key at
+all, its takeoff / ARM button answers neither the SDK key nor its log, and its log
+line is written at the release and needs `READ_LOGS`. Bit 10 of the field is the
+ARM button, and the rest is laid out like this (measured from DJI's own parser):
 | bit | control | bit | control |
 |-----|---------|-----|---------|
 | 4 | pause | 11-15 | 5-way centre/right/left/down/up |
@@ -229,11 +233,13 @@ Bits 16-17 carry a three-position code as well. It is decoded the way the refere
 reader decodes it (`RC Plus Control 1.15`, `com.rcplus.keyprobe`, whose native part
 hands the field back untouched: `2 -> one end, 0 -> the middle, 1 -> the other end`),
 and code 3, which is not a position of a three-position switch, is dropped. The RC
-Plus uses this code for SB to match the reference app's fast start-up path. The SDK
-takes over permanently as soon as it reports a real end position, so packet and SDK
-values cannot alternate later if the stream blinks; the packet reader also backs off
-if its code changes too frequently to represent a physical switch. The RC Plus 2 stays
-on the SDK because its packet field was observed cycling while the lever was still.
+Plus uses this code for SB, and because it registers no SDK the packet is the reader
+for good there — exactly the reference app's behaviour. The packet reader still backs
+off if its code changes too frequently to represent a physical switch (SB then keeps
+the position it is at). On a remote that has the SDK as well, the SDK takes over
+permanently as soon as it reports a real end position, so packet and SDK values
+cannot alternate later if the stream blinks. The RC Plus 2 stays on the SDK because
+its packet field was observed cycling while the lever was still.
 
 What start-up did need is the middle problem: the SDK and packet field can open with
 the *middle* before they have seen the lever, and the firmware comes up with a
@@ -270,11 +276,8 @@ dji: ARM bit in dji.go.v5 returned after 180 ms - release, not another press
 ```
 
 The ARM edge is tracked independently for each process, including its initial
-baseline and active-low timing. On the RC Plus, the selected process and its
-known DJI Fly/agriculture counterpart are bound at start-up; this lets the ARM
-bit through even when the preferred process carries axes but no button field.
-Every reader can report the press, while `RcButtons` merges copies of the same
-physical press so the switch moves once:
+baseline and active-low timing. Every reader can report the press, while
+`RcButtons` merges copies of the same physical press so the switch moves once:
 
 ```
 dji: takeoff pressed (seen by the protocol stream (dji.go.v5))
@@ -289,15 +292,18 @@ toggles — which is what "C1/C2/C3 sometimes do nothing" was. The rule is per
 button on purpose: a blanket "the stream is alive, so everything comes from it"
 also took the log away from a button whose bit this firmware never sets, and the
 ARM button is exactly the one that cannot afford it — the log is its only other
-reader. The log comes back by itself a second after the packets stop:
+reader. The log comes back by itself a second after the packets stop (on the RC
+Plus it is not read at all, see above):
 
 ```
 dji: the remote's own log stands aside for DJI's protocol stream
 ```
 
-Not taken from the packet: the 5-way (the raw reports carry it at 400 Hz with the
-SDK behind them, and a press-only copy of a direction would step the rotary
-twice), and focus / FN, which have no EdgeTX switch here.
+Not taken from the packet while the raw reports are alive: the 5-way (they carry
+it at 400 Hz, and a press-only copy of a direction would step the rotary twice).
+On the RC Plus, which has no SDK reader left, bits 11..15 take the 5-way over the
+moment those reports stop — the raw reader's press is already delivered while it
+runs, so the bits are only tracked there. Focus / FN have no EdgeTX switch here.
 
 Which of the four process names is bound is the reference reader's decision, condition
 for condition: industry when that app ships with the firmware, then agriculture-X,
@@ -308,23 +314,26 @@ manager for `FLAG_SYSTEM | FLAG_UPDATED_SYSTEM_APP`, because one remote can carr
 DJI Fly and the agriculture app side by side and a sideloaded copy must not weigh
 the same as the firmware's own.
 
-If the chosen name still has not produced a packet after 6 s, the other three are
-bound as well; the button field keeps its own winner, and the chosen process takes
-it over as soon as it speaks, so a fallback that answered first cannot keep the
-other protocol buttons away from it. The RC Plus ARM bit is the exception: it is
-tracked per process and is not blocked by that field winner.
-
-The general button field itself is judged by whether it *moves*: every process
-sends the value its stream opens with, and a process whose field carries nothing
-sends that value and never another. An RC Plus can answer on the agriculture
-process with the sticks but an empty button field, so its DJI Fly/agriculture
-counterpart is already bound for the ARM bit; the general field still uses its
-own winner until the named process shows one of its own:
+On a remote read from the packet alone (`RcModel.packetOnly`: the RC Plus and
+anything this port has not been measured on) that rule is the whole of the choice:
+exactly that one service is bound and nothing else — the same single listener DJI's
+own app would be, so an untouched system and one with DJI Fly flashed in are read
+the same way, and its first packet is the state the remote is in. Every axis, every
+button bit, the 5-way directions and the flight-mode code come from that one stream:
 
 ```
 rc protocol: preinstalled dji.go.v5=true, agras=true, agrasx=false, industry=false; listening in com.dji.agras
-rc protocol: RC Plus SA ARM-bit listener also enabled in dji.go.v5
+rc protocol: the reference reader uses com.dji.agras here - that is the only process bound
 ```
+
+The remotes that also have the SDK treat the chosen name as a guess: if it has not
+produced a packet after 6 s, the other three are bound as well; the button field
+keeps its own winner, and the chosen process takes it over as soon as it speaks, so
+a fallback that answered first cannot keep the other protocol buttons away from it.
+The ARM bit is tracked per process there and is not blocked by that field winner.
+The general field itself is judged by whether it *moves*: every process sends the
+value its stream opens with, and a process whose field carries nothing sends that
+value and never another. None of that applies where only the one process is bound.
 
 The first time each bit of the field is seen set it is named once in the log, so a
 "this button does nothing" report can say which bit the button actually uses even
@@ -369,17 +378,20 @@ row the SDK buttons use, and how its data behaves) and in
 | RC Plus | `rm700`, `rm700_enterprise` | SC / SD / SE | SF / SG / SH | — | 5-way trim modifier (return-home) | `SWITCH_TWO` |
 | RC Pro 2 | `rc520` | SD / SC / SF | SG / SH / SI | — | switch SA | `SWITCH_TWO` |
 
-Anything else keeps the RC Plus 2's row and says so in the log. The rows for
+Anything else gets the RC Plus's row and says so in the log. The rows for
 the RC Pro, the RC Plus 2 and the RC Plus were settled by pressing every button
 on the remote; the RC Pro 2 row is its family's layout. The RC Plus shares the
-RC Plus 2's switches but **not** its readers: its C1/C2/C3 never arrive from the
-SDK, only from the remote's own log, so
-`adb shell pm grant com.edgetx.droidui android.permission.READ_LOGS` is what
-makes those three custom buttons work there (the app logs it when the grant is
-missing). Its flight-mode switch and pause button answer from the SDK a moment late,
-as they always have — SB follows the protocol stream on the RC Plus and the SDK on
-the other remotes (see the three-position notes above). Only the buttons are shared otherwise:
-the RC Plus runs Android 10, so the grant its SD card needs is its own (see below).
+RC Plus 2's switches but **not** its readers: it takes every control from DJI's
+protocol stream, the way its reference app does, and neither the SDK nor the
+remote's own log is used there at all (`RcModel.packetOnly`). That is what makes
+its C1/C2/C3 (which the SDK never publishes), its pause and flight-mode buttons
+(which the SDK answers late) and its takeoff button work without the
+`READ_LOGS` grant the log path needs — SB follows the packet's three-position
+code on that remote and the SDK on the others (see the three-position notes
+above). An unrecognised remote is handled exactly the same way, because those
+readers need neither an SDK key nor a permission. Only the buttons are shared
+otherwise: the RC Plus runs Android 10, so the grant its SD card needs is its own
+(see below).
 
 The six side buttons L1/L2/L3/R1/R2/R3 are not in the DJI SDK at all — the
 only supported way to read them is Android key events
@@ -451,14 +463,16 @@ could look dead.
 
 The takeoff button — the one with the red/green LED — is `SA` on the Plus family.
 On the RC Plus 2 the SDK publishes it as `KeyRCAuthLedButtonDown` (one ~200 ms
-pulse per press). The RC Plus has not been seen to answer that key, so the same
-switch is read four ways there: the listener, the SDK's cached value (polled
-with the sticks, one key per 200 ms), the action the SDK's button event names
-(`KeyRcButtonEventPro` → `RcButtonAction.ONEKEYTAKEOFFLANDING`, which is the one
-path that needs no `READ_LOGS`) and a name in the remote's own log that
-reads like takeoff (`TAKEOFF`, `TAKEOFF_LANDING`, `ONEKEYTAKEOFF`, `AUTHLED`…) —
-that log is already the reader for its C1/C2/C3. The name that matched is logged
-the first time, so one run says which one it was:
+pulse per press). The RC Plus reads it from the packet's ARM bit instead (bit 10
+of the button field, see above), because its SDK never publishes that key at all;
+a name in its log that reads like takeoff (`TAKEOFF`, `TAKEOFF_LANDING`,
+`ONEKEYTAKEOFF`, `AUTHLED`…) is no longer needed there. On a remote whose packet
+does not carry it, the same switch is still read four ways: the SDK listener, the
+SDK's cached value (polled with the sticks, one key per 200 ms), the action the
+SDK's button event names (`KeyRcButtonEventPro` →
+`RcButtonAction.ONEKEYTAKEOFFLANDING`, which is the one path that needs no
+`READ_LOGS`) and that takeoff-shaped name in the remote's own log. The name that
+matched is logged the first time, so one run says which one it was:
 
 ```
 dji: the remote's own log calls the takeoff button 'AUTH_LED'
@@ -606,6 +620,8 @@ What keeps flowing after the UI is gone, and what does not:
 | Source | After the activity is gone |
 |--------|----------------------------|
 | DJI SDK (sticks, dials, 5-way, switches — the RC Plus 2's sticks) | **keeps flowing**: the callbacks come from Java inside this process |
+| DJI's protocol stream (every control on the RC Plus, and the sticks elsewhere when the raw reports are not) | **keeps flowing**: its listener runs in a bound service process |
+| The joystick's raw USB reports | **keeps flowing**: read from a thread of this process |
 | Android input events (a gamepad, or any controller whose events Android dispatches) | **stops**: only a focused window receives them, and a service has no window |
 | Touch / the UI itself | stops until the app is opened again |
 
@@ -630,9 +646,10 @@ system app - and every grant it makes is stored by Android and survives a reboot
 
 It grants `ACCESS_FINE_LOCATION` (the remote's own GPS, `RcGps`),
 `WRITE_EXTERNAL_STORAGE` (the card on Android 10) or the `MANAGE_EXTERNAL_STORAGE`
-app-op (Android 11+), and `READ_LOGS` (the remote's own button log, `RcDpadLog`)
-where the build lets shell hand it out. It then verifies each one and prints the
-state, so a grant that the remote refuses is visible rather than silent.
+app-op (Android 11+), and `READ_LOGS` (the remote's own button log, `RcDpadLog` -
+not used on the RC Plus, which reads no log) where the build lets shell hand it
+out. It then verifies each one and prints the state, so a grant that the remote
+refuses is visible rather than silent.
 
 **The USB device permission is the one thing that cannot be pre-granted.** Android
 hands a USB device grant out only through a dialog, or to a system app, and the

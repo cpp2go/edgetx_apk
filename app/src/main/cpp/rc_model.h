@@ -15,7 +15,8 @@ enum class RemoteModel {
     RcPro,     // rm510, rm510b, rm510bv - RC Pro / RC Pro Enterprise
     RcPlus,    // rm700, rm700_enterprise - the RC Plus (M30 / M300)
     RcPro2,    // rc520 - RC Pro 2
-    Unknown,   // anything else: the RC Plus 2's behaviour, as before
+    Unknown,   // anything else: the RC Plus's behaviour (DJI's protocol stream + raw reports,
+               // no SDK and no log - see RcModel.java, whose fallback row is the RC Plus's)
 
     // Not a model: a table entry that applies to every remote. Only ever written in a table,
     // never returned by remote_model().

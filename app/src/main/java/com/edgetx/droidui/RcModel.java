@@ -15,14 +15,15 @@ import android.util.Log;
  * has, and its own button log was not read at all.
  *
  * <p>Every remote this port has been run on now gets a row in {@link #MODELS}, and nothing
- * outside this class decides anything per remote. An unrecognised remote still gets the RC
- * Plus 2's row - the layout the app started with - and says so in the log.
+ * outside this class decides anything per remote. An unrecognised remote gets the RC Plus's row
+ * - DJI's protocol stream and the raw reports, with no SDK and no log (see
+ * {@link #packetOnly}) - and says so in the log.
  *
  * <p>A row is a measurement, not a preference. The rows for the RC Pro and the RC Plus 2 were
- * settled by pressing the buttons on the remote and reading the log; the RC Plus carries the
- * RC Plus 2's row, and the RC Pro 2 row is its family's layout and the first thing to check on
- * the hardware. Changing one value here is how a measurement is applied - nothing else has to
- * move.
+ * settled by pressing the buttons on the remote and reading the log; the RC Plus's row also
+ * carries the reader the reference app for that remote uses ({@link #packetOnly}), and the RC
+ * Pro 2 row is its family's layout and the first thing to check on the hardware. Changing one
+ * value here is how a measurement is applied - nothing else has to move.
  */
 final class RcModel {
 
@@ -46,9 +47,9 @@ final class RcModel {
     /**
      * The remotes, one row each. The constructor arguments are, in order: the
      * {@code Build.DEVICE} prefixes the row matches, its name, the switch each of video,
-     * pause, photo, C1, C2, C3 and the round button drives, then the three flags below
-     * ({@code c3OnSdk}, {@code logDrivesSwitches}, {@code goHomeLands}) and
-     * {@code proFlightMode}.
+     * pause, photo, C1, C2, C3 and the round button drives, then the flags below
+     * ({@code c3OnSdk}, {@code logDrivesSwitches}, {@code goHomeLands}), {@code proFlightMode},
+     * {@code packetFlightMode} and {@code packetOnly}.
      *
      * Measured rows:
      *
@@ -68,24 +69,21 @@ final class RcModel {
      * The other rows:
      *
      * <ul>
-     *   <li><b>RC Plus (rm700, rm700_enterprise)</b>: the RC Plus 2's switches, but not its
-     *       readers. Settled by pressing the buttons on the remote: C1/C2/C3 did nothing at all,
-     *       while the flight-mode switch and pause answered a noticeable moment late. The SDK
-     *       carries no press for the three custom buttons on this remote, so with the log only
-     *       merging those presses went nowhere - {@code logDrivesSwitches} is on here, which is
-     *       what makes C1/C2/C3 (and a second reader for pause) work. {@code goHomeLands} stays
-     *       off: the user's return-home button is the 5-way's trim modifier on this remote just
-     *       as the H key is on the RC Plus 2, and SA stays the takeoff button with the LED. Its
-     *       SDK key ({@code KeyRCAuthLedButtonDown}) is what drives SA on the RC Plus 2, but this
-     *       remote publishes no such key at all, so the button is read four ways there: the
-     *       SDK listener, the SDK's cached value (polled - see DjiMsdkBridge.pollLoop), the
-     *       action its button event names ({@code ONEKEYTAKEOFFLANDING}), and a
-     *       takeoff-shaped name in the remote's own log, which is already the reader for its
-     *       C1/C2/C3. Which name its log uses has not been measured either, so the first one
-     *       that matches is logged. SB uses the reference app's protocol code on this
-     *       remote; it is only the fast start-up reader, and the SDK becomes authoritative after
-     *       its first real end position or if the packet field becomes erratic.
-     *       Pause stays on the SDK, which is where its delay comes from.
+     *   <li><b>RC Plus (rm700, rm700_enterprise)</b>: the RC Plus 2's switches, read the way the
+     *       reference reader for this remote reads them (RC Plus Control 1.15,
+     *       {@code com.rcplus.keyprobe}) - from DJI's own control packet, with no SDK and no log
+     *       ({@link #packetOnly}). Measured on the remote, that is where the other two readers
+     *       fall short: the SDK carries no key at all for C1/C2/C3 and answers the flight-mode
+     *       switch and pause a noticeable moment late, and the remote's log line is written at
+     *       the release and needs READ_LOGS. The packet carries the six axes, the flight-mode
+     *       code, the 5-way and one bit per button, including the takeoff / ARM button whose SDK
+     *       key this remote publishes nowhere - so every one of them has a reader here that
+     *       neither the SDK nor a grant can take away. The raw USB reports stay ahead of it for
+     *       the axes and the 5-way while they are alive (see RcRawJoystick). {@code goHomeLands}
+     *       stays off: this remote's return-home button is the 5-way's trim modifier, just as
+     *       the H key is on the RC Plus 2, and SA stays the takeoff button with the LED. SB uses
+     *       the packet's three-position code ({@code packetFlightMode}), which the reference
+     *       reader decodes for this remote, and nothing else can take it away.
      *       It runs Android 10 like the RC Pro, so its SD card is the
      *       {@code WRITE_EXTERNAL_STORAGE} grant rather than "All files access", and that is
      *       decided from the API level, not from this class.</li>
@@ -99,21 +97,28 @@ final class RcModel {
      * </ul>
      */
     private static final RcModel[] MODELS = {
-            //           video pause photo  C1  C2  C3  round      C3sdk  logSw  goHome  proMode  packetFM
+            //           video pause photo  C1  C2  C3  round      C3sdk  logSw  goHome  proMode  packetFM  packetOnly
             new RcModel(new String[] {"rc701"}, "RC Plus 2",
-                    SC,   SD,   SE,   SF, SG, SH, NO_SWITCH, true,  false, false,  false,  false),
+                    SC,   SD,   SE,   SF, SG, SH, NO_SWITCH, true,  false, false,  false,  false,    false),
             new RcModel(new String[] {"rm510"}, "RC Pro",
-                    SD,   SC,   SF,   SG, SH, SI, SE,        false, true,  true,   true,   false),
+                    SD,   SC,   SF,   SG, SH, SI, SE,        false, true,  true,   true,   false,    false),
             new RcModel(new String[] {"rm700"}, "RC Plus",
-                    SC,   SD,   SE,   SF, SG, SH, NO_SWITCH, true,  true,  false,  false,  true),
+                    SC,   SD,   SE,   SF, SG, SH, NO_SWITCH, false, false, false,  false,  true,     true),
             new RcModel(new String[] {"rc520"}, "RC Pro 2",
-                    SD,   SC,   SF,   SG, SH, SI, NO_SWITCH, true,  true,  true,   false,  false),
+                    SD,   SC,   SF,   SG, SH, SI, NO_SWITCH, true,  true,  true,   false,  false,    false),
     };
 
     /**
-     * This remote's row. An unrecognised one is not an error - the RC Plus 2's layout is what
-     * the app has always used for anything it has not been measured on - but it is worth a line,
-     * because a new remote's buttons are then worth checking against {@link #describe()}.
+     * The row an unrecognised remote gets: the RC Plus's. Its readers (DJI's protocol stream,
+     * with the raw USB reports ahead of it) are the ones that need no SDK and no permission, so
+     * a remote this port has never been measured on still has a working set of controls.
+     */
+    private static final RcModel FALLBACK = MODELS[2];
+
+    /**
+     * This remote's row. An unrecognised one is not an error - it gets the RC Plus's row, whose
+     * readers need neither the SDK nor a log grant - but it is worth a line, because a new
+     * remote's buttons are then worth checking against {@link #describe()}.
      */
     static final RcModel CURRENT = find(Build.DEVICE);
 
@@ -134,15 +139,17 @@ final class RcModel {
     /**
      * Whether the SDK's own {@code KeyCustomButton3Down} is listened to. Not on the RC Pro: the
      * one time its C3 key ever fired it did so in the same millisecond as the return button's
-     * raw bit, so a slot for it would move whenever the return key is pressed.
+     * raw bit, so a slot for it would move whenever the return key is pressed. Not on the RC
+     * Plus either, which never registers with the SDK ({@link #packetOnly}).
      */
     final boolean c3OnSdk;
 
     /**
      * Whether a button the remote reports in its own log may move a switch. On the RC Plus 2 it
      * may not - the SDK and Android already deliver all of them, and the copies are then only
-     * duplicates. On the others the log is the reader that keeps arriving while the SDK's keys
-     * go silent, and {@link RcButtons} merges its copy with the other readers' anyway.
+     * duplicates. On the RC Plus the log is not read at all ({@link #packetOnly}). On the
+     * others the log is the reader that keeps arriving while the SDK's keys go silent, and
+     * {@link RcButtons} merges its copy with the other readers' anyway.
      */
     final boolean logDrivesSwitches;
 
@@ -164,15 +171,34 @@ final class RcModel {
      *
      * <p>Enabled only on the RC Plus to match the reference reader's fast protocol path. It is
      * used for start-up responsiveness, then the SDK takes over permanently after its first real
-     * end position. The RC Plus 2 stays on the SDK: its packet field was observed cycling while
-     * the lever was still.
+     * end position. Where {@link #packetOnly} is set there is no SDK to take over: the packet's
+     * code is the reader for good. The RC Plus 2 stays on the SDK: its packet field was observed
+     * cycling while the lever was still.
      */
     final boolean packetFlightMode;
+
+    /**
+     * Whether every control of this remote is read from DJI's own protocol stream, with no SDK
+     * and no log.
+     *
+     * <p>That is how the reference reader for this remote reads it (RC Plus Control 1.15,
+     * {@code com.rcplus.keyprobe}): a pack rule for {@code cmd(6, 174)} and a listener, and
+     * nothing else - no SDK, no log, no permission. On the RC Plus the two readers it replaces
+     * are exactly where presses went missing: the SDK publishes no key for C1/C2/C3 at all and
+     * answers the flight-mode switch and pause late, and the remote's own log is written at the
+     * release and needs READ_LOGS.
+     *
+     * <p>With this set the SDK is never registered, {@link RcDpadLog} is never started, and the
+     * packet's button bits, 5-way and flight-mode code drive the switches and the rotary (see
+     * DjiMsdkBridge). The raw USB reports stay the faster reader for the axes and the 5-way
+     * while they are alive, and the packet takes over when they are not.
+     */
+    final boolean packetOnly;
 
     private RcModel(String[] devices, String label, int video, int pause, int photo,
                     int c1, int c2, int c3, int round, boolean c3OnSdk,
                     boolean logDrivesSwitches, boolean goHomeLands, boolean proFlightMode,
-                    boolean packetFlightMode) {
+                    boolean packetFlightMode, boolean packetOnly) {
         this.devices = devices;
         this.label = label;
         this.video = video;
@@ -187,6 +213,7 @@ final class RcModel {
         this.goHomeLands = goHomeLands;
         this.proFlightMode = proFlightMode;
         this.packetFlightMode = packetFlightMode;
+        this.packetOnly = packetOnly;
     }
 
     private static RcModel find(String device) {
@@ -201,8 +228,9 @@ final class RcModel {
             }
         }
         Log.i(TAG, "dji: unrecognised remote '" + device
-                + "', using the RC Plus 2's layout (see RcModel)");
-        return MODELS[0];
+                + "', using the RC Plus's row - DJI's protocol stream and the raw reports,"
+                + " no SDK and no log (see RcModel)");
+        return FALLBACK;
     }
 
     /** The switch name the log prints for a board index, "none" for {@link #NO_SWITCH}. */
@@ -217,11 +245,17 @@ final class RcModel {
                 + ", photo " + switchName(photo)
                 + ", C1 " + switchName(c1)
                 + ", C2 " + switchName(c2)
-                + ", C3 " + switchName(c3) + (c3OnSdk ? " (SDK key)" : " (log only)")
+                + ", C3 " + switchName(c3)
+                + (packetOnly ? " (protocol)" : c3OnSdk ? " (SDK key)" : " (log only)")
                 + ", round " + switchName(round)
                 + "; go-home " + (goHomeLands ? "switch SA" : "5-way trim modifier")
                 + "; flight mode top = " + (proFlightMode ? "SWITCH_ONE" : "SWITCH_TWO")
                 + "; SB from " + (packetFlightMode ? "the packet" : "the SDK")
-                + "; the remote's log " + (logDrivesSwitches ? "may move switches" : "is only merged");
+                + "; the remote's log "
+                + (packetOnly ? "is not read"
+                              : logDrivesSwitches ? "may move switches" : "is only merged")
+                + (packetOnly
+                        ? "; readers: DJI's protocol stream (no SDK, no log) and the raw reports"
+                        : "");
     }
 }
